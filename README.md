@@ -1,0 +1,112 @@
+# pi-sync
+
+A small Node.js CLI for applying explicitly declared Pi user-level resources from a setup repository. This repository contains the public CLI only; personal setup files belong in a separate private setup repository.
+
+## Requirements
+
+- Node.js 18 or newer
+
+## Public installation and private-repository bootstrap
+
+The npm package publishes the CLI and its first-party `pi-sync` skill only. Its explicit `files` allowlist excludes setup repositories, credentials, scratch planning files, and test fixtures. Install globally at user level where your npm/pnpm prefix is writable (configure a user-writable npm prefix if needed; do not use sudo), or use a one-shot runner:
+
+```sh
+npm install --global pi-sync
+# or: pnpm add --global pi-sync
+# fallback without a global install:
+pnpm dlx pi-sync bootstrap --repo-url https://github.com/OWNER/PRIVATE-SETUP.git
+# optionally select a user-writable prerequisite install directory:
+pnpm dlx pi-sync bootstrap --repo-url https://github.com/OWNER/PRIVATE-SETUP.git --bin-dir "$HOME/.local/bin"
+# or:
+npx --yes pi-sync bootstrap --repo-url https://github.com/OWNER/PRIVATE-SETUP.git
+```
+
+Bootstrap clones into `~/.pi-sync/setup` by default (override with `--repo-dir PATH`) and applies to `PI_CODING_AGENT_DIR` or `~/.pi/agent` (override with `--agent-dir PATH`). It first tests Git access, then uses an authenticated GitHub CLI session when available. If Git access is unavailable and GitHub CLI is missing, bootstrap installs the official GitHub CLI release into `~/.local/bin` (override with `--bin-dir PATH`) when a supported platform artifact and writable destination are available, then pauses for authentication. If installation is unsupported or fails, it reports the exact missing tool and a no-sudo user action. The authentication handoff includes a `commandArgs` array for `gh auth login --hostname github.com`; when Pi Sync installed the tool locally, it points directly to that executable. After authenticating, rerun the returned resume arguments. Pi Sync never asks for, prints, or stores credentials. Once fetched, bootstrap validates the manifest and lockfile and installs every declared `requiredTools` prerequisite before applying anything; unsupported names are rejected and failed required tools stop setup. It declares the bundled skill as `{ "type": "skill", "source": "resources/skills/pi-sync", "target": "skills/pi-sync" }`, previews normal manifest-driven apply, and installs only through the ordinary conflict-safe apply flow. Existing declared or local content at a colliding path is reported and left untouched. Bootstrap does not commit or push repository changes.
+
+## Setup repository format (schema version 1)
+
+Place `pi-sync.json` and `pi-sync.lock.json` at the root of the setup repository. Schema version 1 supports authored skill directories and explicitly declared npm/GitHub Pi packages. Package pins are kept in the lockfile and ordinary apply never discovers newer releases.
+
+```json
+{
+  "schemaVersion": 1,
+  "resources": [
+    {
+      "type": "skill",
+      "source": "resources/skills/example",
+      "target": "skills/example"
+    }
+  ],
+  "settings": [
+    {
+      "target": "settings.json",
+      "fields": [
+        { "path": "/theme", "value": "dark" },
+        { "path": "/ui/compactMode", "value": true }
+      ]
+    }
+  ],
+  "dependencies": [
+    { "type": "npm", "name": "example-package" },
+    { "type": "github", "repository": "OWNER/pi-extension" }
+  ],
+  "policy": { "minimumReleaseAgeDays": 7 },
+  "requiredTools": ["gh"]
+}
+```
+
+`requiredTools` is optional and contains only tool names from Pi Sync's supported installer catalog; it is not a place for shell commands, URLs, or arbitrary installer metadata. The initial catalog supports GitHub CLI (`gh`) from official GitHub CLI release artifacts on Linux/macOS (x64/arm64) and Windows x64. Each complete release archive is checked against a code-pinned SHA-256 digest from GitHub CLI's official [`gh_2.74.2_checksums.txt`](https://github.com/cli/cli/releases/download/v2.74.2/gh_2.74.2_checksums.txt) before extraction, writing, or execution. HTTPS alone is not treated as artifact integrity. The project does not independently verify a vendor signature; changing the version or digests requires reviewed source changes. Bootstrap checks command availability and reports detected versions. Missing catalogued tools are installed into `~/.local/bin` by default (or a user-selected `--bin-dir`), without sudo or persistent PATH/configuration changes. Unsupported platform/architecture, missing pin, digest mismatch, download, execution, or write failures stop bootstrap with the exact tool, reason, and user action; no required tool is silently skipped. WSL, containers, and remote Linux environments use the Linux artifact and user-local path. On Windows, use the selected bin directory in the current user's PATH yourself if you want to invoke the installed CLI outside Pi Sync. The default Node-only Pi Sync runtime itself does not depend on these external tools. Deterministic host-injected platform fixtures validate asset selection but do not claim native behavior. A dedicated CI workflow runs the intercepted-download install, execution, temporary user-path, and PATH-discovery smoke test on native macOS and Windows runners. Linux adapter tests run on the host test environment; they do not represent executed WSL, container, or remote environments, which remain unverified as deployment environments.
+
+The policy is repository-owned; `minimumReleaseAgeDays` defaults to seven and may not be set below seven. Machines cannot override it. The corresponding lockfile starts empty until `pi-sync update` resolves mature releases:
+
+```json
+{
+  "schemaVersion": 1,
+  "packages": [
+    { "type": "npm", "name": "example-package", "version": "1.2.3", "releasedAt": "2025-01-01T00:00:00.000Z" },
+    { "type": "github", "repository": "OWNER/pi-extension", "commit": "0123456789abcdef0123456789abcdef01234567", "tag": "v1.2.3", "releasedAt": "2025-01-01T00:00:00.000Z" }
+  ]
+}
+```
+
+The npm version is an exact published version; GitHub records the resolved immutable commit SHA plus tag/timestamp review metadata. Missing or incomplete timestamps, tags, or commit SHAs fail closed. Pi Sync pins only top-level package references. Pi controls transitive dependency resolution; Pi Sync does not provide a transitive lock or reproducibility guarantee.
+
+Sources must be directories below `resources/skills/`, targets must be below the local agent directory's `skills/`, and symbolic links are rejected. Paths use relative POSIX syntax and may not traverse outside their root. The optional schema-v1 `settings` list supports explicitly selected JSON Pointer fields in `settings.json`, `models.json`, `keybindings.json`, or `mcp.json`; each entry has a `target` and `fields` array of `{ "path": "/nested/key", "value": ... }`. Keep paths narrow and never declare credentials or machine-local values; Pi Sync rejects credential-like field names as a defense-in-depth check. This is not a general secret scanner. Unselected keys and values are preserved. A pre-existing selected setting that differs from its declared value is reported as a collision on first apply rather than overwritten. Unsupported schema fields, resource types, malformed dependency declarations, and lockfile package entries that do not exactly match manifest dependencies are rejected before the local installation is changed.
+
+Apply stores its last-applied content baseline and recoverable backups under `<agent-dir>/.pi-sync/`, outside the setup repository. The baseline enables file-level three-way resource reconciliation and per-field settings reconciliation: repository-only changes are applied independently, local-only changes are preserved and reported as `local-divergence`, and overlapping changes are reported as conflicts without overwriting the conflicted item. Non-conflicting files and settings fields can still be reconciled in the same apply. Apply operations are serialized with a local lock; if a lock's owner process has exited, apply fails closed and asks the user to remove `.pi-sync/apply.lock` only after confirming that no apply process is running. Local state and backups are not part of the setup repository.
+
+## Commands
+
+Run from the setup repository, or select it explicitly:
+
+```sh
+pi-sync status [--repo PATH] [--agent-dir PATH]
+pi-sync plan [--repo PATH] [--agent-dir PATH]
+pi-sync apply [--repo PATH] [--agent-dir PATH] [--approve]
+pi-sync add --type skill --source skills/NAME [--repo PATH] [--agent-dir PATH]
+pi-sync add --type dependency --source npm:PACKAGE [--repo PATH]
+pi-sync add --type dependency --source github:OWNER/REPOSITORY [--repo PATH]
+pi-sync update [--repo PATH]
+pi-sync update --apply [--repo PATH] [--agent-dir PATH] [--approve]
+pi-sync update --apply --push [--repo PATH] [--agent-dir PATH] [--approve]
+pi-sync push [--repo PATH]
+pi-sync push --publish [--repo PATH]
+pi-sync prune [--repo PATH] [--agent-dir PATH]
+pi-sync prune --confirm [--repo PATH] [--agent-dir PATH]
+```
+
+The target defaults to `PI_CODING_AGENT_DIR`, then `~/.pi/agent`. Each command emits JSON. `status` and `plan` report `install`, `update`, `unchanged`, `local-divergence`, `conflict`, or `collision` actions. Apply installs absent resources, reconciles tracked changes, and leaves unlisted resources and settings untouched. Unknown pre-existing resource paths and settings collisions are never overwritten.
+
+`add --type skill` supports explicitly importing one skill directory from `skills/NAME` in the local Pi agent directory. It copies that directory to `resources/skills/NAME` and appends the corresponding manifest resource. `add --type dependency` declares only the selected npm package or GitHub repository; it does not edit pins or install packages. Run `update` to preview mature exact pins, then `update --apply` to explicitly apply eligible updates. Managed package updates must be performed through `pi-sync update`; ordinary `apply` uses lockfile pins without registry/GitHub update lookups. First-time installs require interactive confirmation or explicit `--approve` for non-interactive use. Known credential-store paths and likely secret material stop skill import and are reported for review; the scanner is best-effort and does not guarantee arbitrary content is secret-free.
+
+Do not use the external `pi update --extensions` command for managed packages. It is unsupported for managed packages and may move them beyond their recorded pins; Pi Sync cannot intercept or prevent it. Use `pi-sync update` (and `--apply` after reviewing the plan) to update managed packages under the repository's release-age policy.
+
+## Agent API and first-party skill
+
+Every command emits JSON with `apiVersion: 1` and an `ok` boolean. Conflict responses include structured `conflicts`, `actions`, and/or `staleResources`; errors retain a readable `error` string and include `errorCode`, `details`, and `exitCode`. Exit `0` means the operation completed, `1` means an operational conflict, required first-install approval, package-manager failure, untrustworthy update metadata, or unsafe stale-resource operation, and `2` means invalid input or repository/manifest validation failed. In particular, apply leaves conflicted items untouched and returns `1`; inspect the JSON and re-plan rather than guessing or overwriting.
+
+The agent workflow is documented in the first-party skill at `resources/skills/pi-sync/SKILL.md`, and that artifact is included in the published CLI package. Its manifest entry is `{ "type": "skill", "source": "resources/skills/pi-sync", "target": "skills/pi-sync" }`. The CLI apply installs declared Pi packages from exact lockfile pins and reconciles managed resources; it does not install undeclared bundled content.
+
+Push is opt-in. `pi-sync push` previews the full patch for `pi-sync.json` (including policy), `pi-sync.lock.json`, and only resources explicitly registered by the manifest. It excludes unrelated staged/unstaged files, ignored files, and unregistered resources. Review the preview before `pi-sync push --publish`; the publishing flow re-displays the commit preview before creating an ordinary commit and fast-forward push. Git hooks are skipped for the Pi Sync commit so hooks cannot add paths outside the managed allowlist. It stops on unrelated commits ahead of upstream or any remote advancement/divergence and never force-pushes. A rejected push leaves the managed commit local. `update --apply --push` is explicit authorization to publish after the approved package update and follows the same managed-only checks.
+
+Resources previously applied by Pi Sync but removed from the manifest are reported as `stale` in status, plan, and apply output. Ordinary apply never removes them. `prune` previews eligible stale resources without changing files; `prune --confirm` removes only stale resources that still exactly match their saved last-applied baseline. Modified stale resources are retained and reported. Removed resources are backed up under `.pi-sync/backups/`, and unrelated local resources are not touched.

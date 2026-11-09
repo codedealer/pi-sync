@@ -1,0 +1,25 @@
+name: Prerequisite native platform smoke
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+jobs:
+  native-platform-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: macOS
+          - os: windows-2022
+            platform: Windows
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.platform }} user-local prerequisite smoke
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test test/prerequisites-platform.test.js
