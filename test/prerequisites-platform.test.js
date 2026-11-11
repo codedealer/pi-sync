@@ -79,7 +79,16 @@ test('native macOS/Windows user-local install, execution, and PATH smoke', { ski
 
   const home = path.join(root, 'isolated-user-home');
   const binDir = path.join(home, '.local', 'bin');
-  const options = { binDir, env: { ...process.env }, platform, architecture };
+  // Hosted runners (macOS in particular) ship a preinstalled gh on PATH, which
+  // would short-circuit the user-local install path. Isolate PATH so the test
+  // exercises the install: only node (needed by the shebang fixture) and the
+  // standard system directories, plus the inspector's own binDir prefix.
+  const nodeDir = path.join(root, 'node-dir');
+  await fs.mkdir(nodeDir);
+  await fs.copyFile(process.execPath, path.join(nodeDir, platform === 'win32' ? 'node.exe' : 'node'));
+  const systemDirs = platform === 'win32' ? ['C:\\Windows\\system32', 'C:\\Windows'] : ['/usr/bin', '/bin'];
+  const isolatedEnv = { ...process.env, PATH: [nodeDir, ...systemDirs].join(path.delimiter) };
+  const options = { binDir, env: isolatedEnv, platform, architecture };
   const installed = await inspector(['gh'], options);
   assert.equal(installed.ok, true, JSON.stringify(installed.tools));
   const executable = path.join(binDir, asset.binary);
