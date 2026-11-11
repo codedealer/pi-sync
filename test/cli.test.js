@@ -149,6 +149,18 @@ function result(processResult) {
   return JSON.parse(processResult.stdout);
 }
 
+async function fakePi(t, { fail = false } = {}) {
+  const bin = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-fake-pi-'));
+  t.after(() => fs.rm(bin, { recursive: true, force: true }));
+  const script = `#!${process.execPath}\nconst fs = require('node:fs');\nif (process.env.PI_CALL_LOG) { try { fs.appendFileSync(process.env.PI_CALL_LOG, process.argv.slice(2).join(' ') + '\\n'); } catch {} }\nprocess.exit(${fail ? 1 : 0});\n`;
+  await fs.writeFile(path.join(bin, 'pi'), script, { mode: 0o755 });
+  return { PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+}
+
+async function piCalls(logFile) {
+  try { return (await fs.readFile(logFile, 'utf8')).trim().split('\n').filter(Boolean); } catch { return []; }
+}
+
 function runAsync(args, env = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [cli, ...args], { encoding: 'utf8', env: { ...process.env, ...env } });
@@ -297,6 +309,9 @@ test('supported agent commands share a versioned JSON response contract', async 
   const added = run(['add', '--type', 'skill', '--source', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(added.status, 0, added.stderr);
   responses.push(result(added));
+  const removed = run(['remove', '--type', 'skill', '--target', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(removed.status, 0, removed.stderr);
+  responses.push(result(removed));
   const pruned = run(['prune', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(pruned.status, 0, pruned.stderr);
   responses.push(result(pruned));
@@ -305,13 +320,15 @@ test('supported agent commands share a versioned JSON response contract', async 
     assert.equal(response.apiVersion, 1);
     assert.equal(response.ok, true);
     assert.equal(response.exitCode, 0);
-    assert.ok(['status', 'plan', 'apply', 'add', 'prune'].includes(response.command));
+    assert.ok(['status', 'plan', 'apply', 'add', 'remove', 'prune'].includes(response.command));
   }
+  const manifestAfterRemove = JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8'));
+  assert.equal(manifestAfterRemove.resources.some((item) => item.target === 'skills/local-only'), false);
 
   const skill = await fs.readFile(new URL('../resources/skills/pi-sync/SKILL.md', import.meta.url), 'utf8');
   const packageJson = JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8'));
   assert.ok(packageJson.files.includes('resources/skills/pi-sync/SKILL.md'));
-  for (const workflow of ['pi-sync status', 'pi-sync plan', 'pi-sync apply', 'pi-sync add', 'pi-sync prune', 'pi-sync prune --confirm']) {
+  for (const workflow of ['pi-sync status', 'pi-sync plan', 'pi-sync apply', 'pi-sync add', 'pi-sync remove', 'pi-sync prune', 'pi-sync prune --confirm']) {
     assert.ok(skill.includes(workflow), `skill documents ${workflow}`);
   }
 });
@@ -373,7 +390,7 @@ test('invalid manifest and unsupported declarations fail before changing the loc
 
   await fs.writeFile(path.join(repo, 'pi-sync.json'), JSON.stringify({
     schemaVersion: 1,
-    resources: [{ type: 'extension', source: 'resources/skills/hello', target: 'skills/hello' }],
+    resources: [{ type: 'theme', source: 'resources/skills/hello', target: 'skills/hello' }],
     dependencies: [],
   }));
   const unsupported = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
@@ -636,9 +653,13 @@ test('add imports only the explicitly selected skill and updates the manifest', 
 
 test('add rejects unsupported types, collisions, and suspected credential material without importing', async (t) => {
   const { repo, agentDir } = await fixture(t);
-  const unsupported = run(['add', '--type', 'extension', '--source', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
+  const unsupported = run(['add', '--type', 'theme', '--source', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(unsupported.status, 2);
   assert.match(result(unsupported).error, /Unsupported resource type/);
+
+  const wrongRoot = run(['add', '--type', 'extension', '--source', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(wrongRoot.status, 2);
+  assert.match(result(wrongRoot).error, /Extension source must be a file or directory under extensions\//);
 
   await fs.mkdir(path.join(repo, 'resources', 'skills', 'local-only'), { recursive: true });
   const collision = run(['add', '--type', 'skill', '--source', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
@@ -1181,3 +1202,1191 @@ test('EACCES installation fixture returns a user-writable handoff without elevat
     fs.mkdir = originalMkdir;
   }
 });
+
+async function extendedFixture(t) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-extended-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repo = path.join(root, 'setup');
+  const agentDir = path.join(root, 'agent');
+  await fs.mkdir(repo, { recursive: true });
+  // Authored local content that the tests import through add.
+  await fs.mkdir(path.join(agentDir, 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(agentDir, 'prompts', 'deploy.md'), '# Deploy prompt\n');
+  await fs.mkdir(path.join(agentDir, 'agents'), { recursive: true });
+  await fs.writeFile(path.join(agentDir, 'agents', 'reviewer.md'), '# Reviewer agent\n');
+  await fs.mkdir(path.join(agentDir, 'roles'), { recursive: true });
+  await fs.writeFile(path.join(agentDir, 'roles', 'moderator.md'), '# Moderator role\n');
+  await fs.mkdir(path.join(agentDir, 'extensions', 'github-copilot-usage'), { recursive: true });
+  await fs.writeFile(path.join(agentDir, 'extensions', 'github-copilot-usage', 'index.ts'), 'export const usage = true;\n');
+  await fs.writeFile(path.join(agentDir, 'extensions', 'github-copilot-usage', 'test.ts'), 'export const t = true;\n');
+  await fs.mkdir(path.join(agentDir, 'extensions', 'subagent'), { recursive: true });
+  await fs.writeFile(path.join(agentDir, 'extensions', 'subagent', 'config.json'), `${JSON.stringify({ model: 'local-model', maxAgents: 3 }, null, 2)}\n`);
+  // Unmanaged content that must remain invisible to reconciliation and untouched by apply.
+  await fs.writeFile(path.join(agentDir, 'prompts', 'unmanaged.md'), '# Unmanaged prompt\n');
+  await fs.writeFile(path.join(agentDir, 'extensions', 'unmanaged-ext.ts'), 'export const x = 1;\n');
+  await fs.writeFile(path.join(repo, 'pi-sync.json'), `${JSON.stringify({ schemaVersion: 1, resources: [], dependencies: [] }, null, 2)}\n`);
+  await fs.writeFile(path.join(repo, 'pi-sync.lock.json'), `${JSON.stringify({ schemaVersion: 1, packages: [] }, null, 2)}\n`);
+  return { root, repo, agentDir };
+}
+
+const EXTENDED_ADDS = [
+  ['prompt', 'prompts/deploy.md'],
+  ['agent', 'agents/reviewer.md'],
+  ['role', 'roles/moderator.md'],
+  ['extension', 'extensions/github-copilot-usage'],
+  ['extension', 'extensions/subagent/config.json'],
+];
+
+function addAllExtended(repo, agentDir) {
+  for (const [type, source] of EXTENDED_ADDS) {
+    const response = run(['add', '--type', type, '--source', source, '--repo', repo, '--agent-dir', agentDir]);
+    assert.equal(response.status, 0, `${type} ${source}: ${response.stderr}\n${response.stdout}`);
+  }
+}
+
+test('add imports prompts, agents, roles, and file and directory extension forms with manifest updates', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  for (const [type, source] of EXTENDED_ADDS) {
+    const response = run(['add', '--type', type, '--source', source, '--repo', repo, '--agent-dir', agentDir]);
+    assert.equal(response.status, 0, `${type} ${source}: ${response.stderr}\n${response.stdout}`);
+    const output = result(response);
+    assert.equal(output.action, 'added');
+    assert.equal(output.type, type);
+    assert.equal(output.source, source);
+    assert.equal(output.target, source);
+    assert.equal(output.repositorySource, `resources/${source}`);
+  }
+  const manifest = JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8'));
+  assert.deepEqual(manifest.resources.map((item) => [item.type, item.source, item.target]), [
+    ['prompt', 'resources/prompts/deploy.md', 'prompts/deploy.md'],
+    ['agent', 'resources/agents/reviewer.md', 'agents/reviewer.md'],
+    ['role', 'resources/roles/moderator.md', 'roles/moderator.md'],
+    ['extension', 'resources/extensions/github-copilot-usage', 'extensions/github-copilot-usage'],
+    ['extension', 'resources/extensions/subagent/config.json', 'extensions/subagent/config.json'],
+  ]);
+  assert.equal(await fs.readFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), 'utf8'), '# Deploy prompt\n');
+  assert.equal(await fs.readFile(path.join(repo, 'resources', 'agents', 'reviewer.md'), 'utf8'), '# Reviewer agent\n');
+  assert.equal(await fs.readFile(path.join(repo, 'resources', 'roles', 'moderator.md'), 'utf8'), '# Moderator role\n');
+  assert.equal(await fs.readFile(path.join(repo, 'resources', 'extensions', 'github-copilot-usage', 'index.ts'), 'utf8'), 'export const usage = true;\n');
+  assert.equal(await fs.readFile(path.join(repo, 'resources', 'extensions', 'subagent', 'config.json'), 'utf8'),
+    await fs.readFile(path.join(agentDir, 'extensions', 'subagent', 'config.json'), 'utf8'));
+  // Local sources remain in place and unrelated local content is not imported.
+  assert.equal(await fs.readFile(path.join(agentDir, 'prompts', 'deploy.md'), 'utf8'), '# Deploy prompt\n');
+  await assert.rejects(fs.access(path.join(repo, 'resources', 'prompts', 'unmanaged.md')));
+  await assert.rejects(fs.access(path.join(repo, 'resources', 'extensions', 'unmanaged-ext.ts')));
+});
+
+test('apply installs new-type resources, is idempotent, and leaves unmanaged content untouched', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  addAllExtended(repo, agentDir);
+  // Remove the local originals so apply performs real installs.
+  await fs.rm(path.join(agentDir, 'prompts', 'deploy.md'));
+  await fs.rm(path.join(agentDir, 'agents', 'reviewer.md'));
+  await fs.rm(path.join(agentDir, 'roles', 'moderator.md'));
+  await fs.rm(path.join(agentDir, 'extensions', 'github-copilot-usage'), { recursive: true });
+  await fs.rm(path.join(agentDir, 'extensions', 'subagent', 'config.json'));
+
+  const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.deepEqual(result(first).actions.map((item) => item.action).sort(), ['installed', 'installed', 'installed', 'installed', 'installed']);
+  assert.equal(await fs.readFile(path.join(agentDir, 'prompts', 'deploy.md'), 'utf8'), '# Deploy prompt\n');
+  assert.equal(await fs.readFile(path.join(agentDir, 'agents', 'reviewer.md'), 'utf8'), '# Reviewer agent\n');
+  assert.equal(await fs.readFile(path.join(agentDir, 'roles', 'moderator.md'), 'utf8'), '# Moderator role\n');
+  assert.equal(await fs.readFile(path.join(agentDir, 'extensions', 'github-copilot-usage', 'index.ts'), 'utf8'), 'export const usage = true;\n');
+  assert.equal(await fs.readFile(path.join(agentDir, 'extensions', 'github-copilot-usage', 'test.ts'), 'utf8'), 'export const t = true;\n');
+  assert.equal(await fs.readFile(path.join(agentDir, 'extensions', 'subagent', 'config.json'), 'utf8'), `${JSON.stringify({ model: 'local-model', maxAgents: 3 }, null, 2)}\n`);
+
+  const second = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(second.status, 0, second.stderr);
+  assert.equal(result(second).ok, true);
+  assert.deepEqual(result(second).actions.map((item) => item.action).sort(), ['unchanged', 'unchanged', 'unchanged', 'unchanged', 'unchanged']);
+
+  // Unmanaged content under the same roots is invisible to plan/status and untouched by apply.
+  const planned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(planned.status, 0, planned.stderr);
+  assert.deepEqual(result(planned).actions.map((item) => item.target).sort(),
+    ['agents/reviewer.md', 'extensions/github-copilot-usage', 'extensions/subagent/config.json', 'prompts/deploy.md', 'roles/moderator.md']);
+  assert.equal(result(planned).conflicts.length, 0);
+  assert.equal(result(planned).staleResources.length, 0);
+  assert.equal(await fs.readFile(path.join(agentDir, 'prompts', 'unmanaged.md'), 'utf8'), '# Unmanaged prompt\n');
+  assert.equal(await fs.readFile(path.join(agentDir, 'extensions', 'unmanaged-ext.ts'), 'utf8'), 'export const x = 1;\n');
+});
+
+test('prompt, agent, and role resources reconcile with the same three-way semantics as skills', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  for (const [type, source] of [['prompt', 'prompts/deploy.md'], ['agent', 'agents/reviewer.md'], ['role', 'roles/moderator.md']]) {
+    const response = run(['add', '--type', type, '--source', source, '--repo', repo, '--agent-dir', agentDir]);
+    assert.equal(response.status, 0, response.stderr);
+  }
+  const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(first.status, 0, first.stderr);
+  for (const action of result(first).actions) assert.equal(action.action, 'unchanged');
+
+  // prompt: a local-only edit is preserved and reported as local-divergence.
+  const prompt = path.join(agentDir, 'prompts', 'deploy.md');
+  await fs.writeFile(prompt, '# Local prompt edit\n');
+  const divergence = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(divergence.status, 0, divergence.stderr);
+  assert.equal(result(divergence).actions.find((item) => item.target === 'prompts/deploy.md').action, 'local-divergence');
+  assert.equal(await fs.readFile(prompt, 'utf8'), '# Local prompt edit\n');
+
+  // role: a repository-only edit applies.
+  const roleTarget = path.join(agentDir, 'roles', 'moderator.md');
+  await fs.writeFile(path.join(repo, 'resources', 'roles', 'moderator.md'), '# Repository role edit\n');
+  const updated = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(updated.status, 0, updated.stderr);
+  assert.equal(result(updated).actions.find((item) => item.target === 'roles/moderator.md').action, 'updated');
+  assert.equal(await fs.readFile(roleTarget, 'utf8'), '# Repository role edit\n');
+
+  // agent: repository and local both changed conflicts without overwriting.
+  const agentTarget = path.join(agentDir, 'agents', 'reviewer.md');
+  await fs.writeFile(agentTarget, '# Local agent edit\n');
+  await fs.writeFile(path.join(repo, 'resources', 'agents', 'reviewer.md'), '# Repository agent edit\n');
+  const conflict = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(conflict.status, 1, conflict.stderr);
+  assert.equal(result(conflict).actions.find((item) => item.target === 'agents/reviewer.md').action, 'conflict');
+  assert.equal(await fs.readFile(agentTarget, 'utf8'), '# Local agent edit\n');
+});
+
+test('multi-file extension directories are managed end to end with the same three-way semantics', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  const response = run(['add', '--type', 'extension', '--source', 'extensions/github-copilot-usage', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(response.status, 0, response.stderr);
+  assert.equal(result(response).repositorySource, 'resources/extensions/github-copilot-usage');
+  const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(result(first).actions[0].action, 'unchanged');
+
+  // Local-only change is preserved and reported with per-file detail.
+  const targetIndex = path.join(agentDir, 'extensions', 'github-copilot-usage', 'index.ts');
+  await fs.writeFile(targetIndex, 'export const usage = "local";\n');
+  const divergence = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(divergence.status, 0, divergence.stderr);
+  const divergenceAction = result(divergence).actions[0];
+  assert.equal(divergenceAction.action, 'local-divergence');
+  assert.equal(divergenceAction.files.find((file) => file.path === 'index.ts').action, 'local-divergence');
+  assert.equal(await fs.readFile(targetIndex, 'utf8'), 'export const usage = "local";\n');
+
+  // Repository and local both changed conflicts without overwriting.
+  await fs.writeFile(path.join(repo, 'resources', 'extensions', 'github-copilot-usage', 'index.ts'), 'export const usage = "repo";\n');
+  const conflict = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(conflict.status, 1, conflict.stderr);
+  const conflictAction = result(conflict).actions[0];
+  assert.equal(conflictAction.action, 'conflict');
+  assert.equal(conflictAction.files.find((file) => file.path === 'index.ts').action, 'conflict');
+  assert.equal(await fs.readFile(targetIndex, 'utf8'), 'export const usage = "local";\n');
+
+  // Aligning the local file with the last-applied baseline lets the repository-only change apply.
+  await fs.writeFile(targetIndex, 'export const usage = true;\n');
+  const updated = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(updated.status, 0, updated.stderr);
+  assert.equal(result(updated).actions[0].action, 'updated');
+  assert.equal(await fs.readFile(targetIndex, 'utf8'), 'export const usage = "repo";\n');
+  // The sibling file that never changed stays intact.
+  assert.equal(await fs.readFile(path.join(agentDir, 'extensions', 'github-copilot-usage', 'test.ts'), 'utf8'), 'export const t = true;\n');
+});
+
+test('a package update rewrite of a managed extension config file is reported, never silently overwritten', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  const response = run(['add', '--type', 'extension', '--source', 'extensions/subagent/config.json', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(response.status, 0, response.stderr);
+  const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(result(first).actions[0].action, 'unchanged');
+  const config = path.join(agentDir, 'extensions', 'subagent', 'config.json');
+
+  // A pinned package install rewrites the managed config file locally: local-only change.
+  await fs.writeFile(config, `${JSON.stringify({ model: 'package-rewritten' }, null, 2)}\n`);
+  const divergence = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(divergence.status, 0, divergence.stderr);
+  assert.equal(result(divergence).actions[0].action, 'local-divergence');
+  assert.equal(JSON.parse(await fs.readFile(config, 'utf8')).model, 'package-rewritten');
+
+  // Repository and local both changed: conflict through the ordinary three-way rules.
+  await fs.writeFile(path.join(repo, 'resources', 'extensions', 'subagent', 'config.json'), `${JSON.stringify({ model: 'repo-config' }, null, 2)}\n`);
+  const conflict = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(conflict.status, 1, conflict.stderr);
+  assert.equal(result(conflict).actions[0].action, 'conflict');
+  assert.equal(JSON.parse(await fs.readFile(config, 'utf8')).model, 'package-rewritten');
+
+  // Resolving locally to the last-applied baseline lets the repository change apply.
+  await fs.writeFile(config, `${JSON.stringify({ model: 'local-model', maxAgents: 3 }, null, 2)}\n`);
+  const updated = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(updated.status, 0, updated.stderr);
+  assert.equal(result(updated).actions[0].action, 'updated');
+  assert.equal(JSON.parse(await fs.readFile(config, 'utf8')).model, 'repo-config');
+});
+
+test('new-type add guards reject symlinks, traversal, collisions, secrets, and package-installed code', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+
+  // Symlinked file source is rejected.
+  await fs.symlink(path.join(agentDir, 'prompts', 'deploy.md'), path.join(agentDir, 'prompts', 'linked.md'));
+  const symlink = run(['add', '--type', 'prompt', '--source', 'prompts/linked.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(symlink.status, 2, symlink.stderr);
+  assert.match(result(symlink).error, /symbolic link/i);
+  await assert.rejects(fs.access(path.join(repo, 'resources', 'prompts', 'linked.md')));
+  await fs.rm(path.join(agentDir, 'prompts', 'linked.md'));
+
+  // Path traversal is rejected before any import.
+  const traversal = run(['add', '--type', 'prompt', '--source', 'prompts/../../outside.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(traversal.status, 2);
+  assert.match(result(traversal).error, /.. path segments/);
+
+  // A source outside the type root is rejected.
+  const wrongRoot = run(['add', '--type', 'extension', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(wrongRoot.status, 2);
+  assert.match(result(wrongRoot).error, /Extension source must be a file or directory under extensions\//);
+
+  // A non-.md file is rejected for prompt types.
+  const wrongShape = run(['add', '--type', 'agent', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(wrongShape.status, 2);
+  assert.match(result(wrongShape).error, /Agent source must be a \.md file directly under agents\//);
+
+  // Re-adding an already declared source is a collision.
+  assert.equal(run(['add', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  const collision = run(['add', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(collision.status, 2);
+  assert.equal(result(collision).errorCode, 'RESOURCE_COLLISION');
+
+  // A repository path that exists but is not declared is a collision.
+  await fs.mkdir(path.join(repo, 'resources', 'agents'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'agents', 'reviewer.md'), '# Existing\n');
+  const repoCollision = run(['add', '--type', 'agent', '--source', 'agents/reviewer.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(repoCollision.status, 2);
+  assert.equal(result(repoCollision).errorCode, 'RESOURCE_COLLISION');
+  assert.match(result(repoCollision).error, /setup repository path already exists/);
+  await fs.rm(path.join(repo, 'resources', 'agents'), { recursive: true });
+
+  // Likely secret material stops the import before anything is copied.
+  await fs.writeFile(path.join(agentDir, 'extensions', 'subagent', 'config.json'), 'apiKey = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"\n');
+  const secret = run(['add', '--type', 'extension', '--source', 'extensions/subagent/config.json', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(secret.status, 2);
+  const secretOutput = result(secret);
+  assert.equal(secretOutput.errorCode, 'SECRET_REVIEW_REQUIRED');
+  assert.equal(secretOutput.reviewRequired[0].path, 'extensions/subagent/config.json');
+  assert.match(secretOutput.reviewRequired[0].reason, /GitHub token/);
+  await assert.rejects(fs.access(path.join(repo, 'resources', 'extensions', 'subagent')));
+  await fs.writeFile(path.join(agentDir, 'extensions', 'subagent', 'config.json'), `${JSON.stringify({ model: 'local-model', maxAgents: 3 }, null, 2)}\n`);
+
+  // Package-installed code (npm tree) is never imported into the repository.
+  await fs.mkdir(path.join(agentDir, 'extensions', 'github-copilot-usage', 'node_modules', 'pinned'), { recursive: true });
+  await fs.writeFile(path.join(agentDir, 'extensions', 'github-copilot-usage', 'node_modules', 'pinned', 'index.js'), 'module.exports = 1;\n');
+  const packageCode = run(['add', '--type', 'extension', '--source', 'extensions/github-copilot-usage', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(packageCode.status, 2);
+  assert.match(result(packageCode).error, /node_modules/);
+  await assert.rejects(fs.access(path.join(repo, 'resources', 'extensions', 'github-copilot-usage')));
+  await fs.rm(path.join(agentDir, 'extensions', 'github-copilot-usage', 'node_modules'), { recursive: true });
+});
+
+test('declared targets that already exist unmanaged are reported as collisions and never overwritten', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+
+  // Unmanaged file with different content at a declared file target.
+  await fs.writeFile(path.join(agentDir, 'prompts', 'deploy.md'), '# Keep my local prompt\n');
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Repository prompt\n');
+  let manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.resources.push({ type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' });
+  await fs.writeFile(manifestPath, JSON.stringify(manifest));
+
+  const applied = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(applied.status, 1, applied.stderr);
+  const output = result(applied);
+  assert.equal(output.actions[0].action, 'collision');
+  assert.equal(output.conflicts[0].target, 'prompts/deploy.md');
+  assert.equal(await fs.readFile(path.join(agentDir, 'prompts', 'deploy.md'), 'utf8'), '# Keep my local prompt\n');
+
+  // A directory where a managed file is declared is also a collision and is left intact.
+  await fs.rm(path.join(agentDir, 'prompts', 'deploy.md'));
+  await fs.rm(path.join(agentDir, 'extensions', 'subagent', 'config.json'));
+  await fs.mkdir(path.join(agentDir, 'extensions', 'subagent', 'config.json'), { recursive: true });
+  await fs.writeFile(path.join(agentDir, 'extensions', 'subagent', 'config.json', 'inner.txt'), 'keep\n');
+  await fs.mkdir(path.join(repo, 'resources', 'extensions', 'subagent'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'extensions', 'subagent', 'config.json'), '{"model":"x"}\n');
+  manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.resources.push({ type: 'extension', source: 'resources/extensions/subagent/config.json', target: 'extensions/subagent/config.json' });
+  await fs.writeFile(manifestPath, JSON.stringify(manifest));
+
+  const second = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(second.status, 1, second.stderr);
+  const secondOutput = result(second);
+  assert.equal(secondOutput.actions.find((item) => item.target === 'extensions/subagent/config.json').action, 'collision');
+  assert.equal(await fs.readFile(path.join(agentDir, 'extensions', 'subagent', 'config.json', 'inner.txt'), 'utf8'), 'keep\n');
+  const stillDirectory = await fs.lstat(path.join(agentDir, 'extensions', 'subagent', 'config.json'));
+  assert.equal(stillDirectory.isDirectory(), true);
+});
+
+test('stale new-type resources are reported and prune removes managed file resources', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  addAllExtended(repo, agentDir);
+  const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(first.status, 0, first.stderr);
+
+  // Undeclaring two file-kind resources leaves stale baselines for them.
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.resources = manifest.resources.filter((item) => !['prompts/deploy.md', 'extensions/subagent/config.json'].includes(item.target));
+  await fs.writeFile(manifestPath, JSON.stringify(manifest));
+
+  const applied = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(applied.status, 0, applied.stderr);
+  const appliedOutput = result(applied);
+  assert.deepEqual(appliedOutput.staleResources.map((item) => item.target).sort(), ['extensions/subagent/config.json', 'prompts/deploy.md']);
+  for (const target of ['extensions/subagent/config.json', 'prompts/deploy.md']) {
+    assert.equal(appliedOutput.staleResources.find((item) => item.target === target).state, 'unchanged');
+    assert.equal(appliedOutput.actions.find((item) => item.target === target).action, 'stale');
+  }
+  // Local content of the stale resources is intact.
+  assert.equal(await fs.readFile(path.join(agentDir, 'prompts', 'deploy.md'), 'utf8'), '# Deploy prompt\n');
+  assert.equal(await fs.readFile(path.join(agentDir, 'extensions', 'subagent', 'config.json'), 'utf8'), `${JSON.stringify({ model: 'local-model', maxAgents: 3 }, null, 2)}\n`);
+
+  // Preview does not delete.
+  const preview = run(['prune', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.deepEqual(result(preview).staleResources.map((item) => item.action).sort(), ['would-prune', 'would-prune']);
+  await fs.access(path.join(agentDir, 'prompts', 'deploy.md'));
+
+  // Confirmed prune removes the local file copies and their state entries.
+  const pruned = run(['prune', '--confirm', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(pruned.status, 0, pruned.stderr);
+  assert.deepEqual(result(pruned).staleResources.map((item) => item.target).sort(), ['extensions/subagent/config.json', 'prompts/deploy.md']);
+  await assert.rejects(fs.access(path.join(agentDir, 'prompts', 'deploy.md')));
+  await assert.rejects(fs.access(path.join(agentDir, 'extensions', 'subagent', 'config.json')));
+  const state = JSON.parse(await fs.readFile(path.join(agentDir, '.pi-sync', 'state.json'), 'utf8'));
+  assert.equal(Object.hasOwn(state.resources, 'prompts/deploy.md'), false);
+  assert.equal(Object.hasOwn(state.resources, 'extensions/subagent/config.json'), false);
+  // The sibling unmanaged prompt and the remaining managed resources stay intact.
+  assert.equal(await fs.readFile(path.join(agentDir, 'prompts', 'unmanaged.md'), 'utf8'), '# Unmanaged prompt\n');
+  assert.equal(await fs.readFile(path.join(agentDir, 'roles', 'moderator.md'), 'utf8'), '# Moderator role\n');
+
+  // A stale multi-file extension directory is pruned the same way.
+  const manifest3 = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest3.resources = manifest3.resources.filter((item) => item.target !== 'extensions/github-copilot-usage');
+  await fs.writeFile(manifestPath, JSON.stringify(manifest3));
+  const prunedDir = run(['prune', '--confirm', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(prunedDir.status, 0, prunedDir.stderr);
+  const pruneDirOutput = result(prunedDir);
+  assert.equal(pruneDirOutput.staleResources[0].target, 'extensions/github-copilot-usage');
+  assert.equal(pruneDirOutput.staleResources[0].action, 'pruned');
+  await assert.rejects(fs.access(path.join(agentDir, 'extensions', 'github-copilot-usage')));
+  const state3 = JSON.parse(await fs.readFile(path.join(agentDir, '.pi-sync', 'state.json'), 'utf8'));
+  assert.equal(Object.hasOwn(state3.resources, 'extensions/github-copilot-usage'), false);
+  // The pruned directory was backed up.
+  const backupRoot = path.join(agentDir, '.pi-sync', 'backups');
+  const backupEntries = await fs.readdir(backupRoot);
+  assert.ok(backupEntries.length >= 3, 'pruned resources are backed up');
+  const prunedBackups = await fs.readdir(path.join(backupRoot, backupEntries.at(-1)));
+  assert.equal(prunedBackups[0], 'extensions');
+  assert.equal(await fs.readFile(path.join(backupRoot, backupEntries.at(-1), 'extensions', 'github-copilot-usage', 'index.ts'), 'utf8'), 'export const usage = true;\n');
+
+  // A stale file resource with local edits is retained, not overwritten.
+  const manifest2 = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest2.resources = manifest2.resources.filter((item) => item.target !== 'agents/reviewer.md');
+  await fs.writeFile(manifestPath, JSON.stringify(manifest2));
+  await fs.writeFile(path.join(agentDir, 'agents', 'reviewer.md'), '# Keep my local agent\n');
+  const retained = run(['prune', '--confirm', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(retained.status, 1, retained.stderr);
+  assert.equal(result(retained).staleResources[0].action, 'retained-modified');
+  assert.equal(await fs.readFile(path.join(agentDir, 'agents', 'reviewer.md'), 'utf8'), '# Keep my local agent\n');
+});
+
+test('manifest validation fails closed for wrong-type roots, missing sources, and duplicate targets before local changes', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  await fs.mkdir(path.join(repo, 'resources', 'extensions'), { recursive: true });
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'extensions', 'config.json'), '{}\n');
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Deploy prompt\n');
+
+  // extension source under a foreign root
+  await fs.writeFile(path.join(repo, 'pi-sync.json'), JSON.stringify({
+    schemaVersion: 1,
+    resources: [{ type: 'extension', source: 'resources/prompts/deploy.md', target: 'extensions/deploy' }],
+    dependencies: [],
+  }));
+  let check = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(check.status, 2);
+  assert.match(result(check).error, /Extension resources must use resources\/extensions\/ sources/);
+
+  // prompt source with the wrong file shape under the correct root
+  await fs.writeFile(path.join(repo, 'pi-sync.json'), JSON.stringify({
+    schemaVersion: 1,
+    resources: [{ type: 'prompt', source: 'resources/prompts/deploy', target: 'prompts/deploy' }],
+    dependencies: [],
+  }));
+  check = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(check.status, 2);
+  assert.match(result(check).error, /must be a single \.md file directly under prompts\//);
+
+  // prompt target outside its root
+  await fs.writeFile(path.join(repo, 'pi-sync.json'), JSON.stringify({
+    schemaVersion: 1,
+    resources: [{ type: 'prompt', source: 'resources/prompts/deploy.md', target: 'agents/deploy.md' }],
+    dependencies: [],
+  }));
+  check = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(check.status, 2);
+  assert.match(result(check).error, /Prompt resources must use resources\/prompts\/ sources and prompts\/ targets/);
+
+  // unknown resource type
+  await fs.writeFile(path.join(repo, 'pi-sync.json'), JSON.stringify({
+    schemaVersion: 1,
+    resources: [{ type: 'theme', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' }],
+    dependencies: [],
+  }));
+  check = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(check.status, 2);
+  assert.match(result(check).error, /Unsupported resource type in resources\[0\]: theme/);
+
+  // missing source file
+  await fs.writeFile(path.join(repo, 'pi-sync.json'), JSON.stringify({
+    schemaVersion: 1,
+    resources: [{ type: 'role', source: 'resources/roles/missing.md', target: 'roles/missing.md' }],
+    dependencies: [],
+  }));
+  check = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(check.status, 2);
+  assert.match(result(check).error, /Resource source does not exist: resources\/roles\/missing\.md/);
+
+  // duplicate targets
+  await fs.writeFile(path.join(repo, 'pi-sync.json'), JSON.stringify({
+    schemaVersion: 1,
+    resources: [
+      { type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' },
+      { type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' },
+    ],
+    dependencies: [],
+  }));
+  check = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(check.status, 2);
+  assert.match(result(check).error, /Duplicate resource target: prompts\/deploy\.md/);
+
+  // A valid file-resource manifest validates and applies cleanly.
+  await fs.writeFile(path.join(repo, 'pi-sync.json'), JSON.stringify({
+    schemaVersion: 1,
+    resources: [{ type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' }],
+    dependencies: [],
+  }));
+  await fs.rm(path.join(agentDir, 'prompts', 'deploy.md'));
+  const ok = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(result(ok).actions[0].action, 'installed');
+  assert.equal(await fs.readFile(path.join(agentDir, 'prompts', 'deploy.md'), 'utf8'), '# Deploy prompt\n');
+});
+
+test('a managed file target replaced by a directory conflicts at apply without crashing or changing the target', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  const added = run(['add', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(added.status, 0, added.stderr);
+  const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(result(first).actions[0].action, 'unchanged');
+  const target = path.join(agentDir, 'prompts', 'deploy.md');
+  const statePath = path.join(agentDir, '.pi-sync', 'state.json');
+  const baselineState = await fs.readFile(statePath, 'utf8');
+  const baselineFile = JSON.parse(baselineState).resources['prompts/deploy.md'].files['deploy.md'];
+
+  // Locally replace the managed file with a directory that still holds the baseline content.
+  await fs.rm(target);
+  await fs.mkdir(target, { recursive: true });
+  await fs.writeFile(path.join(target, 'deploy.md'), '# Deploy prompt\n');
+  await fs.chmod(path.join(target, 'deploy.md'), baselineFile.mode);
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Repository prompt edit\n');
+
+  const planned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(planned.status, 1, planned.stderr);
+  assert.equal(result(planned).actions[0].action, 'conflict');
+  assert.match(result(planned).actions[0].reason, /changed type/);
+
+  // Apply reports the same structured conflict instead of crashing on the directory.
+  const applied = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(applied.status, 1, applied.stderr);
+  assert.doesNotMatch(applied.stdout, /rollback was incomplete/);
+  assert.doesNotMatch(applied.stdout, /EISDIR/);
+  const appliedAction = result(applied).actions[0];
+  assert.equal(appliedAction.action, 'conflict');
+  assert.match(appliedAction.reason, /changed type/);
+  // The local directory and its content are untouched and the baseline was not advanced.
+  const stillDirectory = await fs.lstat(target);
+  assert.equal(stillDirectory.isDirectory(), true);
+  assert.equal(await fs.readFile(path.join(target, 'deploy.md'), 'utf8'), '# Deploy prompt\n');
+  assert.equal(await fs.readFile(statePath, 'utf8'), baselineState);
+
+  // Restoring the file to the baseline lets the pending repository change apply.
+  await fs.rm(path.join(target, 'deploy.md'));
+  await fs.rm(target, { recursive: true });
+  await fs.writeFile(target, '# Deploy prompt\n');
+  await fs.chmod(target, baselineFile.mode);
+  const resolved = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(resolved.status, 0, resolved.stderr);
+  assert.equal(result(resolved).actions[0].action, 'updated');
+  assert.equal(await fs.readFile(target, 'utf8'), '# Repository prompt edit\n');
+});
+
+test('a managed extension directory replaced by a file conflicts at apply without re-materializing the directory', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  // A directory extension whose name matches an inner file, so a file standing in for the
+  // directory still matches the baseline content and the kind-change guard is the conflict.
+  const sourceDir = path.join(agentDir, 'extensions', 'tool');
+  await fs.mkdir(sourceDir, { recursive: true });
+  await fs.writeFile(path.join(sourceDir, 'tool'), 'export const tool = 1;\n');
+  const added = run(['add', '--type', 'extension', '--source', 'extensions/tool', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(added.status, 0, added.stderr);
+  const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(result(first).actions[0].action, 'unchanged');
+  const target = path.join(agentDir, 'extensions', 'tool');
+  const statePath = path.join(agentDir, '.pi-sync', 'state.json');
+  const baselineState = await fs.readFile(statePath, 'utf8');
+  const baselineFile = JSON.parse(baselineState).resources['extensions/tool'].files['tool'];
+
+  // Locally replace the managed directory with a single file holding the baseline content,
+  // then have the repository remove that file: a pending delete that must not re-create the directory.
+  await fs.rm(target, { recursive: true });
+  await fs.writeFile(target, Buffer.from(baselineFile.content, 'base64'));
+  await fs.chmod(target, baselineFile.mode);
+  await fs.rm(path.join(repo, 'resources', 'extensions', 'tool', 'tool'));
+
+  const planned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(planned.status, 1, planned.stderr);
+  const plannedAction = result(planned).actions[0];
+  assert.equal(plannedAction.action, 'conflict');
+  assert.match(plannedAction.reason, /changed type/);
+  assert.equal(plannedAction.files[0].action, 'delete');
+
+  const applied = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(applied.status, 1, applied.stderr);
+  assert.doesNotMatch(applied.stdout, /rollback was incomplete/);
+  const appliedAction = result(applied).actions[0];
+  assert.equal(appliedAction.action, 'conflict');
+  assert.match(appliedAction.reason, /changed type/);
+  // The user's file is not absorbed into a re-materialized directory and the baseline is unchanged.
+  const stillFile = await fs.lstat(target);
+  assert.equal(stillFile.isFile(), true);
+  assert.equal(await fs.readFile(target, 'utf8'), 'export const tool = 1;\n');
+  assert.equal(await fs.readFile(statePath, 'utf8'), baselineState);
+});
+
+test('file resource installs keep the repository file mode under a restrictive umask and stay idempotent', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  const added = run(['add', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(added.status, 0, added.stderr);
+  const target = path.join(agentDir, 'prompts', 'deploy.md');
+  await fs.rm(target);
+  const repoMode = (await fs.stat(path.join(repo, 'resources', 'prompts', 'deploy.md'))).mode & 0o777;
+  const previousUmask = process.umask(0o077);
+  try {
+    const installed = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+    assert.equal(installed.status, 0, installed.stderr);
+    assert.equal(result(installed).actions[0].action, 'installed');
+    assert.equal((await fs.stat(target)).mode & 0o777, repoMode);
+    const repeated = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+    assert.equal(repeated.status, 0, repeated.stderr);
+    assert.equal(result(repeated).actions[0].action, 'unchanged');
+  } finally {
+    process.umask(previousUmask);
+  }
+});
+
+test('a failed file apply restores the previous file through rollback and keeps the baseline', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  const added = run(['add', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(added.status, 0, added.stderr);
+  const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(result(first).actions[0].action, 'unchanged');
+  const target = path.join(agentDir, 'prompts', 'deploy.md');
+  const original = await fs.readFile(target, 'utf8');
+  const originalMode = (await fs.stat(target)).mode & 0o777;
+  const statePath = path.join(agentDir, '.pi-sync', 'state.json');
+  const baselineState = await fs.readFile(statePath, 'utf8');
+
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Repository prompt edit\n');
+  // Block the backup step so the file apply fails after planning and rollback capture.
+  const backupsPath = path.join(agentDir, '.pi-sync', 'backups');
+  await fs.writeFile(backupsPath, 'blocked\n');
+  const failed = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(failed.status, 2, failed.stderr);
+  assert.equal(result(failed).ok, false);
+  assert.doesNotMatch(failed.stdout, /rollback was incomplete/);
+  // The previous file is intact, the repository change did not leak in, and the baseline was not advanced.
+  assert.equal(await fs.readFile(target, 'utf8'), original);
+  assert.equal((await fs.stat(target)).mode & 0o777, originalMode);
+  assert.equal(await fs.readFile(statePath, 'utf8'), baselineState);
+
+  // Unblocking backups lets the pending update apply.
+  await fs.rm(backupsPath);
+  const retried = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(retried.status, 0, retried.stderr);
+  assert.equal(result(retried).actions[0].action, 'updated');
+  assert.equal(await fs.readFile(target, 'utf8'), '# Repository prompt edit\n');
+});
+
+test('remove deletes managed resources and dependencies from the repository without touching the local installation', async (t) => {
+  const { root, repo, agentDir } = await extendedFixture(t);
+  const skillDir = path.join(agentDir, 'skills', 'hello');
+  await fs.mkdir(skillDir, { recursive: true });
+  await fs.writeFile(path.join(skillDir, 'SKILL.md'), '# Hello\n');
+  assert.equal(run(['add', '--type', 'skill', '--source', 'skills/hello', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  addAllExtended(repo, agentDir);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const lockPath = path.join(repo, 'pi-sync.lock.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.dependencies = [{ type: 'npm', name: 'fixture-package' }, { type: 'github', repository: 'acme/pi-extension' }];
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  await fs.writeFile(lockPath, `${JSON.stringify({ schemaVersion: 1, packages: [
+    { type: 'npm', name: 'fixture-package', version: '1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' },
+    { type: 'github', repository: 'acme/pi-extension', commit: 'a'.repeat(40), tag: 'v1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' },
+  ] }, null, 2)}\n`);
+  const piEnv = await fakePi(t);
+  const log = path.join(root, 'pi-calls.log');
+  const applied = run(['apply', '--approve', '--repo', repo, '--agent-dir', agentDir], { ...piEnv, PI_CALL_LOG: log });
+  assert.equal(applied.status, 0, `${applied.stderr}\n${applied.stdout}`);
+  assert.equal((await piCalls(log)).filter((call) => call.startsWith('install')).length, 2, 'both packages installed locally before removal');
+
+  const removals = [
+    ['skill', 'skills/hello'],
+    ['extension', 'extensions/github-copilot-usage'],
+    ['extension', 'extensions/subagent/config.json'],
+    ['prompt', 'prompts/deploy.md'],
+    ['agent', 'agents/reviewer.md'],
+    ['role', 'roles/moderator.md'],
+  ];
+  for (const [type, target] of removals) {
+    const response = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', type, '--target', target], piEnv);
+    assert.equal(response.status, 0, `${type} ${target}: ${response.stderr}\n${response.stdout}`);
+    const output = result(response);
+    assert.equal(output.apiVersion, 1);
+    assert.equal(output.command, 'remove');
+    assert.equal(output.ok, true);
+    assert.equal(output.exitCode, 0);
+    assert.deepEqual(output.removed, { type, source: `resources/${target}`, target });
+    assert.equal(output.stale.target, target);
+    assert.equal(output.stale.localInstallation, 'unchanged');
+    // Repository content and manifest entry are gone.
+    await assert.rejects(fs.access(path.join(repo, 'resources', ...target.split('/'))));
+    const current = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+    assert.equal(current.resources.some((item) => item.target === target), false);
+    // The local installation is never modified and nothing is queued: the
+    // baseline stays in the local state for the stale report and prune flow.
+    const state = JSON.parse(await fs.readFile(path.join(agentDir, '.pi-sync', 'state.json'), 'utf8'));
+    assert.ok(state.resources[target], `baseline for ${target} is retained`);
+  }
+  assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'hello', 'SKILL.md'), 'utf8'), '# Hello\n');
+  assert.equal(await fs.readFile(path.join(agentDir, 'extensions', 'github-copilot-usage', 'index.ts'), 'utf8'), 'export const usage = true;\n');
+  assert.equal(await fs.readFile(path.join(agentDir, 'prompts', 'deploy.md'), 'utf8'), '# Deploy prompt\n');
+
+  const npmRemoved = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'npm:fixture-package'], piEnv);
+  assert.equal(npmRemoved.status, 0, npmRemoved.stderr);
+  const npmOutput = result(npmRemoved);
+  assert.deepEqual(npmOutput.removed.dependency, { type: 'npm', name: 'fixture-package' });
+  assert.equal(npmOutput.removed.pin.version, '1.0.0');
+  assert.equal(npmOutput.localInstallation, 'unchanged');
+  const githubRemoved = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'github:acme/pi-extension'], piEnv);
+  assert.equal(githubRemoved.status, 0, githubRemoved.stderr);
+  assert.deepEqual(result(githubRemoved).removed.dependency, { type: 'github', repository: 'acme/pi-extension' });
+  const finalManifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  assert.deepEqual(finalManifest.dependencies, []);
+  const finalLock = JSON.parse(await fs.readFile(lockPath, 'utf8'));
+  assert.deepEqual(finalLock.packages, []);
+  // Removal never uninstalls on its own.
+  assert.equal((await piCalls(log)).filter((call) => call.startsWith('uninstall')).length, 0);
+});
+
+test('remove validates before changing anything and leaves the repository unchanged on failure', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  const skillDir = path.join(agentDir, 'skills', 'hello');
+  await fs.mkdir(skillDir, { recursive: true });
+  await fs.writeFile(path.join(skillDir, 'SKILL.md'), '# Hello\n');
+  assert.equal(run(['add', '--type', 'skill', '--source', 'skills/hello', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const lockPath = path.join(repo, 'pi-sync.lock.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.dependencies = [{ type: 'npm', name: 'fixture-package' }];
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  await fs.writeFile(lockPath, `${JSON.stringify({ schemaVersion: 1, packages: [
+    { type: 'npm', name: 'fixture-package', version: '1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' },
+  ] }, null, 2)}\n`);
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  const lockBefore = await fs.readFile(lockPath, 'utf8');
+  const contentBefore = await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8');
+
+  const failures = [
+    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', 'skills/absent'], errorCode: 'REMOVE_TARGET_NOT_FOUND' },
+    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'prompt', '--target', 'skills/hello'], errorCode: 'REMOVE_TYPE_MISMATCH' },
+    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'npm:absent'], errorCode: 'REMOVE_DEPENDENCY_NOT_FOUND' },
+    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'theme', '--target', 'skills/hello'], errorCode: 'VALIDATION_ERROR' },
+    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill'] },
+    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency'] },
+    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', 'skills/hello', '--uninstall'], errorCode: 'VALIDATION_ERROR' },
+    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', '../escape'], errorCode: 'VALIDATION_ERROR' },
+  ];
+  for (const { args, errorCode } of failures) {
+    const response = run(args);
+    assert.equal(response.status, 2, `${args.join(' ')}: ${response.stderr}\n${response.stdout}`);
+    const output = result(response);
+    assert.equal(output.ok, false);
+    assert.equal(output.exitCode, 2);
+    if (errorCode) assert.equal(output.errorCode, errorCode);
+  }
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+  assert.equal(await fs.readFile(lockPath, 'utf8'), lockBefore);
+  assert.equal(await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8'), contentBefore);
+
+  // A repository that does not validate stops remove before any change.
+  await fs.writeFile(lockPath, `${JSON.stringify({ schemaVersion: 1, packages: [] }, null, 2)}\n`);
+  const invalid = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', 'skills/hello']);
+  assert.equal(invalid.status, 2, invalid.stderr);
+  assert.equal(result(invalid).errorCode, 'VALIDATION_ERROR');
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+  assert.equal(await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8'), contentBefore);
+});
+
+test('push publishes removal commits that delete previously managed paths', async (t) => {
+  // Working-tree removal: remove, preview, and publish through managed push.
+  const { repo, bare, root } = await pushFixture(t);
+  const agentDir = path.join(root, 'agent');
+  const removed = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', 'skills/hello']);
+  assert.equal(removed.status, 0, removed.stderr);
+  const preview = run(['push', '--repo', repo]);
+  assert.equal(preview.status, 0, preview.stderr);
+  const plan = result(preview);
+  assert.equal(plan.mode, 'preview');
+  assert.deepEqual(plan.changes.map((item) => [item.status, item.path]).sort(), [['D', 'resources/skills/hello/SKILL.md'], ['M', 'pi-sync.json']]);
+  assert.equal(plan.commitRequired, true);
+  const published = run(['push', '--publish', '--repo', repo]);
+  assert.equal(published.status, 0, published.stderr);
+  const output = result(published);
+  assert.equal(output.mode, 'published');
+  assert.deepEqual(output.changes.map((item) => [item.status, item.path]).sort(), [['D', 'resources/skills/hello/SKILL.md'], ['M', 'pi-sync.json']]);
+  const remoteFiles = spawnSync('git', ['--git-dir', bare, 'ls-tree', '-r', '--name-only', 'main'], { encoding: 'utf8' });
+  assert.equal(remoteFiles.status, 0, remoteFiles.stderr);
+  assert.deepEqual(remoteFiles.stdout.trim().split(/\r?\n/).sort(), ['.gitignore', 'pi-sync.json', 'pi-sync.lock.json']);
+  const headFiles = gitAt(repo, ['show', '--format=', '--name-only', 'HEAD']).split(/\r?\n/).filter(Boolean);
+  assert.deepEqual(headFiles.sort(), ['pi-sync.json', 'resources/skills/hello/SKILL.md']);
+
+  // Committed removal ahead of upstream: validated against the manifest as of
+  // the commit (plus the current managed set) and publishable.
+  const second = await pushFixture(t);
+  const { repo: repo2, bare: bare2 } = second;
+  const manifest2 = path.join(repo2, 'pi-sync.json');
+  await fs.writeFile(manifest2, `${JSON.stringify({ schemaVersion: 1, resources: [], dependencies: [] }, null, 2)}\n`);
+  gitAt(repo2, ['rm', '--quiet', '-r', '--', 'resources/skills/hello']);
+  gitAt(repo2, ['add', '--', 'pi-sync.json']);
+  gitAt(repo2, ['commit', '-m', 'roll back skill']);
+  const ahead = run(['push', '--publish', '--repo', repo2]);
+  assert.equal(ahead.status, 0, `${ahead.stderr}\n${ahead.stdout}`);
+  const aheadOutput = result(ahead);
+  assert.equal(aheadOutput.mode, 'published');
+  assert.deepEqual(aheadOutput.changes.map((item) => [item.status, item.path]).sort(),
+    [['committed', 'pi-sync.json'], ['committed', 'resources/skills/hello/SKILL.md']]);
+  const remoteFiles2 = spawnSync('git', ['--git-dir', bare2, 'ls-tree', '-r', '--name-only', 'main'], { encoding: 'utf8' });
+  assert.equal(remoteFiles2.status, 0, remoteFiles2.stderr);
+  assert.deepEqual(remoteFiles2.stdout.trim().split(/\r?\n/).sort(), ['.gitignore', 'pi-sync.json', 'pi-sync.lock.json']);
+});
+
+test('push rejects unrelated ahead commits, including ones mixed with a removal commit', async (t) => {
+  const { repo } = await pushFixture(t);
+  const manifest = path.join(repo, 'pi-sync.json');
+  await fs.writeFile(manifest, `${JSON.stringify({ schemaVersion: 1, resources: [], dependencies: [] }, null, 2)}\n`);
+  gitAt(repo, ['rm', '--quiet', '-r', '--', 'resources/skills/hello']);
+  gitAt(repo, ['add', '--', 'pi-sync.json']);
+  gitAt(repo, ['commit', '-m', 'roll back skill']);
+  await fs.writeFile(path.join(repo, 'notes.txt'), 'unrelated ahead commit\n');
+  gitAt(repo, ['add', '--', 'notes.txt']);
+  gitAt(repo, ['commit', '-m', 'unrelated note']);
+  const before = gitAt(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0];
+  const rejected = run(['push', '--publish', '--repo', repo]);
+  assert.equal(rejected.status, 1, rejected.stderr);
+  const output = result(rejected);
+  assert.equal(output.errorCode, 'PUSH_BLOCKED');
+  assert.deepEqual(output.details.unrelatedPaths, ['notes.txt']);
+  assert.equal(gitAt(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0], before, 'remote unchanged');
+  // The local removal commit and the unrelated file both remain local.
+  assert.equal(gitAt(repo, ['rev-list', '--count', '@{upstream}..HEAD']), '2');
+  assert.equal(await fs.readFile(path.join(repo, 'notes.txt'), 'utf8'), 'unrelated ahead commit\n');
+
+  // Re-adding content under a removed source without re-declaring it is not a
+  // publishable managed change.
+  const sneaky = await pushFixture(t);
+  await fs.writeFile(path.join(sneaky.repo, 'pi-sync.json'), `${JSON.stringify({ schemaVersion: 1, resources: [], dependencies: [] }, null, 2)}\n`);
+  await fs.writeFile(path.join(sneaky.repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Sneaky re-add\n');
+  const blocked = run(['push', '--publish', '--repo', sneaky.repo]);
+  assert.equal(blocked.status, 1, blocked.stderr);
+  assert.equal(result(blocked).errorCode, 'PUSH_BLOCKED');
+  assert.deepEqual(result(blocked).details.unrelatedPaths, ['resources/skills/hello/SKILL.md']);
+  assert.equal(gitAt(sneaky.repo, ['rev-parse', 'HEAD']), gitAt(sneaky.repo, ['rev-parse', '@{upstream}']), 'no commit was created');
+  assert.equal(await fs.readFile(path.join(sneaky.repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8'), '# Sneaky re-add\n');
+});
+
+test('remove --uninstall uninstalls the dependency explicitly and reports failures without altering the repository change', async (t) => {
+  const { root, repo, agentDir } = await extendedFixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const lockPath = path.join(repo, 'pi-sync.lock.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.dependencies = [{ type: 'npm', name: 'fixture-package' }];
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  const pin = { type: 'npm', name: 'fixture-package', version: '1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' };
+  await fs.writeFile(lockPath, `${JSON.stringify({ schemaVersion: 1, packages: [pin] }, null, 2)}\n`);
+  const pinsFile = path.join(agentDir, '.pi-sync', 'packages.json');
+  const okPi = await fakePi(t);
+  const okLog = path.join(root, 'pi-ok.log');
+  const applied = run(['apply', '--approve', '--repo', repo, '--agent-dir', agentDir], { ...okPi, PI_CALL_LOG: okLog });
+  assert.equal(applied.status, 0, applied.stderr);
+  const pinsBefore = JSON.parse(await fs.readFile(pinsFile, 'utf8'));
+  assert.equal(pinsBefore.packages['npm:fixture-package'], '1.0.0');
+
+  const okLogBefore = await fs.readFile(okLog, 'utf8');
+  const removed = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'npm:fixture-package', '--uninstall'],
+    { ...okPi, PI_CALL_LOG: okLog });
+  assert.equal(removed.status, 0, `${removed.stderr}\n${removed.stdout}`);
+  const output = result(removed);
+  assert.equal(output.ok, true);
+  assert.deepEqual(output.removed.dependency, { type: 'npm', name: 'fixture-package' });
+  assert.deepEqual(output.uninstalled, { package: 'npm:fixture-package', spec: 'npm:fixture-package@1.0.0' });
+  assert.equal(output.localInstallation, 'uninstalled');
+  assert.deepEqual(await piCalls(okLog), [...okLogBefore.trim().split('\n').filter(Boolean), 'uninstall npm:fixture-package@1.0.0']);
+  const pinsAfter = JSON.parse(await fs.readFile(pinsFile, 'utf8'));
+  assert.equal(pinsAfter.packages['npm:fixture-package'], undefined, 'local pin bookkeeping cleared after successful uninstall');
+  // The repository change is complete and persisted.
+  assert.deepEqual(JSON.parse(await fs.readFile(manifestPath, 'utf8')).dependencies, []);
+  assert.deepEqual(JSON.parse(await fs.readFile(lockPath, 'utf8')).packages, []);
+
+  // A failed uninstall is reported without rolling back or altering the
+  // repository change: re-declare the dependency, reinstall it, then remove
+  // with a failing Pi.
+  const manifest2 = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest2.dependencies = [{ type: 'npm', name: 'fixture-package' }];
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest2, null, 2)}\n`);
+  await fs.writeFile(lockPath, `${JSON.stringify({ schemaVersion: 1, packages: [pin] }, null, 2)}\n`);
+  const reinstalled = run(['apply', '--approve', '--repo', repo, '--agent-dir', agentDir], { ...okPi, PI_CALL_LOG: okLog });  assert.equal(reinstalled.status, 0, reinstalled.stderr);
+  const failPi = await fakePi(t, { fail: true });
+  const failLog = path.join(root, 'pi-fail.log');
+  await fs.writeFile(failLog, '');
+  const failed = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'npm:fixture-package', '--uninstall'],
+    { ...failPi, PI_CALL_LOG: failLog });
+  assert.equal(failed.status, 1, failed.stderr);
+  const failure = result(failed);
+  assert.equal(failure.ok, false);
+  assert.equal(failure.exitCode, 1);
+  assert.equal(failure.errorCode, 'UNINSTALL_FAILED');
+  assert.match(failure.error, /pi uninstall failed for npm:fixture-package@1\.0\.0/);
+  assert.equal(failure.uninstall.status, 'failed');
+  assert.equal(await fs.readFile(failLog, 'utf8'), 'uninstall npm:fixture-package@1.0.0\n');
+  assert.deepEqual(JSON.parse(await fs.readFile(manifestPath, 'utf8')).dependencies, [], 'manifest change persisted despite the uninstall failure');
+  assert.deepEqual(JSON.parse(await fs.readFile(lockPath, 'utf8')).packages, [], 'lockfile change persisted despite the uninstall failure');
+  const pinsStill = JSON.parse(await fs.readFile(pinsFile, 'utf8'));
+  assert.equal(pinsStill.packages['npm:fixture-package'], '1.0.0', 'local pin bookkeeping is untouched when the uninstall fails');
+});
+
+test('the full remove, stale, and prune sequence works end to end after publication', async (t) => {
+  const { repo, bare, root } = await pushFixture(t);
+  const agentDir = path.join(root, 'agent');
+  const applied = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(applied.status, 0, applied.stderr);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+
+  const removed = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', 'skills/hello']);
+  assert.equal(removed.status, 0, removed.stderr);
+  const published = run(['push', '--publish', '--repo', repo]);
+  assert.equal(published.status, 0, published.stderr);
+  assert.equal(result(published).mode, 'published');
+  const remoteFiles = spawnSync('git', ['--git-dir', bare, 'ls-tree', '-r', '--name-only', 'main'], { encoding: 'utf8' });
+  assert.deepEqual(remoteFiles.stdout.trim().split(/\r?\n/).sort(), ['.gitignore', 'pi-sync.json', 'pi-sync.lock.json']);
+
+  // status/plan/apply report the removed resource as stale; apply never deletes it.
+  for (const command of ['status', 'plan', 'apply']) {
+    const response = run([command, '--repo', repo, '--agent-dir', agentDir]);
+    assert.equal(response.status, 0, `${command}: ${response.stderr}`);
+    const output = result(response);
+    assert.deepEqual(output.staleResources, [{ target: 'skills/hello', state: 'unchanged', installed: true, pruneAvailable: true }]);
+  }
+  assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'hello', 'SKILL.md'), 'utf8'), '# Hello\n');
+
+  // Re-declaring the resource stops stale reporting.
+  await fs.mkdir(path.join(repo, 'resources', 'skills', 'hello'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Hello\n');
+  const redeclared = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  redeclared.resources = [{ type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' }];
+  await fs.writeFile(manifestPath, `${JSON.stringify(redeclared, null, 2)}\n`);
+  const replanned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(replanned.status, 0, replanned.stderr);
+  assert.deepEqual(result(replanned).staleResources, []);
+  // Remove it again for the explicit local removal.
+  const removedAgain = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', 'skills/hello']);
+  assert.equal(removedAgain.status, 0, removedAgain.stderr);
+
+  // Prune preview does not delete; confirmed prune removes with a backup and
+  // clears the local state entry.
+  const preview = run(['prune', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.deepEqual(result(preview).staleResources, [{ target: 'skills/hello', action: 'would-prune', installed: true }]);
+  await fs.access(path.join(agentDir, 'skills', 'hello', 'SKILL.md'));
+  const pruned = run(['prune', '--confirm', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(pruned.status, 0, pruned.stderr);
+  assert.deepEqual(result(pruned).staleResources, [{ target: 'skills/hello', action: 'pruned', installed: false }]);
+  await assert.rejects(fs.access(path.join(agentDir, 'skills', 'hello')));
+  const backupRoot = path.join(agentDir, '.pi-sync', 'backups');
+  const backupStamp = (await fs.readdir(backupRoot)).at(-1);
+  assert.equal(await fs.readFile(path.join(backupRoot, backupStamp, 'skills', 'hello', 'SKILL.md'), 'utf8'), '# Hello\n');
+  const state = JSON.parse(await fs.readFile(path.join(agentDir, '.pi-sync', 'state.json'), 'utf8'));
+  assert.equal(Object.hasOwn(state.resources, 'skills/hello'), false);
+});
+
+test('a tracked file target replaced by a same-content same-mode directory reports the kind mismatch without a repository change', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  const added = run(['add', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(added.status, 0, added.stderr);
+  const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(first.status, 0, first.stderr);
+  const target = path.join(agentDir, 'prompts', 'deploy.md');
+  const statePath = path.join(agentDir, '.pi-sync', 'state.json');
+  const baselineState = await fs.readFile(statePath, 'utf8');
+  const baselineFile = JSON.parse(baselineState).resources['prompts/deploy.md'].files['deploy.md'];
+
+  // Replace the tracked file with a directory holding the baseline content and
+  // mode; the repository is deliberately left unchanged.
+  await fs.rm(target);
+  await fs.mkdir(target, { recursive: true });
+  await fs.writeFile(path.join(target, 'deploy.md'), '# Deploy prompt\n');
+  await fs.chmod(path.join(target, 'deploy.md'), baselineFile.mode);
+
+  const planned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(planned.status, 1, planned.stderr);
+  const plannedAction = result(planned).actions[0];
+  assert.equal(plannedAction.action, 'conflict');
+  assert.match(plannedAction.reason, /changed type/);
+
+  const applied = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(applied.status, 1, applied.stderr);
+  const appliedAction = result(applied).actions[0];
+  assert.equal(appliedAction.action, 'conflict');
+  assert.match(appliedAction.reason, /changed type/);
+  assert.equal((await fs.lstat(target)).isDirectory(), true);
+  assert.equal(await fs.readFile(path.join(target, 'deploy.md'), 'utf8'), '# Deploy prompt\n');
+  assert.equal(await fs.readFile(statePath, 'utf8'), baselineState);
+
+  // Restoring the file clears the conflict immediately, still without a
+  // repository change.
+  await fs.rm(target, { recursive: true });
+  await fs.writeFile(target, '# Deploy prompt\n');
+  await fs.chmod(target, baselineFile.mode);
+  const recovered = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.equal(result(recovered).actions[0].action, 'unchanged');
+});
+
+test('a tracked extension directory replaced by a same-content same-mode file reports the kind mismatch without a repository change', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  const sourceDir = path.join(agentDir, 'extensions', 'tool');
+  await fs.mkdir(sourceDir, { recursive: true });
+  await fs.writeFile(path.join(sourceDir, 'tool'), 'export const tool = 1;\n');
+  const added = run(['add', '--type', 'extension', '--source', 'extensions/tool', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(added.status, 0, added.stderr);
+  const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(first.status, 0, first.stderr);
+  const target = path.join(agentDir, 'extensions', 'tool');
+  const statePath = path.join(agentDir, '.pi-sync', 'state.json');
+  const baselineState = await fs.readFile(statePath, 'utf8');
+  const baselineFile = JSON.parse(baselineState).resources['extensions/tool'].files['tool'];
+
+  // Replace the tracked directory with a single file holding the baseline
+  // content and mode; the repository is deliberately left unchanged.
+  await fs.rm(target, { recursive: true });
+  await fs.writeFile(target, Buffer.from(baselineFile.content, 'base64'));
+  await fs.chmod(target, baselineFile.mode);
+
+  const planned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(planned.status, 1, planned.stderr);
+  const plannedAction = result(planned).actions[0];
+  assert.equal(plannedAction.action, 'conflict');
+  assert.match(plannedAction.reason, /changed type/);
+
+  const applied = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(applied.status, 1, applied.stderr);
+  const appliedAction = result(applied).actions[0];
+  assert.equal(appliedAction.action, 'conflict');
+  assert.match(appliedAction.reason, /changed type/);
+  assert.equal((await fs.lstat(target)).isFile(), true);
+  assert.equal(await fs.readFile(target, 'utf8'), 'export const tool = 1;\n');
+  assert.equal(await fs.readFile(statePath, 'utf8'), baselineState);
+
+  // Restoring the directory clears the conflict immediately.
+  await fs.rm(target);
+  await fs.mkdir(target, { recursive: true });
+  await fs.writeFile(path.join(target, 'tool'), 'export const tool = 1;\n');
+  await fs.chmod(path.join(target, 'tool'), baselineFile.mode);
+  const recovered = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.equal(result(recovered).actions[0].action, 'unchanged');
+});
+
+test('remove of a declared dependency without a lock pin reports the structured not-pinned error', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  const skillDir = path.join(agentDir, 'skills', 'hello');
+  await fs.mkdir(skillDir, { recursive: true });
+  await fs.writeFile(path.join(skillDir, 'SKILL.md'), '# Hello\n');
+  assert.equal(run(['add', '--type', 'skill', '--source', 'skills/hello', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const lockPath = path.join(repo, 'pi-sync.lock.json');
+  // Declare the dependency without a lock pin: the repository no longer
+  // validates strictly, but remove must surface the specific error.
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.dependencies = [{ type: 'npm', name: 'fixture-package' }];
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  const lockBefore = await fs.readFile(lockPath, 'utf8');
+  const contentBefore = await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8');
+
+  const response = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'npm:fixture-package']);
+  assert.equal(response.status, 2, response.stderr);
+  const output = result(response);
+  assert.equal(output.ok, false);
+  assert.equal(output.exitCode, 2);
+  assert.equal(output.errorCode, 'REMOVE_DEPENDENCY_NOT_PINNED');
+  assert.match(output.error, /no exact pin in the lockfile/);
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+  assert.equal(await fs.readFile(lockPath, 'utf8'), lockBefore);
+
+  // Resource removal in the same repository keeps its strict repository
+  // validation and still fails with the generic validation error.
+  const resourceRemove = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', 'skills/hello']);
+  assert.equal(resourceRemove.status, 2, resourceRemove.stderr);
+  assert.equal(result(resourceRemove).errorCode, 'VALIDATION_ERROR');
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+  assert.equal(await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8'), contentBefore);
+});
+
+test('remove --uninstall with a corrupted local pin file fails before any side effect', async (t) => {
+  const { root, repo, agentDir } = await extendedFixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const lockPath = path.join(repo, 'pi-sync.lock.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.dependencies = [{ type: 'npm', name: 'fixture-package' }];
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  const pin = { type: 'npm', name: 'fixture-package', version: '1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' };
+  await fs.writeFile(lockPath, `${JSON.stringify({ schemaVersion: 1, packages: [pin] }, null, 2)}\n`);
+  const pinsFile = path.join(agentDir, '.pi-sync', 'packages.json');
+  const okPi = await fakePi(t);
+  const log = path.join(root, 'pi-calls.log');
+  const applied = run(['apply', '--approve', '--repo', repo, '--agent-dir', agentDir], { ...okPi, PI_CALL_LOG: log });
+  assert.equal(applied.status, 0, applied.stderr);
+
+  // Corrupt the local pin bookkeeping after a successful install.
+  await fs.writeFile(pinsFile, '{ corrupted\n');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  const lockBefore = await fs.readFile(lockPath, 'utf8');
+  const pinsBefore = await fs.readFile(pinsFile, 'utf8');
+
+  const response = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'npm:fixture-package', '--uninstall'],
+    { ...okPi, PI_CALL_LOG: log });
+  assert.equal(response.status, 2, response.stderr);
+  const output = result(response);
+  assert.equal(output.ok, false);
+  assert.equal(output.exitCode, 2);
+  assert.equal(output.errorCode, 'VALIDATION_ERROR');
+  assert.match(output.error, /local package pin state/);
+  // No side effects: the repository is unchanged, the pin file is untouched,
+  // and nothing was uninstalled.
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+  assert.equal(await fs.readFile(lockPath, 'utf8'), lockBefore);
+  assert.equal(await fs.readFile(pinsFile, 'utf8'), pinsBefore);
+  assert.deepEqual((await piCalls(log)).filter((call) => call.startsWith('uninstall')), []);
+
+  // A valid pin file keeps the successful uninstall flow working.
+  await fs.writeFile(pinsFile, `${JSON.stringify({ schemaVersion: 1, packages: { 'npm:fixture-package': '1.0.0' } }, null, 2)}\n`);
+  const retried = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'npm:fixture-package', '--uninstall'],
+    { ...okPi, PI_CALL_LOG: log });
+  assert.equal(retried.status, 0, retried.stderr);
+  assert.equal(result(retried).localInstallation, 'uninstalled');
+  assert.deepEqual((await piCalls(log)).filter((call) => call.startsWith('uninstall')), ['uninstall npm:fixture-package@1.0.0']);
+  const pinsAfter = JSON.parse(await fs.readFile(pinsFile, 'utf8'));
+  assert.equal(pinsAfter.packages['npm:fixture-package'], undefined, 'local pin bookkeeping cleared after successful uninstall');
+});
+
+test('remove restores the manifest atomically when the content deletion fails', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  const added = run(['add', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(added.status, 0, added.stderr);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const lockPath = path.join(repo, 'pi-sync.lock.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  const lockBefore = await fs.readFile(lockPath, 'utf8');
+  const contentBefore = await fs.readFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), 'utf8');
+
+  // Make the managed content undeletable so the remove fails after the
+  // manifest rewrite and exercises the rollback path.
+  const sourceParent = path.join(repo, 'resources', 'prompts');
+  await fs.chmod(sourceParent, 0o500);
+  let response;
+  try {
+    response = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'prompt', '--target', 'prompts/deploy.md']);
+  } finally {
+    await fs.chmod(sourceParent, 0o755);
+  }
+  assert.equal(response.status, 2, response.stderr);
+  const output = result(response);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'VALIDATION_ERROR');
+  assert.match(output.error, /Could not remove managed resource content/);
+  // The repository is restored byte-for-byte and no temporary files remain.
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore, 'manifest restored byte-for-byte');
+  assert.equal(await fs.readFile(lockPath, 'utf8'), lockBefore);
+  assert.equal(await fs.readFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), 'utf8'), contentBefore);
+  assert.deepEqual((await fs.readdir(repo)).filter((name) => name.includes('.tmp')), []);
+});
+
+test('push rejects an ahead commit that leaves the repository in an invalid state even when a later commit repairs it', async (t) => {
+  const { repo } = await pushFixture(t);
+  // The first ahead commit deletes the managed content but leaves the manifest
+  // declaring it, so the repository state at that commit is invalid (the
+  // declared source is missing from the tree).
+  gitAt(repo, ['rm', '--quiet', '-r', '--', 'resources/skills/hello']);
+  gitAt(repo, ['commit', '-m', 'delete content without updating the manifest']);
+  // The second ahead commit restores the content; HEAD itself is a valid
+  // repository state, so only the per-commit validation catches the chain.
+  await fs.mkdir(path.join(repo, 'resources', 'skills', 'hello'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Restored\n');
+  gitAt(repo, ['add', '--', 'resources/skills/hello']);
+  gitAt(repo, ['commit', '-m', 'restore the content']);
+
+  const remoteBefore = gitAt(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0];
+  const rejected = run(['push', '--publish', '--repo', repo]);
+  assert.equal(rejected.status, 1, rejected.stderr);
+  const output = result(rejected);
+  assert.equal(output.errorCode, 'PUSH_BLOCKED');
+  assert.match(output.error, /missing from that commit/);
+  assert.equal(output.details.commit, gitAt(repo, ['rev-parse', 'HEAD~1']), 'the broken intermediate commit is reported');
+  assert.equal(gitAt(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0], remoteBefore, 'remote unchanged');
+  assert.equal(gitAt(repo, ['rev-list', '--count', '@{upstream}..HEAD']), '2', 'local commits preserved');
+
+  // Repair the broken intermediate commit in place (the final commit's content
+  // makes the manifest state valid) and push again: the repaired chain must
+  // now be accepted, proving the repair-commit half of the requirement rather
+  // than only the rejection.
+  // reset --soft keeps the index at the final (repaired) tree, so amending
+  // the broken commit rewrites it with the valid content.
+  gitAt(repo, ['reset', '--soft', 'HEAD~1']);
+  gitAt(repo, ['commit', '--amend', '--no-edit']);
+  const republished = run(['push', '--publish', '--repo', repo]);
+  assert.equal(republished.status, 0, republished.stderr);
+  assert.equal(result(republished).ok, true);
+  assert.equal(gitAt(repo, ['rev-list', '--count', '@{upstream}..HEAD']), '0', 'repaired commits published');
+  assert.equal(gitAt(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0], gitAt(repo, ['rev-parse', 'HEAD']), 'remote advanced to local HEAD');
+});
+
+test('push publishes a valid ahead commit that edits a directory resource source', async (t) => {
+  const { repo } = await pushFixture(t);
+  // A single ahead commit that edits the skill (a directory-shaped resource
+  // source) is a fully valid repository state and must publish.
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Hello v2\n');
+  gitAt(repo, ['add', '--', 'resources/skills/hello']);
+  gitAt(repo, ['commit', '-m', 'edit the skill']);
+
+  const response = run(['push', '--publish', '--repo', repo]);
+  assert.equal(response.status, 0, response.stderr);
+  assert.equal(result(response).ok, true);
+  assert.equal(gitAt(repo, ['rev-list', '--count', '@{upstream}..HEAD']), '0');
+  assert.equal(gitAt(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0], gitAt(repo, ['rev-parse', 'HEAD']), 'remote advanced to local HEAD');
+})

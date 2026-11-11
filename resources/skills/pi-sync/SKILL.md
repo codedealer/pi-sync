@@ -5,7 +5,7 @@ description: Inspect and safely operate the explicitly managed Pi setup using th
 
 # Pi Sync agent workflow
 
-Use `pi-sync` as the only interface for inspecting and changing resources managed by Pi Sync. Do not edit `pi-sync.json` or `pi-sync.lock.json` directly, copy managed resources into place behind Pi Sync, or install a managed dependency through another tool. Pi Sync supports authored skill resources, selected settings fields, and exact top-level npm/GitHub package pins. Push is opt-in and separate from apply/update unless the user explicitly authorizes it.
+Use `pi-sync` as the only interface for inspecting and changing resources managed by Pi Sync. Do not edit `pi-sync.json` or `pi-sync.lock.json` directly, copy managed resources into place behind Pi Sync, or install a managed dependency through another tool. Pi Sync supports authored Pi resources (skill directories, extension files or directories, and single `.md` prompt, agent, and role files), selected settings fields, and exact top-level npm/GitHub package pins. Push is opt-in and separate from apply/update unless the user explicitly authorizes it.
 
 ## Concepts and boundaries
 
@@ -36,15 +36,19 @@ pi-sync apply --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
 
 Apply follows the reviewed repository state, preserves unlisted content and local-only divergence, and never overwrites a reported collision or conflicted item. A non-zero result requires stopping to explain the structured conflict or error; do not resolve conflicts by guessing, overwriting, or editing managed files around the CLI. Review a new plan after the user resolves the issue.
 
-## Add only a specifically selected local skill
+## Add only a specifically selected local resource
 
-When the user explicitly asks to add a named local skill, review its contents for private data and use the CLI:
+When the user explicitly asks to add a named local resource, review its contents for private data and use the CLI with the matching type:
 
 ```sh
 pi-sync add --type skill --source skills/NAME --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
+pi-sync add --type extension --source extensions/NAME --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
+pi-sync add --type prompt --source prompts/NAME.md --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
+pi-sync add --type agent --source agents/NAME.md --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
+pi-sync add --type role --source roles/NAME.md --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
 ```
 
-`add` imports only that selected skill to `resources/skills/NAME` and registers it in the manifest. It does not import unrelated files. Review any `reviewRequired` findings and remove suspected secret content before retrying; never bypass the check. A collision, invalid path, or malformed repository stops the operation. Do not install an added resource separately; apply it through Pi Sync when requested.
+`add` imports only the selected file or directory to the matching `resources/<type-root>/` path (skills are directories, extensions may be a single file or directory, and prompts/agents/roles must be single `.md` files directly under their root) and registers it in the manifest. It does not import unrelated files, and `node_modules` or package-installed code is never imported. Review any `reviewRequired` findings and remove suspected secret content before retrying; never bypass the check. A collision, invalid path, or malformed repository stops the operation. Do not install an added resource separately; apply it through Pi Sync when requested.
 
 The first-party skill is shipped at `resources/skills/pi-sync/SKILL.md`. Fresh-machine setup uses the CLI bootstrap command, which safely declares it in the fetched setup repository as:
 
@@ -83,6 +87,22 @@ pi-sync apply --approve --repo /path/to/private-setup --agent-dir "$PI_CODING_AG
 
 Pi Sync coordinates exact top-level pins through Pi's package manager. Pi currently owns transitive dependency resolution; Pi Sync does not provide or claim a reproducible transitive tree. Managed package updates must be performed through `pi-sync update --apply` under the repository's age policy. Do not run `pi update --extensions` when it could update managed packages: that command is unsupported for managed packages, may move them beyond their recorded exact pins, and Pi Sync cannot intercept or prevent it. When a user requests or discusses updating managed packages, explain/remind them to use Pi Sync instead. Do not claim that external Pi updates preserve pins or are constrained by Pi Sync, or claim/assume transitive dependencies are locked.
 
+## Remove only an explicitly requested resource or dependency
+
+Removal is the inverse of add. Only when the user explicitly asks to remove a named resource or dependency, use the matching type:
+
+```sh
+pi-sync remove --type skill --target skills/NAME --repo /path/to/private-setup
+pi-sync remove --type extension --target extensions/NAME --repo /path/to/private-setup
+pi-sync remove --type prompt --target prompts/NAME.md --repo /path/to/private-setup
+pi-sync remove --type agent --target agents/NAME.md --repo /path/to/private-setup
+pi-sync remove --type role --target roles/NAME.md --repo /path/to/private-setup
+pi-sync remove --type dependency --source npm:PACKAGE --repo /path/to/private-setup
+pi-sync remove --type dependency --source github:OWNER/REPOSITORY --repo /path/to/private-setup
+```
+
+Removal is non-destructive by design: it deletes only the manifest entry and the repository content (or the manifest dependency and its exact lockfile pin). It never modifies the local Pi installation and never queues or schedules anything for deletion. A removed resource stays installed indefinitely and is reported as `stale` by `status`, `plan`, and `apply` until it is explicitly pruned or re-declared in the manifest. Local removal of a removed resource happens only through the existing explicit `pi-sync prune --confirm` flow, which keeps its baseline-match and backup protections. A removed dependency stays installed locally by default; only an explicit `pi-sync remove --type dependency --source ... --uninstall` uninstalls it by running `pi uninstall` for the removed pin, and an uninstall failure is reported (exit `1`) without rolling back or altering the repository change. `remove` validates the entry and the repository before changing anything, uses the atomic manifest write pattern, and exits `2` on invalid input or repository validation failure. Publish a removal with the normal explicit push flow (`pi-sync push` preview, then `--publish`), which accepts commits that remove previously managed paths.
+
 ## Push only when explicitly authorized
 
 Never infer permission to publish from a request to inspect, set up, apply, add, or update Pi Sync. First preview the exact managed-only commit contents:
@@ -97,7 +117,7 @@ Review the listed paths and full patch with the user. The preview includes only 
 pi-sync push --publish --repo /path/to/private-setup
 ```
 
-This creates an ordinary commit and uses a normal fast-forward push; force-push is never used. Git hooks are skipped for this Pi Sync commit so they cannot stage content outside the managed allowlist. Pi Sync stops if local commits contain unrelated paths or if the upstream has advanced/diverged. Reconcile such branches manually and review a fresh preview; do not reset, rebase, merge, or force-push on the user's behalf. A rejected push preserves the local managed commit and changes for a later safe retry. `update --apply --push` is also an explicit publication request after approved package updates; the same full managed patch preview is shown immediately before publication. Preview with `pi-sync push` first whenever possible so the resulting managed commit paths are reviewed before that command.
+This creates an ordinary commit and uses a normal fast-forward push; force-push is never used. Git hooks are skipped for this Pi Sync commit so they cannot stage content outside the managed allowlist. Ahead commits are validated against the setup manifest as of that commit, the manifest before the commit, and the current managed set, so commits that add, edit, or remove managed paths — including a committed removal of a resource — are publishable. Pi Sync stops when local commits contain genuinely unrelated paths or when the upstream has advanced/diverged. Reconcile such branches manually and review a fresh preview; do not reset, rebase, merge, or force-push on the user's behalf. A rejected push preserves the local managed commit and changes for a later safe retry. `update --apply --push` is also an explicit publication request after approved package updates; the same full managed patch preview is shown immediately before publication. Preview with `pi-sync push` first whenever possible so the resulting managed commit paths are reviewed before that command.
 
 ## Prune only on an explicit request
 
@@ -119,8 +139,8 @@ Pi Sync removes only previously managed stale resources that still match their s
 
 Every response is JSON with `apiVersion: 1`. Successful operations have `ok: true`. Conflicts and blocked operations have `ok: false`; inspect structured `conflicts`, `actions`, `staleResources`, `reviewRequired`, or `details` instead of parsing prose. Error responses include `errorCode`, a readable `error`, `details`, and `exitCode`.
 
-- Exit `0`: operation succeeded (including a read-only plan that reports eligible actions).
-- Exit `1`: an operational conflict, required first-install approval, package-manager failure, untrustworthy update metadata, or a stale item that cannot safely be pruned. Stop and explain the structured result; do not override it.
+- Exit `0`: operation succeeded (including a read-only plan that reports eligible actions and a completed `remove`).
+- Exit `1`: an operational conflict, required first-install approval, package-manager failure, untrustworthy update metadata, a failed explicit `remove --uninstall`, or a stale item that cannot safely be pruned. Stop and explain the structured result; do not override it.
 - Exit `2`: invalid input, unsupported operation, or repository/manifest validation failure. Correct the input only with the user's authorization, then re-plan.
 
 `apply` can complete independent non-conflicting resource actions while leaving conflicted items untouched; its exit status remains `1` when any conflict was reported. Bootstrap returns structured authentication and prerequisite-install handoffs; follow them without exposing credentials, invoking sudo, or installing outside the user-writable destination. `update` returns a JSON preview by default and changes lockfile pins or installs packages only with `--apply`. `update --apply --push` requires explicit update approval plus explicit publication authorization and then follows the same managed-only fast-forward push rules. `--approve` is solely for explicit first-time package-install approval; it does not lower release-age policy or resolve conflicts. Push previews and results use the versioned JSON API. Pi Sync pins only top-level package versions/revisions; transitive reproducibility is not guaranteed.
