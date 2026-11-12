@@ -36,6 +36,17 @@ pi-sync apply --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
 
 Apply follows the reviewed repository state, preserves unlisted content and local-only divergence, and never overwrites a reported collision or conflicted item. A non-zero result requires stopping to explain the structured conflict or error; do not resolve conflicts by guessing, overwriting, or editing managed files around the CLI. Review a new plan after the user resolves the issue.
 
+## Back-sync local setting changes when requested
+
+Pi rewrites `settings.json` (and other managed settings targets) when the user changes the model, model scope, theme, thinking level, or any other setting in the TUI. Those local-only changes drift away from the setup manifest until someone edits it by hand. The first-party `pi-sync` extension (installed next to this skill) watches the managed files and runs `pi-sync sync --apply` automatically after a short debounce; a `pi-sync` status-line entry and the `/pi-sync` command expose the result. When the extension is absent (or the user asks to persist a setting change), run the CLI directly:
+
+```sh
+pi-sync sync --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
+pi-sync sync --apply --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
+```
+
+`sync` promotes local-only managed setting fields into the manifest using the same three-way comparison as `plan` (repository unchanged, local diverged from the last applied baseline). Eligible values are portability-validated, the rewritten manifest is secret-scanned, and the write is atomic. Fields changed in both places are conflicts and are never overwritten; baseline-less collisions and locally removed fields are reported for manual review and never written. `sync` previews by default and writes only with `--apply`. It modifies only the setup manifest; it never touches the local installation and never commits or pushes. A non-zero result means some fields were not synced: explain the structured `conflicts`, `rejected`, or `review` entries, and publish the synced change only through an explicit `pi-sync push`.
+
 ## Add only a specifically selected local resource
 
 When the user explicitly asks to add a named local resource, review its contents for private data and use the CLI with the matching type:

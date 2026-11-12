@@ -173,7 +173,7 @@ function runAsync(args, env = {}) {
   });
 }
 
-test('bootstrap fetches a private setup fixture, declares the bundled skill, and installs it through apply', async (t) => {
+test('bootstrap fetches a private setup fixture, declares the bundled skill and extension, and installs them through apply', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-test-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const sourceRepo = await bootstrapRepo(t, root);
@@ -191,11 +191,17 @@ test('bootstrap fetches a private setup fixture, declares the bundled skill, and
   const output = result(bootstrapped);
   assert.equal(output.ok, true);
   assert.equal(output.authenticationMethod, 'git');
-  assert.deepEqual(output.skill, { source: 'resources/skills/pi-sync', target: 'skills/pi-sync', action: 'declared-and-applied' });
+  assert.deepEqual(output.bundledResources, [
+    { type: 'skill', source: 'resources/skills/pi-sync', target: 'skills/pi-sync', action: 'declared-and-applied' },
+    { type: 'extension', source: 'resources/extensions/pi-sync', target: 'extensions/pi-sync', action: 'declared-and-applied' },
+  ]);
   const manifest = JSON.parse(await fs.readFile(path.join(setupDir, 'pi-sync.json'), 'utf8'));
   assert.ok(manifest.resources.some((item) => item.type === 'skill' && item.source === 'resources/skills/pi-sync' && item.target === 'skills/pi-sync'));
+  assert.ok(manifest.resources.some((item) => item.type === 'extension' && item.source === 'resources/extensions/pi-sync' && item.target === 'extensions/pi-sync'));
   assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'pi-sync', 'SKILL.md'), 'utf8'),
     await fs.readFile(new URL('../resources/skills/pi-sync/SKILL.md', import.meta.url), 'utf8'));
+  assert.equal(await fs.readFile(path.join(agentDir, 'extensions', 'pi-sync', 'index.ts'), 'utf8'),
+    await fs.readFile(new URL('../resources/extensions/pi-sync/index.ts', import.meta.url), 'utf8'));
   assert.equal(await fs.readFile(unrelated, 'utf8'), '# Keep local\n');
   const state = await fs.readFile(path.join(agentDir, '.pi-sync', 'state.json'), 'utf8').then(JSON.parse);
   assert.ok(state.resources['skills/pi-sync'], 'the bundled skill is installed and tracked by normal apply state');
@@ -284,9 +290,9 @@ test('bootstrap detects manifest-owned skill target collisions without editing t
   assert.deepEqual(JSON.parse(await fs.readFile(manifestPath, 'utf8')), manifest);
 });
 
-test('public npm package allowlist includes the CLI and skill but excludes tests and scratch data', async () => {
+test('public npm package allowlist includes the CLI, skill, and extension but excludes tests and scratch data', async () => {
   const packageJson = JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8'));
-  assert.deepEqual(packageJson.files, ['README.md', 'src/cli.js', 'src/packages.js', 'src/prerequisites.js', 'resources/skills/pi-sync/SKILL.md']);
+  assert.deepEqual(packageJson.files, ['README.md', 'src/cli.js', 'src/packages.js', 'src/prerequisites.js', 'resources/skills/pi-sync/SKILL.md', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/README.md']);
   const packed = spawnSync('npm', ['pack', '--dry-run', '--json'], { encoding: 'utf8', cwd: path.dirname(fileURLToPath(new URL('../package.json', import.meta.url))) });
   assert.equal(packed.status, 0, packed.stderr);
   const files = JSON.parse(packed.stdout)[0].files.map((item) => item.path);
@@ -294,8 +300,9 @@ test('public npm package allowlist includes the CLI and skill but excludes tests
   assert.ok(files.includes('src/prerequisites.js'));
   assert.ok(files.includes('src/packages.js'));
   assert.ok(files.includes('resources/skills/pi-sync/SKILL.md'));
+  assert.ok(files.includes('resources/extensions/pi-sync/index.ts'));
   assert.ok(!files.some((item) => /^(?:test(?:\/|$)|test-support(?:\/|$)|\.scratch(?:\/|$)|resources\/skills\/(?!pi-sync\/))/.test(item)));
-  assert.deepEqual(files.sort(), ['README.md', 'package.json', 'resources/skills/pi-sync/SKILL.md', 'src/cli.js', 'src/packages.js', 'src/prerequisites.js']);
+  assert.deepEqual(files.sort(), ['README.md', 'package.json', 'resources/extensions/pi-sync/README.md', 'resources/extensions/pi-sync/index.ts', 'resources/skills/pi-sync/SKILL.md', 'src/cli.js', 'src/packages.js', 'src/prerequisites.js']);
 });
 
 test('supported agent commands share a versioned JSON response contract', async (t) => {
@@ -658,6 +665,177 @@ test('manages credential-like settings fields as environment references only', a
   const rejectedAuth = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(rejectedAuth.status, 2);
   assert.match(result(rejectedAuth).error, /credential-like key \(authToken\)/);
+});
+
+// Sets up a baseline for settings fields, then mutates the local file the way
+// Pi does when a user changes a setting in the TUI.
+async function settingsFixture(t, fields, target = 'settings.json') {
+  const { repo, agentDir } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.settings = [{ target, fields }];
+  await fs.writeFile(manifestPath, JSON.stringify(manifest));
+  const applied = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(applied.status, 0, applied.stderr);
+  const localPath = path.join(agentDir, target);
+  return { repo, agentDir, manifestPath, localPath };
+}
+
+test('sync previews local-only settings changes and applies them to the manifest', async (t) => {
+  const { repo, agentDir, manifestPath, localPath } = await settingsFixture(t, [
+    { path: '/theme', value: 'dark' },
+    { path: '/defaultProvider', value: 'github-copilot' },
+  ]);
+  const local = JSON.parse(await fs.readFile(localPath, 'utf8'));
+  local.theme = 'light';
+  local.defaultProvider = 'openrouter';
+  await fs.writeFile(localPath, `${JSON.stringify(local, null, 2)}\n`);
+
+  const preview = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(preview.status, 0, preview.stderr);
+  const plan = result(preview);
+  assert.equal(plan.mode, 'preview');
+  assert.deepEqual(plan.syncable.map((item) => item.path).sort(), ['/defaultProvider', '/theme']);
+  assert.deepEqual(plan.conflicts, []);
+  const previewManifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  assert.equal(previewManifest.settings[0].fields.find((field) => field.path === '/theme').value, 'dark', 'preview must not write the manifest');
+
+  const applied = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(applied.status, 0, applied.stderr);
+  const output = result(applied);
+  assert.equal(output.mode, 'applied');
+  assert.equal(output.ok, true);
+  assert.deepEqual(output.synced.map((item) => item.path).sort(), ['/defaultProvider', '/theme']);
+  assert.equal(output.synced.find((item) => item.path === '/theme').from, 'dark');
+  assert.equal(output.synced.find((item) => item.path === '/theme').to, 'light');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  assert.equal(manifest.settings[0].fields.find((field) => field.path === '/theme').value, 'light');
+  assert.equal(manifest.settings[0].fields.find((field) => field.path === '/defaultProvider').value, 'openrouter');
+
+  const again = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(again.status, 0, again.stderr);
+  const idle = result(again);
+  assert.deepEqual(idle.synced, []);
+  assert.match(idle.note, /Nothing to sync/);
+
+  // A second local change after a sync must still be eligible: the first sync
+  // re-baselines the field so this change is a local-only divergence, not a
+  // both-sides conflict against the stale pre-sync baseline.
+  const local2 = JSON.parse(await fs.readFile(localPath, 'utf8'));
+  local2.theme = 'dark';
+  await fs.writeFile(localPath, `${JSON.stringify(local2, null, 2)}\n`);
+  const second = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(second.status, 0, second.stderr);
+  const secondOutput = result(second);
+  assert.deepEqual(secondOutput.synced.map((item) => item.path), ['/theme']);
+  assert.deepEqual(secondOutput.conflicts, [], 're-baselining prevents a false conflict on the next change');
+  assert.equal(JSON.parse(await fs.readFile(manifestPath, 'utf8')).settings[0].fields.find((field) => field.path === '/theme').value, 'dark');
+
+  const reapply = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(reapply.status, 0, reapply.stderr);
+  assert.equal(result(reapply).ok, true, 'apply after sync is conflict-free and re-baselines the fields');
+});
+
+test('sync writes eligible fields but never overwrites fields changed in both places', async (t) => {
+  const { repo, agentDir, manifestPath, localPath } = await settingsFixture(t, [
+    { path: '/theme', value: 'dark' },
+    { path: '/defaultThinkingLevel', value: 'medium' },
+  ]);
+  const local = JSON.parse(await fs.readFile(localPath, 'utf8'));
+  local.theme = 'light'; // local-only change: eligible
+  local.defaultThinkingLevel = 'high'; // local change...
+  await fs.writeFile(localPath, `${JSON.stringify(local, null, 2)}\n`);
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')); // ...and a repository change: conflict
+  manifest.settings[0].fields.find((field) => field.path === '/defaultThinkingLevel').value = 'low';
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const applied = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(applied.status, 1, applied.stderr);
+  const output = result(applied);
+  assert.equal(output.ok, false);
+  assert.deepEqual(output.synced.map((item) => item.path), ['/theme'], 'independent eligible fields are still synced');
+  assert.deepEqual(output.conflicts, [{ target: 'settings.json', path: '/defaultThinkingLevel', action: 'conflict', reason: 'local and setup repository both changed since the last apply' }]);
+  const after = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  assert.equal(after.settings[0].fields.find((field) => field.path === '/theme').value, 'light');
+  assert.equal(after.settings[0].fields.find((field) => field.path === '/defaultThinkingLevel').value, 'low', 'conflicted repository value is preserved');
+  assert.equal(JSON.parse(await fs.readFile(localPath, 'utf8')).defaultThinkingLevel, 'high', 'conflicted local value is preserved');
+});
+
+test('sync rejects non-portable and suspected-secret local values before writing', async (t) => {
+  const { repo, agentDir, manifestPath, localPath } = await settingsFixture(t, [
+    { path: '/providers/local', value: { baseUrl: 'http://llama-swap:8080/v1', apiKey: '$LLAMA_SWAP_API_KEY' } },
+    { path: '/theme', value: 'dark' },
+  ], 'models.json');
+  const local = JSON.parse(await fs.readFile(localPath, 'utf8'));
+  local.providers.local.apiKey = 'sk-supersecret12345'; // literal credential: not portable
+  local.theme = 'ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ'; // suspected GitHub token
+  await fs.writeFile(localPath, `${JSON.stringify(local, null, 2)}\n`);
+
+  // The suspected secret blocks the whole write, so nothing is synced.
+  const blocked = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(blocked.status, 1, blocked.stderr);
+  assert.equal(result(blocked).errorCode, 'SYNC_BLOCKED');
+  assert.match(result(blocked).error, /suspected credential material/);
+  const untouched = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  assert.equal(untouched.settings[0].fields.find((field) => field.path === '/providers/local').value.apiKey, '$LLAMA_SWAP_API_KEY', 'nothing is written when the secret scan blocks');
+  assert.equal(untouched.settings[0].fields.find((field) => field.path === '/theme').value, 'dark');
+
+  // With the secret gone, the literal credential is rejected portability-wise.
+  const portable = JSON.parse(await fs.readFile(localPath, 'utf8'));
+  portable.theme = 'dark';
+  await fs.writeFile(localPath, `${JSON.stringify(portable, null, 2)}\n`);
+  const rejected = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(rejected.status, 1, rejected.stderr);
+  const output = result(rejected);
+  assert.equal(output.ok, false);
+  assert.deepEqual(output.synced, []);
+  assert.equal(output.rejected.length, 1);
+  assert.equal(output.rejected[0].path, '/providers/local');
+  assert.match(output.rejected[0].reason, /credential-like key \(apiKey\)/);
+  assert.deepEqual(output.review, []);
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  assert.equal(manifest.settings[0].fields.find((field) => field.path === '/providers/local').value.apiKey, '$LLAMA_SWAP_API_KEY', 'manifest is untouched when any field is rejected');
+
+  // The placeholder itself is portable and syncs cleanly.
+  portable.providers.local.apiKey = '__PLACEHOLDER__';
+  await fs.writeFile(localPath, `${JSON.stringify(portable, null, 2)}\n`);
+  const ok = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.deepEqual(result(ok).synced.map((item) => item.path), ['/providers/local']);
+  assert.equal(JSON.parse(await fs.readFile(manifestPath, 'utf8')).settings[0].fields.find((field) => field.path === '/providers/local').value.apiKey, '__PLACEHOLDER__');
+});
+
+test('sync reports locally removed managed fields for review without unmanaging them', async (t) => {
+  const { repo, agentDir, manifestPath, localPath } = await settingsFixture(t, [{ path: '/theme', value: 'dark' }]);
+  const local = JSON.parse(await fs.readFile(localPath, 'utf8'));
+  delete local.theme;
+  await fs.writeFile(localPath, `${JSON.stringify(local, null, 2)}\n`);
+
+  const applied = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(applied.status, 1, applied.stderr);
+  const output = result(applied);
+  assert.equal(output.ok, false);
+  assert.deepEqual(output.synced, []);
+  assert.equal(output.review.length, 1);
+  assert.equal(output.review[0].path, '/theme');
+  assert.match(output.review[0].reason, /removed locally/);
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  assert.equal(manifest.settings[0].fields.find((field) => field.path === '/theme').value, 'dark', 'removals are never back-synced automatically');
+});
+
+test('sync requires an existing agent directory and never writes on preview', async (t) => {
+  const { repo, agentDir, manifestPath, localPath } = await settingsFixture(t, [{ path: '/theme', value: 'dark' }]);
+  const missing = run(['sync', '--repo', repo, '--agent-dir', path.join(agentDir, 'nope')]);
+  assert.equal(missing.status, 2);
+  assert.match(result(missing).error, /agent directory does not exist/);
+
+  const local = JSON.parse(await fs.readFile(localPath, 'utf8'));
+  local.theme = 'light';
+  await fs.writeFile(localPath, `${JSON.stringify(local, null, 2)}\n`);
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  const preview = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
 });
 
 test('serializes concurrent applies and leaves one consistent managed installation', async (t) => {

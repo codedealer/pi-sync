@@ -24,6 +24,7 @@ const RESOURCE_RULES = {
 };
 const RESOURCE_TARGET_ROOTS = Object.values(RESOURCE_RULES).map((rule) => `${rule.targetRoot}/`);
 const BUNDLED_SKILL = fileURLToPath(new URL('../resources/skills/pi-sync', import.meta.url));
+const BUNDLED_EXTENSION = fileURLToPath(new URL('../resources/extensions/pi-sync', import.meta.url));
 
 function fail(error, code = VALIDATION_ERROR) {
   const command = process.argv[2] ?? null;
@@ -970,6 +971,94 @@ async function buildPlan(repo, agentDir, declarations, state) {
   return { resources, settings, stale };
 }
 
+// Back-syncs local-only managed setting changes into the setup manifest.
+// A field is eligible only when the three-way comparison says the repository
+// is unchanged and the local installation diverged from the last applied
+// baseline. Conflicts, collisions (no baseline), and locally removed fields
+// are reported for manual review and never written. The manifest is the only
+// file this command modifies; it is rewritten with the same atomic
+// read-check-rename pattern as add/remove and re-validated after the write.
+async function syncSettings(repo, agentDir, declarations, state, applyChanges) {
+  const plan = await buildPlan(repo, agentDir, declarations, state);
+  const syncable = [];
+  const conflicts = [];
+  const rejected = [];
+  const review = [];
+  for (const item of plan.settings) {
+    for (const field of item.fields) {
+      if (field.action === 'local-divergence') {
+        if (!field.local.exists) {
+          review.push({ target: item.target, path: field.pointer, reason: 'managed setting was removed locally; update the setup manifest manually' });
+          continue;
+        }
+        try {
+          validatePortableSettingValue(field.local.value, `${item.target} ${field.pointer}`);
+          syncable.push({ target: item.target, path: field.pointer, from: field.value, to: field.local.value });
+        } catch (error) {
+          rejected.push({ target: item.target, path: field.pointer, reason: error.message });
+        }
+      } else if (field.action === 'conflict' || field.action === 'collision') {
+        conflicts.push({ target: item.target, path: field.pointer, action: field.action, ...(field.reason ? { reason: field.reason } : {}) });
+      }
+    }
+  }
+
+  if (!applyChanges) {
+    return { apiVersion: 1, command: 'sync', ok: true, exitCode: 0, repository: repo, agentDirectory: agentDir, mode: 'preview',
+      syncable, conflicts, rejected, review,
+      note: syncable.length
+        ? 'Preview only: run `pi-sync sync --apply` to write the local values into the setup manifest. Pushing the change still requires an explicit `pi-sync push`.'
+        : 'Nothing to sync: every managed setting field matches the setup manifest locally.' };
+  }
+
+  const output = { apiVersion: 1, command: 'sync', ok: true, exitCode: 0, repository: repo, agentDirectory: agentDir, mode: 'applied',
+    synced: [], conflicts, rejected, review };
+  if (!syncable.length) {
+    output.note = conflicts.length || rejected.length || review.length
+      ? 'No eligible local-only changes to write; the reported fields need manual review.'
+      : 'Nothing to sync: every managed setting field matches the setup manifest locally.';
+    if (conflicts.length || rejected.length || review.length) { output.ok = false; output.exitCode = OPERATION_ERROR; }
+    return output;
+  }
+
+  const manifestPath = path.join(repo, MANIFEST_FILE);
+  const manifestText = await fs.readFile(manifestPath, 'utf8');
+  const manifest = JSON.parse(manifestText);
+  const nextManifest = structuredClone(manifest);
+  for (const change of syncable) {
+    const field = nextManifest.settings?.find((item) => item.target === change.target)?.fields?.find((item) => item.path === change.path);
+    if (!field) throw new Error(`Manifest no longer declares ${change.target} ${change.path}; re-run sync`);
+    field.value = change.to;
+  }
+  const findings = findLikelySecretsInText(`${JSON.stringify(nextManifest, null, 2)}\n`, MANIFEST_FILE);
+  if (findings.length) {
+    const error = new Error('Synced local setting values contain suspected credential material; nothing was written');
+    error.errorCode = 'SYNC_BLOCKED';
+    error.details = { reviewRequired: findings };
+    throw error;
+  }
+  await writeJsonFileAtomic(manifestPath, nextManifest, manifestText);
+  try {
+    await validateRepository(repo);
+  } catch (error) {
+    await restoreFileAtomic(manifestPath, manifestText);
+    throw error;
+  }
+  // Re-baseline the synced fields so a later local change is compared against
+  // the value this sync just published, not against the pre-sync baseline
+  // (which would misclassify the next local-only change as a both-sides conflict).
+  const mutableState = structuredClone(state);
+  for (const change of syncable) {
+    mutableState.settings[change.target] ??= {};
+    mutableState.settings[change.target][change.path] = { exists: true, value: change.to };
+  }
+  await writeState(agentDir, mutableState);
+  output.synced = syncable;
+  output.note = 'Local values were written to the setup manifest. The setup repository is not committed or pushed; publish with an explicit `pi-sync push`.';
+  if (conflicts.length || rejected.length || review.length) { output.ok = false; output.exitCode = OPERATION_ERROR; }
+  return output;
+}
+
 function outputAction(item, key) {
   return { type: item.type ?? 'setting', [key]: item[key], action: item.action, ...(item.reason ? { reason: item.reason } : {}),
     ...(item.files?.length ? { files: item.files.map(({ path: file, action, reason }) => ({ path: file, action, ...(reason ? { reason } : {}) })) } : {}) };
@@ -1366,31 +1455,42 @@ function bootstrapResponse(ok, errorCode, error, extra = {}) {
   return { apiVersion: 1, command: 'bootstrap', ok, errorCode, error, exitCode: ok ? 0 : OPERATION_ERROR, ...extra };
 }
 
-async function installBundledSkill(repo) {
+async function installBundledResources(repo) {
   const manifestPath = path.join(repo, MANIFEST_FILE);
   const manifestText = await fs.readFile(manifestPath, 'utf8');
   const manifest = JSON.parse(manifestText);
   const declarations = await validateRepository(repo);
-  const source = 'resources/skills/pi-sync';
-  const target = 'skills/pi-sync';
-  const exact = declarations.resources.some((item) => item.source === source && item.target === target);
-  if (exact) return { ok: true, added: false };
-
-  const collision = declarations.resources.find((item) => pathsOverlap(item.target, target) || pathsOverlap(item.source, source));
-  if (collision) return { ok: false, collision: { source: collision.source, target: collision.target } };
-  const sourcePath = path.join(repo, ...source.split('/'));
-  const existingSource = await fs.lstat(sourcePath).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
-  if (existingSource) return { ok: false, collision: { source, target, reason: 'setup repository source path already exists and is not declared as this resource' } };
-
-  const bundled = await fs.lstat(BUNDLED_SKILL).catch((error) => { throw new Error(`Bundled pi-sync skill is unavailable: ${error.message}`); });
-  if (bundled.isSymbolicLink() || !bundled.isDirectory()) throw new Error('Bundled pi-sync skill is not a real directory');
-  await ensureRealDirectory(repo, 'resources/skills', true);
-  await fs.mkdir(sourcePath);
+  const bundled = [
+    { type: 'skill', source: 'resources/skills/pi-sync', target: 'skills/pi-sync', root: BUNDLED_SKILL },
+    { type: 'extension', source: 'resources/extensions/pi-sync', target: 'extensions/pi-sync', root: BUNDLED_EXTENSION },
+  ];
+  // Fail before materializing anything: a collision on any bundled resource
+  // must not leave partially declared repository content behind.
+  const toAdd = [];
+  for (const item of bundled) {
+    if (declarations.resources.some((resource) => resource.source === item.source && resource.target === item.target)) continue;
+    const collision = declarations.resources.find((resource) => pathsOverlap(resource.target, item.target) || pathsOverlap(resource.source, item.source));
+    if (collision) return { ok: false, collision: { source: collision.source, target: collision.target, bundled: { type: item.type, source: item.source, target: item.target } } };
+    const sourcePath = path.join(repo, ...item.source.split('/'));
+    const existingSource = await fs.lstat(sourcePath).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
+    if (existingSource) return { ok: false, collision: { source: item.source, target: item.target, bundled: { type: item.type, source: item.source, target: item.target }, reason: 'setup repository source path already exists and is not declared as this resource' } };
+    const info = await fs.lstat(item.root).catch((error) => { throw new Error(`Bundled pi-sync ${item.type} is unavailable: ${error.message}`); });
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`Bundled pi-sync ${item.type} is not a real directory`);
+    toAdd.push(item);
+  }
+  if (!toAdd.length) return { ok: true, added: false, addedResources: [] };
+  const created = [];
   try {
-    for (const entry of await fs.readdir(BUNDLED_SKILL)) {
-      await fs.cp(path.join(BUNDLED_SKILL, entry), path.join(sourcePath, entry), { recursive: true, errorOnExist: true, force: false });
+    for (const item of toAdd) {
+      const sourcePath = path.join(repo, ...item.source.split('/'));
+      await ensureRealDirectory(repo, path.posix.dirname(item.source), true);
+      await fs.mkdir(sourcePath);
+      created.push(sourcePath);
+      for (const entry of await fs.readdir(item.root)) {
+        await fs.cp(path.join(item.root, entry), path.join(sourcePath, entry), { recursive: true, errorOnExist: true, force: false });
+      }
     }
-    const nextManifest = { ...manifest, resources: [...manifest.resources, { type: 'skill', source, target }] };
+    const nextManifest = { ...manifest, resources: [...manifest.resources, ...toAdd.map(({ type, source, target }) => ({ type, source, target }))] };
     const temporary = `${manifestPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
     try {
       const info = await fs.stat(manifestPath);
@@ -1402,11 +1502,11 @@ async function installBundledSkill(repo) {
       throw error;
     }
   } catch (error) {
-    await fs.rm(sourcePath, { recursive: true, force: true }).catch(() => {});
+    for (const directory of created) await fs.rm(directory, { recursive: true, force: true }).catch(() => {});
     throw error;
   }
   await validateRepository(repo);
-  return { ok: true, added: true };
+  return { ok: true, added: true, addedResources: toAdd.map(({ type, source, target }) => ({ type, source, target })) };
 }
 
 async function runPiSync(command, repo, agentDir) {
@@ -1484,16 +1584,20 @@ async function bootstrap(repoUrl, repoDir, agentDir, binDir) {
         missingPrerequisites: prerequisites.tools.filter((tool) => tool.status === 'failed'),
       });
 
-    const declaration = await installBundledSkill(checkout);
-    if (!declaration.ok) return bootstrapResponse(false, 'RESOURCE_COLLISION', 'The bundled pi-sync skill conflicts with existing setup repository content; no installation was performed', {
-      repository: destination, collision: declaration.collision, skill: { source: 'resources/skills/pi-sync', target: 'skills/pi-sync' },
+    const declaration = await installBundledResources(checkout);
+    if (!declaration.ok) return bootstrapResponse(false, 'RESOURCE_COLLISION', 'A bundled pi-sync resource conflicts with existing setup repository content; no installation was performed', {
+      repository: destination, collision: declaration.collision,
     });
 
     await validateRepository(checkout);
     const plan = await runPiSync('plan', checkout, path.resolve(agentDir));
     if (plan.status !== 0 || !plan.output.ok) {
       return bootstrapResponse(false, 'APPLY_CONFLICT', 'Bootstrap plan found a collision or conflict; existing local content was left untouched', {
-        repository: destination, skill: { source: 'resources/skills/pi-sync', target: 'skills/pi-sync' }, plan: plan.output,
+        repository: destination,
+        bundledResources: [
+          { type: 'skill', source: 'resources/skills/pi-sync', target: 'skills/pi-sync' },
+          { type: 'extension', source: 'resources/extensions/pi-sync', target: 'extensions/pi-sync' },
+        ], plan: plan.output,
       });
     }
     if (await fs.lstat(destination).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error))) {
@@ -1504,7 +1608,10 @@ async function bootstrap(repoUrl, repoDir, agentDir, binDir) {
     return bootstrapResponse(applied.status === 0 && applied.output.ok, applied.status === 0 && applied.output.ok ? undefined : 'APPLY_CONFLICT',
       applied.status === 0 && applied.output.ok ? undefined : 'Bootstrap apply did not complete cleanly; inspect the structured apply result and resume after resolving it', {
         repository: destination, authenticationMethod, prerequisites: prerequisites.tools,
-        skill: { source: 'resources/skills/pi-sync', target: 'skills/pi-sync', action: declaration.added ? 'declared-and-applied' : 'applied' },
+        bundledResources: [
+          { type: 'skill', source: 'resources/skills/pi-sync', target: 'skills/pi-sync' },
+          { type: 'extension', source: 'resources/extensions/pi-sync', target: 'extensions/pi-sync' },
+        ].map((item) => ({ ...item, action: declaration.addedResources.some((added) => added.source === item.source) ? 'declared-and-applied' : 'applied' })),
         apply: applied.output,
       });
   } finally {
@@ -1780,8 +1887,8 @@ async function managedPush(repo, declarations, publish = false) {
 
 async function main() {
   const command = process.argv[2];
-  if (!['status', 'plan', 'apply', 'add', 'remove', 'prune', 'bootstrap', 'update', 'push'].includes(command)) {
-    throw new Error('Usage: pi-sync <status|plan|apply|add|remove|prune|update|push|bootstrap> [--repo PATH] [--repo-url URL --repo-dir PATH] [--agent-dir PATH] [--type skill|extension|prompt|agent|role|dependency --target VALUE | --source VALUE] [--confirm] [--approve] [--apply] [--push] [--publish] [--uninstall]');
+  if (!['status', 'plan', 'apply', 'add', 'remove', 'prune', 'bootstrap', 'update', 'push', 'sync'].includes(command)) {
+    throw new Error('Usage: pi-sync <status|plan|apply|add|remove|prune|update|push|bootstrap|sync> [--repo PATH] [--repo-url URL --repo-dir PATH] [--agent-dir PATH] [--type skill|extension|prompt|agent|role|dependency --target VALUE | --source VALUE] [--confirm] [--approve] [--apply] [--push] [--publish] [--uninstall]');
   }
   const options = { repo: process.cwd(), repoDir: path.join(os.homedir(), '.pi-sync', 'setup'), agentDir: process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent'), binDir: path.join(os.homedir(), '.local', 'bin'), confirm: false, approve: false, applyUpdate: false, pushUpdate: false, publish: false, uninstall: false };
   for (let i = 3; i < process.argv.length; i++) {
@@ -1807,7 +1914,7 @@ async function main() {
   }
   if (options.confirm && command !== 'prune') throw new Error('--confirm is only supported by prune');
   if (options.approve && !['apply', 'update'].includes(command)) throw new Error('--approve is only supported by apply or update');
-  if (options.applyUpdate && command !== 'update') throw new Error('--apply is only supported by update');
+  if (options.applyUpdate && !['update', 'sync'].includes(command)) throw new Error('--apply is only supported by update or sync');
   if (options.pushUpdate && command !== 'update') throw new Error('--push is only supported by update');
   if (options.pushUpdate && !options.applyUpdate) throw new Error('update --push requires --apply so package updates are explicitly approved');
   if (options.publish && command !== 'push') throw new Error('--publish is only supported by push');
@@ -1920,6 +2027,21 @@ async function main() {
         minimumReleaseAgeDays, policySource: 'setup repository pi-sync.json', mode: 'applied', updates,
         pins: nextLock.packages, installed, ...(push ? { push } : {}), dependencyModel: 'exact top-level pins; transitive dependency tree is controlled by Pi and is not locked by Pi Sync' }, null, 2));
     } finally { await releasePackageLock(); }
+    return;
+  }
+  if (command === 'sync') {
+    if (!agentInfo) throw new Error(`Pi agent directory does not exist: ${agentDir}`);
+    // --apply writes the manifest and re-baselines synced fields, so it takes
+    // the same agent lock as apply to serialize state.json updates.
+    const releaseSyncLock = options.applyUpdate ? await acquireLock(agentDir) : null;
+    try {
+      const state = await loadState(agentDir);
+      const output = await syncSettings(repo, agentDir, declarations, state, options.applyUpdate);
+      console.log(JSON.stringify(output, null, 2));
+      if (!output.ok) process.exitCode = output.exitCode;
+    } finally {
+      if (releaseSyncLock) await releaseSyncLock();
+    }
     return;
   }
   if (command === 'apply' && !agentInfo) {
@@ -2042,4 +2164,4 @@ async function main() {
   }
 }
 
-main().catch((error) => fail(error, ['PACKAGE_INSTALL_FAILED', 'APPROVAL_REQUIRED', 'UPDATE_TRANSACTION_FAILED', 'PUSH_BLOCKED'].includes(error?.errorCode) || /update stopped closed|^(Another Pi Sync|A stale Pi Sync)/.test(error.message) ? OPERATION_ERROR : VALIDATION_ERROR));
+main().catch((error) => fail(error, ['PACKAGE_INSTALL_FAILED', 'APPROVAL_REQUIRED', 'UPDATE_TRANSACTION_FAILED', 'PUSH_BLOCKED', 'SYNC_BLOCKED'].includes(error?.errorCode) || /update stopped closed|^(Another Pi Sync|A stale Pi Sync)/.test(error.message) ? OPERATION_ERROR : VALIDATION_ERROR));
