@@ -11,14 +11,14 @@ A small Node.js CLI for applying explicitly declared Pi user-level resources fro
 The npm package publishes the CLI and its first-party `pi-sync` skill only. Its explicit `files` allowlist excludes setup repositories, credentials, scratch planning files, and test fixtures. Install globally at user level where your npm/pnpm prefix is writable (configure a user-writable npm prefix if needed; do not use sudo), or use a one-shot runner:
 
 ```sh
-npm install --global pi-sync
-# or: pnpm add --global pi-sync
+npm install --global @codedealer/pi-sync
+# or: pnpm add --global @codedealer/pi-sync
 # fallback without a global install:
-pnpm dlx pi-sync bootstrap --repo-url https://github.com/OWNER/PRIVATE-SETUP.git
+pnpm dlx @codedealer/pi-sync bootstrap --repo-url https://github.com/OWNER/PRIVATE-SETUP.git
 # optionally select a user-writable prerequisite install directory:
-pnpm dlx pi-sync bootstrap --repo-url https://github.com/OWNER/PRIVATE-SETUP.git --bin-dir "$HOME/.local/bin"
+pnpm dlx @codedealer/pi-sync bootstrap --repo-url https://github.com/OWNER/PRIVATE-SETUP.git --bin-dir "$HOME/.local/bin"
 # or:
-npx --yes pi-sync bootstrap --repo-url https://github.com/OWNER/PRIVATE-SETUP.git
+npx --yes @codedealer/pi-sync bootstrap --repo-url https://github.com/OWNER/PRIVATE-SETUP.git
 ```
 
 Bootstrap clones into `~/.pi-sync/setup` by default (override with `--repo-dir PATH`) and applies to `PI_CODING_AGENT_DIR` or `~/.pi/agent` (override with `--agent-dir PATH`). It first tests Git access, then uses an authenticated GitHub CLI session when available. If Git access is unavailable and GitHub CLI is missing, bootstrap installs the official GitHub CLI release into `~/.local/bin` (override with `--bin-dir PATH`) when a supported platform artifact and writable destination are available, then pauses for authentication. If installation is unsupported or fails, it reports the exact missing tool and a no-sudo user action. The authentication handoff includes a `commandArgs` array for `gh auth login --hostname github.com`; when Pi Sync installed the tool locally, it points directly to that executable. After authenticating, rerun the returned resume arguments. Pi Sync never asks for, prints, or stores credentials. Once fetched, bootstrap validates the manifest and lockfile and installs every declared `requiredTools` prerequisite before applying anything; unsupported names are rejected and failed required tools stop setup. It declares the bundled skill as `{ "type": "skill", "source": "resources/skills/pi-sync", "target": "skills/pi-sync" }`, previews normal manifest-driven apply, and installs only through the ordinary conflict-safe apply flow. Existing declared or local content at a colliding path is reported and left untouched. Bootstrap does not commit or push repository changes.
