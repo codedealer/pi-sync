@@ -204,6 +204,15 @@ async function findLikelySecrets(root, relative) {
 }
 
 const ENV_REFERENCE = /^\$[A-Za-z_][A-Za-z0-9_]*$|^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/;
+// LLM usage/limit parameters that contain "token" but never carry credentials.
+const NON_CREDENTIAL_TOKEN_KEYS = new Set(['tokens', 'maxtokens', 'mintokens', 'tokencount', 'tokenlimit', 'numtokens']);
+
+function isCredentialLikeKey(normalized) {
+  if (['apikey', 'password', 'passwd', 'secret', 'credential', 'privatekey'].some((part) => normalized.includes(part))) return true;
+  if (normalized.includes('token')) return !NON_CREDENTIAL_TOKEN_KEYS.has(normalized);
+  if (normalized.includes('auth')) return !normalized.startsWith('author');
+  return false;
+}
 
 function validatePortableSettingValue(value, label) {
   if (Array.isArray(value)) {
@@ -211,7 +220,7 @@ function validatePortableSettingValue(value, label) {
   } else if (isRecord(value)) {
     for (const [key, nested] of Object.entries(value)) {
       const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
-      if (/(?:apikey|token|password|secret|credential|auth)/.test(normalized)) {
+      if (isCredentialLikeKey(normalized)) {
         if (typeof nested !== 'string' || !ENV_REFERENCE.test(nested)) {
           throw new Error(`${label} contains a credential-like key (${key}); only a $NAME or ${'$'}{NAME} environment reference may be managed`);
         }
@@ -308,7 +317,7 @@ async function validateRepository(repo, { allowMissingPins = false } = {}) {
       const segments = decodePointer(field.path, `${fieldLabel}.path`);
       validatePortableSettingValue(field.value, `${fieldLabel}.value`);
       for (const segment of segments) {
-        if (/(?:apikey|token|password|secret|credential|auth)/.test(segment.toLowerCase().replace(/[^a-z0-9]/g, ''))) {
+        if (isCredentialLikeKey(segment.toLowerCase().replace(/[^a-z0-9]/g, ''))) {
           throw new Error(`${fieldLabel}.path contains a credential-like key`);
         }
       }

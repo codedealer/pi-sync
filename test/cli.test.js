@@ -620,12 +620,13 @@ test('manages credential-like settings fields as environment references only', a
   const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
   const settingsPath = path.join(agentDir, 'settings.json');
 
-  manifest.settings = [{ target: 'settings.json', fields: [{ path: '/providers/local', value: { baseUrl: 'http://llama-swap:8080/v1', apiKey: '$LLAMA_SWAP_API_KEY' } }] }];
+  manifest.settings = [{ target: 'settings.json', fields: [{ path: '/providers/local', value: { baseUrl: 'http://llama-swap:8080/v1', apiKey: '$LLAMA_SWAP_API_KEY', models: [{ id: 'qwen-3.8-27b', maxTokens: 131072 }] } }] }];
   await fs.writeFile(manifestPath, JSON.stringify(manifest));
   const applied = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(applied.status, 0, applied.stderr);
   const value = await fs.readFile(settingsPath, 'utf8').then(JSON.parse);
   assert.equal(value.providers.local.apiKey, '$LLAMA_SWAP_API_KEY');
+  assert.equal(value.providers.local.models[0].maxTokens, 131072);
 
   const braced = { path: '/providers/local', value: { apiKey: '${BRACED_NAME}' } };
   manifest.settings = [{ target: 'settings.json', fields: [braced] }];
@@ -640,6 +641,12 @@ test('manages credential-like settings fields as environment references only', a
     assert.equal(rejected.status, 2, `expected rejection for ${JSON.stringify(badValue)}`);
     assert.match(result(rejected).error, /credential-like key/);
   }
+
+  manifest.settings = [{ target: 'settings.json', fields: [{ path: '/providers/local', value: { authToken: 'literal' } }] }];
+  await fs.writeFile(manifestPath, JSON.stringify(manifest));
+  const rejectedAuth = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(rejectedAuth.status, 2);
+  assert.match(result(rejectedAuth).error, /credential-like key \(authToken\)/);
 });
 
 test('serializes concurrent applies and leaves one consistent managed installation', async (t) => {
