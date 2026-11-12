@@ -614,6 +614,34 @@ test('rejects credential-like fields in portable settings before changing local 
   await assert.rejects(fs.access(path.join(agentDir, 'settings.json')));
 });
 
+test('manages credential-like settings fields as environment references only', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  const settingsPath = path.join(agentDir, 'settings.json');
+
+  manifest.settings = [{ target: 'settings.json', fields: [{ path: '/providers/local', value: { baseUrl: 'http://llama-swap:8080/v1', apiKey: '$LLAMA_SWAP_API_KEY' } }] }];
+  await fs.writeFile(manifestPath, JSON.stringify(manifest));
+  const applied = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(applied.status, 0, applied.stderr);
+  const value = await fs.readFile(settingsPath, 'utf8').then(JSON.parse);
+  assert.equal(value.providers.local.apiKey, '$LLAMA_SWAP_API_KEY');
+
+  const braced = { path: '/providers/local', value: { apiKey: '${BRACED_NAME}' } };
+  manifest.settings = [{ target: 'settings.json', fields: [braced] }];
+  await fs.writeFile(manifestPath, JSON.stringify(manifest));
+  const appliedBraced = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(appliedBraced.status, 0, appliedBraced.stderr);
+
+  for (const badValue of ['literal-secret', '!echo pwned', '$$NAME', '$1BAD', { env: 'LLAMA_SWAP_API_KEY' }, 42]) {
+    manifest.settings = [{ target: 'settings.json', fields: [{ path: '/providers/local', value: { apiKey: badValue } }] }];
+    await fs.writeFile(manifestPath, JSON.stringify(manifest));
+    const rejected = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+    assert.equal(rejected.status, 2, `expected rejection for ${JSON.stringify(badValue)}`);
+    assert.match(result(rejected).error, /credential-like key/);
+  }
+});
+
 test('serializes concurrent applies and leaves one consistent managed installation', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const args = ['apply', '--repo', repo, '--agent-dir', agentDir];

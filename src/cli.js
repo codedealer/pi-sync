@@ -203,6 +203,8 @@ async function findLikelySecrets(root, relative) {
   return findings;
 }
 
+const ENV_REFERENCE = /^\$[A-Za-z_][A-Za-z0-9_]*$|^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/;
+
 function validatePortableSettingValue(value, label) {
   if (Array.isArray(value)) {
     value.forEach((item, index) => validatePortableSettingValue(item, `${label}[${index}]`));
@@ -210,7 +212,10 @@ function validatePortableSettingValue(value, label) {
     for (const [key, nested] of Object.entries(value)) {
       const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
       if (/(?:apikey|token|password|secret|credential|auth)/.test(normalized)) {
-        throw new Error(`${label} contains a credential-like key (${key})`);
+        if (typeof nested !== 'string' || !ENV_REFERENCE.test(nested)) {
+          throw new Error(`${label} contains a credential-like key (${key}); only a $NAME or ${'$'}{NAME} environment reference may be managed`);
+        }
+        continue;
       }
       validatePortableSettingValue(nested, `${label}.${key}`);
     }
