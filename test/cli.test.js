@@ -634,7 +634,18 @@ test('manages credential-like settings fields as environment references only', a
   const appliedBraced = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(appliedBraced.status, 0, appliedBraced.stderr);
 
-  for (const badValue of ['literal-secret', '!echo pwned', '$$NAME', '$1BAD', { env: 'LLAMA_SWAP_API_KEY' }, 42]) {
+  // The safe placeholder is Pi's documented way to satisfy the mandatory apiKey
+  // field for local endpoints that require no real key, without a per-machine env var.
+  const placeholder = { path: '/providers/local', value: { baseUrl: 'http://localhost:11434/v1', apiKey: '__PLACEHOLDER__' } };
+  manifest.settings = [{ target: 'settings.json', fields: [placeholder] }];
+  await fs.writeFile(manifestPath, JSON.stringify(manifest));
+  const appliedPlaceholder = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(appliedPlaceholder.status, 0, appliedPlaceholder.stderr);
+  const placeholderValue = await fs.readFile(settingsPath, 'utf8').then(JSON.parse);
+  assert.equal(placeholderValue.providers.local.apiKey, '__PLACEHOLDER__');
+  assert.equal(placeholderValue.providers.local.baseUrl, 'http://localhost:11434/v1');
+
+  for (const badValue of ['literal-secret', '!echo pwned', '$$NAME', '$1BAD', '__PLACEHOLDER__EXTRA', { env: 'LLAMA_SWAP_API_KEY' }, 42]) {
     manifest.settings = [{ target: 'settings.json', fields: [{ path: '/providers/local', value: { apiKey: badValue } }] }];
     await fs.writeFile(manifestPath, JSON.stringify(manifest));
     const rejected = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
@@ -1111,6 +1122,23 @@ test('push blocks a likely token in a manifest setting before commit or publicat
   assert.equal(gitAt(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0], remoteBefore);
   assert.equal(gitAt(repo, ['diff', '--cached', '--name-only']), '');
   assert.equal(await fs.readFile(manifestPath, 'utf8'), `${JSON.stringify(manifest, null, 2)}\n`);
+});
+
+test('push allows the safe placeholder in a manifest credential-like setting', async (t) => {
+  const { repo, bare } = await pushFixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.settings = [{ target: 'models.json', fields: [{ path: '/providers/local', value: { baseUrl: 'http://localhost:11434/v1', apiKey: '__PLACEHOLDER__' } }] }];
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const response = run(['push', '--publish', '--repo', repo]);
+  assert.equal(response.status, 0, response.stderr);
+  const output = result(response);
+  assert.equal(output.mode, 'published');
+  const remote = spawnSync('git', ['--git-dir', bare, 'show', 'main:pi-sync.json'], { encoding: 'utf8' });
+  assert.equal(remote.status, 0, remote.stderr);
+  const remoteManifest = JSON.parse(remote.stdout);
+  assert.equal(remoteManifest.settings[0].fields[0].value.apiKey, '__PLACEHOLDER__');
 });
 
 test('push refuses unrelated local commits and remote advancement without losing local edits', async (t) => {

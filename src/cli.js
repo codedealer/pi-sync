@@ -157,7 +157,8 @@ const SECRET_PATTERNS = [
   ['GitHub token', /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/],
   ['AWS access key', /\bAKIA[0-9A-Z]{16}\b/],
   ['bearer token', /\bBearer\s+[A-Za-z0-9._~+/-]{20,}/i],
-  ['credential assignment', /(?:api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*["']?(?!your[_ -]|example|changeme|placeholder)[A-Za-z0-9_./+=-]{12,}/i],
+  // Keep the __placeholder__ exclusion in sync with SAFE_PLACEHOLDER below.
+  ['credential assignment', /(?:api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*["']?(?!your[_ -]|example|changeme|placeholder|__placeholder__)[A-Za-z0-9_./+=-]{12,}/i],
 ];
 
 function findLikelySecretsInText(text, relative) {
@@ -204,6 +205,9 @@ async function findLikelySecrets(root, relative) {
 }
 
 const ENV_REFERENCE = /^\$[A-Za-z_][A-Za-z0-9_]*$|^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/;
+// Safe literal for credential-like keys of providers that require no real API key
+// (Pi's documented way to satisfy the mandatory apiKey field for local endpoints).
+const SAFE_PLACEHOLDER = '__PLACEHOLDER__';
 // LLM usage/limit parameters that contain "token" but never carry credentials.
 const NON_CREDENTIAL_TOKEN_KEYS = new Set(['tokens', 'maxtokens', 'mintokens', 'tokencount', 'tokenlimit', 'numtokens']);
 
@@ -221,8 +225,8 @@ function validatePortableSettingValue(value, label) {
     for (const [key, nested] of Object.entries(value)) {
       const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
       if (isCredentialLikeKey(normalized)) {
-        if (typeof nested !== 'string' || !ENV_REFERENCE.test(nested)) {
-          throw new Error(`${label} contains a credential-like key (${key}); only a $NAME or ${'$'}{NAME} environment reference may be managed`);
+        if (typeof nested !== 'string' || !(nested === SAFE_PLACEHOLDER || ENV_REFERENCE.test(nested))) {
+          throw new Error(`${label} contains a credential-like key (${key}); only a $NAME or ${'$'}{NAME} environment reference or the ${SAFE_PLACEHOLDER} placeholder may be managed`);
         }
         continue;
       }
