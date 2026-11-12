@@ -838,6 +838,66 @@ test('sync requires an existing agent directory and never writes on preview', as
   assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
 });
 
+test('serializes concurrent sync --apply runs the way multiple Pi sessions would trigger them', async (t) => {
+  const { repo, agentDir, manifestPath, localPath } = await settingsFixture(t, [{ path: '/theme', value: 'dark' }]);
+  const local = JSON.parse(await fs.readFile(localPath, 'utf8'));
+  local.theme = 'light';
+  await fs.writeFile(localPath, `${JSON.stringify(local, null, 2)}\n`);
+  const args = ['sync', '--apply', '--repo', repo, '--agent-dir', agentDir];
+  const [first, second] = await Promise.all([runAsync(args), runAsync(args)]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(second.status, 0, second.stderr);
+  // The winner syncs the change; the loser waits on the agent lock, re-reads the
+  // fresh manifest and state, and no-ops. Exactly one run reports the sync.
+  const [a, b] = [result(first), result(second)];
+  assert.equal(a.synced.length + b.synced.length, 1, 'only one concurrent sync should write the field');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  assert.equal(manifest.settings[0].fields.find((field) => field.path === '/theme').value, 'light');
+  const idle = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(idle.status, 0, idle.stderr);
+  assert.match(result(idle).note, /Nothing to sync/);
+});
+
+test('sync recovers from a torn settings read and fails clearly on genuinely invalid files', async (t) => {
+  const { repo, agentDir, manifestPath, localPath } = await settingsFixture(t, [{ path: '/theme', value: 'dark' }]);
+
+  // A file that stays invalid must still fail clearly: the transient-read
+  // retry must not mask a real error, and nothing may be written.
+  await fs.writeFile(localPath, '{ "theme": "light"');
+  const invalid = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(invalid.status, 2);
+  assert.match(result(invalid).error, /not valid JSON/);
+  assert.equal(JSON.parse(await fs.readFile(manifestPath, 'utf8')).settings[0].fields[0].value, 'dark', 'failed sync must not write the manifest');
+
+  // A file that is only briefly half-written (as Pi's in-place settings write
+  // can leave it) must recover on the retry. Simulate the concurrent writer by
+  // repairing the file as soon as the CLI's first read is observed (its atime
+  // advances past the torn write's mtime).
+  await fs.writeFile(localPath, '{ "theme": "li');
+  const repair = async () => {
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const stat = await fs.stat(localPath);
+      if (stat.atimeMs >= stat.mtimeMs) {
+        await fs.writeFile(localPath, `${JSON.stringify({ theme: 'light' }, null, 2)}\n`);
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    return false;
+  };
+  const [repaired, didRepair] = await Promise.all([
+    runAsync(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]),
+    repair(),
+  ]);
+  assert.ok(didRepair, 'the CLI read of the torn file should be observable via atime');
+  assert.equal(repaired.status, 0, repaired.stderr);
+  const output = result(repaired);
+  assert.equal(output.ok, true, JSON.stringify(output));
+  assert.deepEqual(output.synced.map((item) => item.path), ['/theme']);
+  assert.equal(JSON.parse(await fs.readFile(manifestPath, 'utf8')).settings[0].fields[0].value, 'light');
+});
+
 test('serializes concurrent applies and leaves one consistent managed installation', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const args = ['apply', '--repo', repo, '--agent-dir', agentDir];

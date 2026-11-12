@@ -907,7 +907,7 @@ function summarizeActions(actions) {
 }
 
 async function readSettingsFile(file) {
-  try {
+  const readOnce = async () => {
     const info = await fs.lstat(file);
     if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Managed settings target must be a regular file: ${file}`);
     const text = await fs.readFile(file, 'utf8');
@@ -915,10 +915,22 @@ async function readSettingsFile(file) {
     try { value = JSON.parse(text); } catch { throw new Error(`Managed settings file is not valid JSON: ${file}`); }
     if (!isRecord(value)) throw new Error(`Managed settings file must contain a JSON object: ${file}`);
     return { value, text, exists: true };
-  } catch (error) {
-    if (error.code === 'ENOENT') return { value: {}, text: null, exists: false };
-    throw error;
+  };
+  let error;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return await readOnce();
+    } catch (readError) {
+      if (readError.code === 'ENOENT') return { value: {}, text: null, exists: false };
+      error = readError;
+      // Pi persists settings with an in-place write, so a concurrent read can
+      // catch a partially written file for a few milliseconds. Retry once so a
+      // transient torn read does not fail the whole operation; a file that is
+      // genuinely invalid still fails on the second attempt.
+      if (attempt === 1) await new Promise((resolve) => setTimeout(resolve, 50));
+    }
   }
+  throw error;
 }
 
 async function buildPlan(repo, agentDir, declarations, state) {
