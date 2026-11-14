@@ -111,11 +111,35 @@ async function pushFixture(t) {
   return { root, repo, bare };
 }
 
-function run(args, env = {}) {
+function run(args, env = {}, options = {}) {
   return spawnSync(process.execPath, [cli, ...args], {
     encoding: 'utf8',
     env: { ...process.env, ...env },
+    ...options,
   });
+}
+
+// Environment for the --repo default-resolution tests: the inherited
+// environment is scrubbed of PI_SYNC_REPO_DIR and PI_CODING_AGENT_DIR so an
+// outer developer environment cannot shadow the behavior under test.
+function repoDefaultEnv(overrides = {}) {
+  const env = { ...process.env };
+  delete env.PI_SYNC_REPO_DIR;
+  delete env.PI_CODING_AGENT_DIR;
+  return { ...env, ...overrides };
+}
+
+// A minimal valid setup repository with a single uniquely named skill so a
+// test can tell which repository a command actually operated on.
+async function writeRepo(repo, skillName) {
+  await fs.mkdir(path.join(repo, 'resources', 'skills', skillName), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'skills', skillName, 'SKILL.md'), '# ' + skillName + '\n');
+  await fs.writeFile(path.join(repo, 'pi-sync.json'), JSON.stringify({
+    schemaVersion: 1,
+    resources: [{ type: 'skill', source: 'resources/skills/' + skillName, target: 'skills/' + skillName }],
+    dependencies: [],
+  }));
+  await fs.writeFile(path.join(repo, 'pi-sync.lock.json'), JSON.stringify({ schemaVersion: 1, packages: [] }));
 }
 
 async function fakeGitHubTools(t, sourceRepo) {
@@ -336,7 +360,7 @@ test('supported agent commands share a versioned JSON response contract', async 
   const skill = await fs.readFile(new URL('../resources/skills/pi-sync/SKILL.md', import.meta.url), 'utf8');
   const packageJson = JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8'));
   assert.ok(packageJson.files.includes('resources/skills/pi-sync/SKILL.md'));
-  for (const workflow of ['pi-sync status', 'pi-sync plan', 'pi-sync apply', 'pi-sync add', 'pi-sync remove', 'pi-sync prune', 'pi-sync prune --confirm']) {
+  for (const workflow of ['pi-sync status', 'pi-sync plan', 'pi-sync apply', 'pi-sync add', 'pi-sync register', 'pi-sync remove', 'pi-sync prune', 'pi-sync prune --confirm']) {
     assert.ok(skill.includes(workflow), `skill documents ${workflow}`);
   }
 });
@@ -1997,6 +2021,785 @@ test('new-type add guards reject symlinks, traversal, collisions, secrets, and p
   await fs.rm(path.join(agentDir, 'extensions', 'github-copilot-usage', 'node_modules'), { recursive: true });
 });
 
+test('register declares a repository-present resource and never touches the local installation', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Repository prompt\n');
+
+  // --agent-dir is not required: register operates on the repository only.
+  const registered = run(['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--repo', repo]);
+  assert.equal(registered.status, 0, registered.stderr);
+  const output = result(registered);
+  assert.equal(output.apiVersion, 1);
+  assert.equal(output.command, 'register');
+  assert.equal(output.ok, true);
+  assert.equal(output.exitCode, 0);
+  assert.equal(output.type, 'prompt');
+  assert.equal(output.source, 'resources/prompts/deploy.md');
+  assert.equal(output.target, 'prompts/deploy.md');
+  assert.equal(output.action, 'registered');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  assert.deepEqual(manifest.resources.at(-1), { type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' });
+
+  // No import or copy: the local installation is not created or modified.
+  await assert.rejects(fs.access(path.join(agentDir, 'prompts')));
+  assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'local-only', 'SKILL.md'), 'utf8'), '# Local\n');
+
+  // --agent-dir is not used even when supplied: a missing directory is not created.
+  const missingAgentDir = path.join(path.dirname(agentDir), 'no-such-agent');
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'second.md'), '# Second prompt\n');
+  const withAgentFlag = run(['register', '--type', 'prompt', '--source', 'resources/prompts/second.md', '--repo', repo, '--agent-dir', missingAgentDir]);
+  assert.equal(withAgentFlag.status, 0, withAgentFlag.stderr);
+  assert.equal(result(withAgentFlag).action, 'registered');
+  await assert.rejects(fs.access(missingAgentDir));
+});
+
+test('register works for every resource type with repository-present content', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  await fs.mkdir(path.join(repo, 'resources', 'skills', 'alpha'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'alpha', 'SKILL.md'), '# Alpha\n');
+  await fs.mkdir(path.join(repo, 'resources', 'extensions', 'alpha-ext'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'extensions', 'alpha-ext', 'index.ts'), 'export const alpha = true;\n');
+  await fs.writeFile(path.join(repo, 'resources', 'extensions', 'alpha-config.json'), `${JSON.stringify({ model: 'local-model' }, null, 2)}\n`);
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Deploy prompt\n');
+  await fs.mkdir(path.join(repo, 'resources', 'agents'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'agents', 'reviewer.md'), '# Reviewer agent\n');
+  await fs.mkdir(path.join(repo, 'resources', 'roles'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'roles', 'moderator.md'), '# Moderator role\n');
+  const registrations = [
+    ['skill', 'resources/skills/alpha', 'skills/alpha'],
+    ['extension', 'resources/extensions/alpha-ext', 'extensions/alpha-ext'],
+    ['extension', 'resources/extensions/alpha-config.json', 'extensions/alpha-config.json'],
+    ['prompt', 'resources/prompts/deploy.md', 'prompts/deploy.md'],
+    ['agent', 'resources/agents/reviewer.md', 'agents/reviewer.md'],
+    ['role', 'resources/roles/moderator.md', 'roles/moderator.md'],
+  ];
+  for (const [type, source, target] of registrations) {
+    const response = run(['register', '--type', type, '--source', source, '--repo', repo]);
+    assert.equal(response.status, 0, `${type} ${source}: ${response.stderr}\n${response.stdout}`);
+    const output = result(response);
+    assert.equal(output.action, 'registered');
+    assert.equal(output.type, type);
+    assert.equal(output.source, source);
+    assert.equal(output.target, target);
+  }
+  const manifest = JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8'));
+  assert.deepEqual(manifest.resources.slice(1), registrations.map(([type, source, target]) => ({ type, source, target })));
+  // Nothing was copied into the local installation.
+  for (const [, , target] of registrations) {
+    await assert.rejects(fs.access(path.join(agentDir, ...target.split('/'))));
+  }
+});
+
+test('register is idempotent for an exact source and target match', async (t) => {
+  const { repo } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Repository prompt\n');
+  const first = run(['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--repo', repo]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(result(first).action, 'registered');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+
+  const second = run(['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--repo', repo]);
+  assert.equal(second.status, 0, second.stderr);
+  const output = result(second);
+  assert.equal(output.apiVersion, 1);
+  assert.equal(output.command, 'register');
+  assert.equal(output.ok, true);
+  assert.equal(output.exitCode, 0);
+  assert.equal(output.type, 'prompt');
+  assert.equal(output.source, 'resources/prompts/deploy.md');
+  assert.equal(output.target, 'prompts/deploy.md');
+  assert.equal(output.action, 'already-registered');
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore, 'the manifest is unchanged by the no-op');
+});
+
+test('register reports RESOURCE_COLLISION for any other overlap and writes nothing', async (t) => {
+  const { repo } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const writeManifest = (resources) => fs.writeFile(manifestPath, JSON.stringify({ schemaVersion: 1, resources, dependencies: [] }));
+
+  // The target is declared under a different source.
+  await fs.mkdir(path.join(repo, 'resources', 'skills', 'renamed'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'renamed', 'SKILL.md'), '# Renamed\n');
+  await writeManifest([{ type: 'skill', source: 'resources/skills/renamed', target: 'skills/hello' }]);
+  let collision = run(['register', '--type', 'skill', '--source', 'resources/skills/hello', '--repo', repo]);
+  assert.equal(collision.status, 2, collision.stderr);
+  let output = result(collision);
+  assert.equal(output.ok, false);
+  assert.equal(output.exitCode, 2);
+  assert.equal(output.errorCode, 'RESOURCE_COLLISION');
+  assert.match(output.error, /collision/i);
+  assert.deepEqual(output.details, { type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' });
+
+  // The source is declared under a different target.
+  await writeManifest([{ type: 'skill', source: 'resources/skills/hello', target: 'skills/renamed' }]);
+  collision = run(['register', '--type', 'skill', '--source', 'resources/skills/hello', '--repo', repo]);
+  assert.equal(collision.status, 2, collision.stderr);
+  assert.equal(result(collision).errorCode, 'RESOURCE_COLLISION');
+
+  // A nested overlap: the declared target contains the derived target.
+  await fs.mkdir(path.join(repo, 'resources', 'extensions', 'subagent'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'extensions', 'subagent', 'config.json'), `${JSON.stringify({ model: 'local-model' }, null, 2)}\n`);
+  await writeManifest([{ type: 'extension', source: 'resources/extensions/subagent', target: 'extensions/subagent' }]);
+  collision = run(['register', '--type', 'extension', '--source', 'resources/extensions/subagent/config.json', '--repo', repo]);
+  assert.equal(collision.status, 2, collision.stderr);
+  output = result(collision);
+  assert.equal(output.errorCode, 'RESOURCE_COLLISION');
+  assert.deepEqual(output.details, { type: 'extension', source: 'resources/extensions/subagent/config.json', target: 'extensions/subagent/config.json' });
+
+  // Nothing was written: the manifest keeps its single entry.
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  assert.equal(manifest.resources.length, 1);
+});
+
+test('register fails validation for missing sources, wrong roots, unsupported types, and missing options', async (t) => {
+  const { repo } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Repository prompt\n');
+
+  const failures = [
+    { args: ['register', '--type', 'prompt', '--source', 'resources/prompts/absent.md', '--repo', repo], message: /Resource source does not exist/ },
+    { args: ['register', '--type', 'prompt', '--source', 'resources/skills/hello', '--repo', repo], message: /Prompt source must be a \.md file directly under resources\/prompts\// },
+    { args: ['register', '--type', 'skill', '--source', 'resources/prompts/deploy.md', '--repo', repo], message: /Skill source must be a direct child directory of resources\/skills\// },
+    { args: ['register', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo], message: /Prompt source must be a \.md file directly under resources\/prompts\// },
+    { args: ['register', '--type', 'theme', '--source', 'resources/prompts/deploy.md', '--repo', repo], message: /Unsupported resource type/ },
+    { args: ['register', '--type', 'dependency', '--source', 'npm:example', '--repo', repo], message: /Unsupported resource type/ },
+    { args: ['register', '--type', 'prompt', '--repo', repo], message: /register requires explicit --type and --source/ },
+    { args: ['register', '--source', 'resources/prompts/deploy.md', '--repo', repo], message: /register requires explicit --type and --source/ },
+  ];
+  for (const { args, message } of failures) {
+    const response = run(args);
+    assert.equal(response.status, 2, `${args.join(' ')}: ${response.stderr}\n${response.stdout}`);
+    const output = result(response);
+    assert.equal(output.ok, false);
+    assert.equal(output.exitCode, 2);
+    assert.match(output.error, message);
+  }
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+});
+
+test('register stops on suspected secret material without registering or echoing the value', async (t) => {
+  const { repo } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+
+  // Known credential-store path.
+  await fs.mkdir(path.join(repo, 'resources', 'skills', 'leaky'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'leaky', 'SKILL.md'), '# Leaky\n');
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'leaky', 'credentials.json'), `${JSON.stringify({ token: 'placeholder' }, null, 2)}\n`);
+  const credential = run(['register', '--type', 'skill', '--source', 'resources/skills/leaky', '--repo', repo]);
+  assert.equal(credential.status, 2, credential.stderr);
+  const credentialOutput = result(credential);
+  assert.equal(credentialOutput.apiVersion, 1);
+  assert.equal(credentialOutput.command, 'register');
+  assert.equal(credentialOutput.ok, false);
+  assert.equal(credentialOutput.exitCode, 2);
+  assert.equal(credentialOutput.errorCode, 'SECRET_REVIEW_REQUIRED');
+  assert.match(credentialOutput.error, /review suspected secret material/);
+  assert.equal(credentialOutput.reviewRequired[0].path, 'resources/skills/leaky/credentials.json');
+  assert.match(credentialOutput.reviewRequired[0].reason, /known credential-store path/);
+  assert.deepEqual(credentialOutput.details.reviewRequired, credentialOutput.reviewRequired);
+
+  // Likely secret value in a repository prompt.
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'leak.md'), 'token: ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ\n');
+  const secret = run(['register', '--type', 'prompt', '--source', 'resources/prompts/leak.md', '--repo', repo]);
+  assert.equal(secret.status, 2, secret.stderr);
+  const secretOutput = result(secret);
+  assert.equal(secretOutput.errorCode, 'SECRET_REVIEW_REQUIRED');
+  assert.equal(secretOutput.reviewRequired[0].path, 'resources/prompts/leak.md');
+  assert.match(secretOutput.reviewRequired[0].reason, /GitHub token/);
+  assert.doesNotMatch(secret.stdout, /ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ/);
+
+  // Sensitive filename.
+  await fs.mkdir(path.join(repo, 'resources', 'skills', 'leaky-key'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'leaky-key', 'SKILL.md'), '# Key\n');
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'leaky-key', 'id_rsa'), 'not a real key\n');
+  const sensitive = run(['register', '--type', 'skill', '--source', 'resources/skills/leaky-key', '--repo', repo]);
+  assert.equal(sensitive.status, 2, sensitive.stderr);
+  assert.match(result(sensitive).reviewRequired[0].reason, /sensitive filename/);
+
+  // Nothing was registered.
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+});
+
+test('register rejects symlinks and node_modules in repository content', async (t) => {
+  const { repo } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  await fs.writeFile(path.join(repo, 'outside.md'), '# Outside\n');
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+
+  // A symlinked file source is rejected.
+  await fs.symlink(path.join(repo, 'outside.md'), path.join(repo, 'resources', 'prompts', 'linked.md'));
+  let response = run(['register', '--type', 'prompt', '--source', 'resources/prompts/linked.md', '--repo', repo]);
+  assert.equal(response.status, 2, response.stderr);
+  assert.match(result(response).error, /Symbolic links are not supported/);
+  await fs.rm(path.join(repo, 'resources', 'prompts', 'linked.md'));
+
+  // A symlinked directory source is rejected.
+  await fs.mkdir(path.join(repo, 'elsewhere', 'real'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'elsewhere', 'real', 'SKILL.md'), '# Real\n');
+  await fs.symlink(path.join(repo, 'elsewhere', 'real'), path.join(repo, 'resources', 'skills', 'linked-skill'));
+  response = run(['register', '--type', 'skill', '--source', 'resources/skills/linked-skill', '--repo', repo]);
+  assert.equal(response.status, 2, response.stderr);
+  assert.match(result(response).error, /symbolic-link/i);
+  await fs.rm(path.join(repo, 'resources', 'skills', 'linked-skill'));
+
+  // A symbolic link inside the resource is rejected.
+  await fs.mkdir(path.join(repo, 'resources', 'skills', 'inner-link'), { recursive: true });
+  await fs.symlink(path.join(repo, 'outside.md'), path.join(repo, 'resources', 'skills', 'inner-link', 'linked.md'));
+  response = run(['register', '--type', 'skill', '--source', 'resources/skills/inner-link', '--repo', repo]);
+  assert.equal(response.status, 2, response.stderr);
+  assert.match(result(response).error, /Symbolic links are not supported/);
+  await fs.rm(path.join(repo, 'resources', 'skills', 'inner-link'), { recursive: true });
+
+  // Package-installed code is rejected.
+  await fs.mkdir(path.join(repo, 'resources', 'skills', 'with-packages', 'node_modules', 'pinned'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'with-packages', 'node_modules', 'pinned', 'index.js'), 'module.exports = 1;\n');
+  response = run(['register', '--type', 'skill', '--source', 'resources/skills/with-packages', '--repo', repo]);
+  assert.equal(response.status, 2, response.stderr);
+  assert.match(result(response).error, /node_modules/);
+
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+});
+
+test('register never commits or pushes: only the manifest changes in the working tree', async (t) => {
+  const { repo, bare } = await pushFixture(t);
+  await fs.mkdir(path.join(repo, 'resources', 'agents'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'agents', 'reviewer.md'), '# Reviewer agent\n');
+  const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
+  const logBefore = gitAt(repo, ['log', '--oneline']);
+  const remoteHeadBefore = gitAt(bare, ['rev-parse', 'HEAD']);
+
+  const response = run(['register', '--type', 'agent', '--source', 'resources/agents/reviewer.md', '--repo', repo]);
+  assert.equal(response.status, 0, response.stderr);
+  assert.equal(result(response).action, 'registered');
+
+  // No commit or push: the working tree holds only the manifest edit and the
+  // untracked resource, and local and remote history are unchanged.
+  const status = gitAt(repo, ['status', '--porcelain']).split('\n').filter(Boolean);
+  assert.equal(status.length, 2, `unexpected working-tree state: ${status.join(' | ')}`);
+  assert.ok(status.some((line) => line.includes('M') && line.includes('pi-sync.json')), 'the manifest edit remains uncommitted in the working tree');
+  assert.ok(status.some((line) => line.startsWith('??') && line.includes('resources/agents')), 'the new resource remains untracked');
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), headBefore);
+  assert.equal(gitAt(repo, ['log', '--oneline']), logBefore);
+  assert.equal(gitAt(bare, ['rev-parse', 'HEAD']), remoteHeadBefore);
+});
+
+test('register validates the repository up front and changes nothing on failure', async (t) => {
+  const { repo } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const lockPath = path.join(repo, 'pi-sync.lock.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Repository prompt\n');
+
+  // A manifest that is not valid JSON fails before register does anything.
+  await fs.writeFile(manifestPath, '{ not json');
+  let response = run(['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--repo', repo]);
+  assert.equal(response.status, 2, response.stderr);
+  let output = result(response);
+  assert.equal(output.ok, false);
+  assert.equal(output.exitCode, 2);
+  assert.equal(output.errorCode, 'VALIDATION_ERROR');
+  assert.match(output.error, /not valid JSON/);
+  await fs.writeFile(manifestPath, manifestBefore);
+
+  // A missing lockfile fails the repository validation up front.
+  await fs.rm(lockPath);
+  response = run(['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--repo', repo]);
+  assert.equal(response.status, 2, response.stderr);
+  assert.match(result(response).error, /Missing lockfile/);
+  await fs.writeFile(lockPath, JSON.stringify({ schemaVersion: 1, packages: [] }));
+
+  // A declared resource whose repository content is missing fails before registration.
+  await fs.rm(path.join(repo, 'resources', 'skills', 'hello'), { recursive: true });
+  response = run(['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--repo', repo]);
+  assert.equal(response.status, 2, response.stderr);
+  output = result(response);
+  assert.equal(output.errorCode, 'VALIDATION_ERROR');
+  assert.match(output.error, /resources\/skills\/hello/);
+
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+  assert.equal(await fs.readFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), 'utf8'), '# Repository prompt\n');
+});
+
+test('register --list and --all fail on an invalid repository manifest without modifying repository state', async (t) => {
+  const { repo } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  const lockPath = path.join(repo, 'pi-sync.lock.json');
+  const lockBefore = await fs.readFile(lockPath, 'utf8');
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Repository prompt\n');
+  const treeOf = async (dir) => {
+    const out = [];
+    for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+      const entryPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) out.push(...(await treeOf(entryPath)));
+      else out.push(path.relative(repo, entryPath));
+    }
+    return out;
+  };
+  const treeBefore = (await treeOf(path.join(repo, 'resources'))).sort();
+  const invalidManifests = [
+    ['{ not json', /not valid JSON/],
+    [JSON.stringify({ schemaVersion: 2, resources: [], dependencies: [] }), /Manifest must have schemaVersion 1/],
+  ];
+  for (const mode of ['--list', '--all']) {
+    for (const [invalid, message] of invalidManifests) {
+      await fs.writeFile(manifestPath, invalid);
+      const response = run(['register', mode, '--repo', repo]);
+      assert.equal(response.status, 2, `${mode}: ${response.stderr}\n${response.stdout}`);
+      const output = result(response);
+      assert.equal(output.apiVersion, 1);
+      assert.equal(output.command, 'register');
+      assert.equal(output.ok, false);
+      assert.equal(output.exitCode, 2);
+      assert.equal(output.errorCode, 'VALIDATION_ERROR');
+      assert.match(output.error, message);
+      // The invalid manifest is left exactly as written and nothing else in
+      // the repository is touched.
+      assert.equal(await fs.readFile(manifestPath, 'utf8'), invalid);
+      assert.equal(await fs.readFile(lockPath, 'utf8'), lockBefore);
+      assert.deepEqual((await treeOf(path.join(repo, 'resources'))).sort(), treeBefore);
+    }
+  }
+  await fs.writeFile(manifestPath, manifestBefore);
+});
+
+test('register --list reports exactly the unregistered resources and changes nothing', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  // Unregistered resources across every type root.
+  await fs.mkdir(path.join(repo, 'resources', 'skills', 'alpha'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'alpha', 'SKILL.md'), '# Alpha\n');
+  await fs.mkdir(path.join(repo, 'resources', 'extensions', 'alpha-ext'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'extensions', 'alpha-ext', 'index.ts'), 'export const alpha = true;\n');
+  await fs.writeFile(path.join(repo, 'resources', 'extensions', 'alpha-config.json'), `${JSON.stringify({ model: 'local-model' }, null, 2)}\n`);
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Deploy prompt\n');
+  await fs.mkdir(path.join(repo, 'resources', 'agents'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'agents', 'reviewer.md'), '# Reviewer agent\n');
+  await fs.mkdir(path.join(repo, 'resources', 'roles'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'roles', 'moderator.md'), '# Moderator role\n');
+  // Non-resources: other paths in resources/, a non-.md file, a nested
+  // file, and symlinked entries are not candidates.
+  await fs.writeFile(path.join(repo, 'resources', 'README.md'), '# Repository notes\n');
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'notes.txt'), 'not a prompt\n');
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'inner.md'), '# Inner\n');
+  await fs.writeFile(path.join(repo, 'outside.md'), '# Outside\n');
+  await fs.symlink(path.join(repo, 'outside.md'), path.join(repo, 'resources', 'prompts', 'linked.md'));
+  await fs.mkdir(path.join(repo, 'elsewhere'), { recursive: true });
+  await fs.symlink(path.join(repo, 'elsewhere'), path.join(repo, 'resources', 'skills', 'linked-skill'));
+
+  const treeOf = async (dir) => {
+    const out = [];
+    for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+      const entryPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) out.push(...(await treeOf(entryPath)));
+      else out.push(path.relative(repo, entryPath));
+    }
+    return out;
+  };
+  const resourcesDir = path.join(repo, 'resources');
+  const treeBefore = (await treeOf(resourcesDir)).sort();
+
+  const response = run(['register', '--list', '--repo', repo]);
+  assert.equal(response.status, 0, response.stderr);
+  const output = result(response);
+  assert.equal(output.apiVersion, 1);
+  assert.equal(output.command, 'register');
+  assert.equal(output.ok, true);
+  assert.equal(output.exitCode, 0);
+  assert.deepEqual(output.unregistered, [
+    { type: 'skill', source: 'resources/skills/alpha', target: 'skills/alpha' },
+    { type: 'extension', source: 'resources/extensions/alpha-config.json', target: 'extensions/alpha-config.json' },
+    { type: 'extension', source: 'resources/extensions/alpha-ext', target: 'extensions/alpha-ext' },
+    { type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' },
+    { type: 'agent', source: 'resources/agents/reviewer.md', target: 'agents/reviewer.md' },
+    { type: 'role', source: 'resources/roles/moderator.md', target: 'roles/moderator.md' },
+  ]);
+
+  // Read-only: the manifest and the repository tree are unchanged, and the
+  // local installation is untouched.
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+  assert.deepEqual((await treeOf(resourcesDir)).sort(), treeBefore);
+  assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'local-only', 'SKILL.md'), 'utf8'), '# Local\n');
+});
+
+test('register --list and --all honor --type narrowing and tolerate missing type roots', async (t) => {
+  const { repo } = await fixture(t);
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Deploy prompt\n');
+  await fs.mkdir(path.join(repo, 'resources', 'agents'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'agents', 'reviewer.md'), '# Reviewer agent\n');
+
+  // --type narrows the roots scanned in both modes.
+  let response = run(['register', '--list', '--type', 'prompt', '--repo', repo]);
+  assert.equal(response.status, 0, response.stderr);
+  assert.deepEqual(result(response).unregistered, [{ type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' }]);
+
+  // A type root that exists but has no unregistered resources is empty.
+  response = run(['register', '--list', '--type', 'skill', '--repo', repo]);
+  assert.equal(response.status, 0, response.stderr);
+  assert.deepEqual(result(response).unregistered, []);
+
+  // A type root that does not exist is empty, not an error.
+  response = run(['register', '--list', '--type', 'role', '--repo', repo]);
+  assert.equal(response.status, 0, response.stderr);
+  assert.deepEqual(result(response).unregistered, []);
+
+  // --all with --type registers only that type's candidates.
+  response = run(['register', '--all', '--type', 'agent', '--repo', repo]);
+  assert.equal(response.status, 0, response.stderr);
+  const output = result(response);
+  assert.equal(output.action, 'registered');
+  assert.deepEqual(output.registered, [{ type: 'agent', source: 'resources/agents/reviewer.md', target: 'agents/reviewer.md' }]);
+  const manifest = JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8'));
+  assert.equal(manifest.resources.length, 2);
+  assert.deepEqual(manifest.resources[1], { type: 'agent', source: 'resources/agents/reviewer.md', target: 'agents/reviewer.md' });
+});
+
+test('register --all registers every unregistered resource in a single manifest write', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  await fs.mkdir(path.join(repo, 'resources', 'skills', 'alpha'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'alpha', 'SKILL.md'), '# Alpha\n');
+  await fs.mkdir(path.join(repo, 'resources', 'extensions', 'alpha-ext'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'extensions', 'alpha-ext', 'index.ts'), 'export const alpha = true;\n');
+  await fs.writeFile(path.join(repo, 'resources', 'extensions', 'alpha-config.json'), `${JSON.stringify({ model: 'local-model' }, null, 2)}\n`);
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Deploy prompt\n');
+  await fs.mkdir(path.join(repo, 'resources', 'agents'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'agents', 'reviewer.md'), '# Reviewer agent\n');
+  await fs.mkdir(path.join(repo, 'resources', 'roles'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'roles', 'moderator.md'), '# Moderator role\n');
+
+  const response = run(['register', '--all', '--repo', repo]);
+  assert.equal(response.status, 0, response.stderr);
+  const output = result(response);
+  assert.equal(output.apiVersion, 1);
+  assert.equal(output.command, 'register');
+  assert.equal(output.ok, true);
+  assert.equal(output.exitCode, 0);
+  assert.equal(output.action, 'registered');
+  assert.deepEqual(output.registered, [
+    { type: 'skill', source: 'resources/skills/alpha', target: 'skills/alpha' },
+    { type: 'extension', source: 'resources/extensions/alpha-config.json', target: 'extensions/alpha-config.json' },
+    { type: 'extension', source: 'resources/extensions/alpha-ext', target: 'extensions/alpha-ext' },
+    { type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' },
+    { type: 'agent', source: 'resources/agents/reviewer.md', target: 'agents/reviewer.md' },
+    { type: 'role', source: 'resources/roles/moderator.md', target: 'roles/moderator.md' },
+  ]);
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  // The original declaration keeps its position and every new entry is
+  // appended in discovery order: one write, no reordering.
+  assert.deepEqual(manifest.resources, [
+    { type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' },
+    { type: 'skill', source: 'resources/skills/alpha', target: 'skills/alpha' },
+    { type: 'extension', source: 'resources/extensions/alpha-config.json', target: 'extensions/alpha-config.json' },
+    { type: 'extension', source: 'resources/extensions/alpha-ext', target: 'extensions/alpha-ext' },
+    { type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' },
+    { type: 'agent', source: 'resources/agents/reviewer.md', target: 'agents/reviewer.md' },
+    { type: 'role', source: 'resources/roles/moderator.md', target: 'roles/moderator.md' },
+  ]);
+  // No copy: the local installation is not created or modified.
+  for (const { target } of output.registered) await assert.rejects(fs.access(path.join(agentDir, ...target.split('/'))));
+  assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'local-only', 'SKILL.md'), 'utf8'), '# Local\n');
+});
+
+test('register --all is a no-op up-to-date when there are no candidates', async (t) => {
+  const { repo } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  const response = run(['register', '--all', '--repo', repo]);
+  assert.equal(response.status, 0, response.stderr);
+  const output = result(response);
+  assert.equal(output.apiVersion, 1);
+  assert.equal(output.command, 'register');
+  assert.equal(output.ok, true);
+  assert.equal(output.exitCode, 0);
+  assert.equal(output.action, 'up-to-date');
+  assert.deepEqual(output.registered, []);
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore, 'the manifest is unchanged by the no-op');
+});
+
+test('register --all secret-scans every candidate and registers nothing on any finding', async (t) => {
+  const { repo } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  // A clean candidate plus two candidates with findings.
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'clean.md'), '# Clean prompt\n');
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'leak.md'), 'token: ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ\n');
+  await fs.mkdir(path.join(repo, 'resources', 'skills', 'leaky'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'leaky', 'SKILL.md'), '# Leaky\n');
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'leaky', 'credentials.json'), `${JSON.stringify({ token: 'placeholder' }, null, 2)}\n`);
+
+  const response = run(['register', '--all', '--repo', repo]);
+  assert.equal(response.status, 2, response.stderr);
+  const output = result(response);
+  assert.equal(output.apiVersion, 1);
+  assert.equal(output.command, 'register');
+  assert.equal(output.ok, false);
+  assert.equal(output.exitCode, 2);
+  assert.equal(output.errorCode, 'SECRET_REVIEW_REQUIRED');
+  assert.match(output.error, /review suspected secret material/);
+  // Every candidate is scanned and all findings are reported.
+  assert.deepEqual(output.reviewRequired, [
+    { path: 'resources/skills/leaky/credentials.json', reason: 'known credential-store path' },
+    { path: 'resources/prompts/leak.md', reason: 'GitHub token' },
+  ]);
+  assert.doesNotMatch(response.stdout, /ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ/);
+  // All-or-nothing: the clean candidate is not registered either.
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+});
+
+test('register --all performs a collision pre-flight and registers nothing', async (t) => {
+  const { repo } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const writeManifest = (resources) => fs.writeFile(manifestPath, JSON.stringify({ schemaVersion: 1, resources, dependencies: [] }));
+  await fs.mkdir(path.join(repo, 'resources', 'skills', 'renamed'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'renamed', 'SKILL.md'), '# Renamed\n');
+
+  // A candidate whose target is declared under a different source collides.
+  await writeManifest([{ type: 'skill', source: 'resources/skills/renamed', target: 'skills/hello' }]);
+  let manifestText = await fs.readFile(manifestPath, 'utf8');
+  let response = run(['register', '--all', '--repo', repo]);
+  assert.equal(response.status, 2, response.stderr);
+  let output = result(response);
+  assert.equal(output.apiVersion, 1);
+  assert.equal(output.command, 'register');
+  assert.equal(output.ok, false);
+  assert.equal(output.exitCode, 2);
+  assert.equal(output.errorCode, 'RESOURCE_COLLISION');
+  assert.match(output.error, /collision/i);
+  assert.deepEqual(output.details, {
+    source: 'resources/skills/hello',
+    target: 'skills/hello',
+    conflictingSource: 'resources/skills/renamed',
+    conflictingTarget: 'skills/hello',
+  });
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestText);
+
+  // Candidates that overlap only case-insensitively collide against the
+  // candidate set itself; a case-sensitive filesystem is required.
+  const probe = path.join(repo, 'case-probe');
+  await fs.mkdir(probe);
+  let caseSensitive = true;
+  try {
+    await fs.mkdir(path.join(probe, 'Case'));
+    await fs.mkdir(path.join(probe, 'case'));
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    caseSensitive = false;
+  }
+  await fs.rm(probe, { recursive: true, force: true });
+  if (caseSensitive) {
+    await fs.mkdir(path.join(repo, 'resources', 'extensions', 'Foo'), { recursive: true });
+    await fs.writeFile(path.join(repo, 'resources', 'extensions', 'Foo', 'index.ts'), 'export const foo = true;\n');
+    await fs.writeFile(path.join(repo, 'resources', 'extensions', 'foo'), 'module.exports = 1;\n');
+    await writeManifest([]);
+    manifestText = await fs.readFile(manifestPath, 'utf8');
+    response = run(['register', '--all', '--repo', repo]);
+    assert.equal(response.status, 2, response.stderr);
+    output = result(response);
+    assert.equal(output.errorCode, 'RESOURCE_COLLISION');
+    assert.deepEqual(output.details, {
+      source: 'resources/extensions/Foo',
+      target: 'extensions/Foo',
+      conflictingSource: 'resources/extensions/foo',
+      conflictingTarget: 'extensions/foo',
+    });
+    assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestText);
+  }
+});
+
+test('register --all reports RESOURCE_COLLISION for a candidate whose source is declared under a different target', async (t) => {
+  const { repo } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  // The candidate's source is already declared, under a different target.
+  await fs.mkdir(path.join(repo, 'resources', 'skills', 'renamed'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'renamed', 'SKILL.md'), '# Renamed\n');
+  await fs.writeFile(manifestPath, JSON.stringify({
+    schemaVersion: 1,
+    resources: [
+      { type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' },
+      { type: 'skill', source: 'resources/skills/renamed', target: 'skills/other' },
+    ],
+    dependencies: [],
+  }));
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+
+  // --list reports the candidate under its inferred source and derived target.
+  const list = run(['register', '--list', '--repo', repo]);
+  assert.equal(list.status, 0, list.stderr);
+  const listOutput = result(list);
+  assert.equal(listOutput.ok, true);
+  assert.equal(listOutput.exitCode, 0);
+  assert.deepEqual(listOutput.unregistered, [
+    { type: 'skill', source: 'resources/skills/renamed', target: 'skills/renamed' },
+  ]);
+
+  // --all refuses the batch: the candidate's source is already declared.
+  const batch = run(['register', '--all', '--repo', repo]);
+  assert.equal(batch.status, 2, batch.stderr);
+  const output = result(batch);
+  assert.equal(output.apiVersion, 1);
+  assert.equal(output.command, 'register');
+  assert.equal(output.ok, false);
+  assert.equal(output.exitCode, 2);
+  assert.equal(output.errorCode, 'RESOURCE_COLLISION');
+  assert.match(output.error, /collision/i);
+  assert.deepEqual(output.details, {
+    source: 'resources/skills/renamed',
+    target: 'skills/renamed',
+    conflictingSource: 'resources/skills/renamed',
+    conflictingTarget: 'skills/other',
+  });
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore, 'the manifest is byte-identical after the collision');
+});
+
+test('register --all validates repository content for every candidate before writing', async (t) => {
+  const { repo } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  // A clean candidate plus a skill whose repository content is not
+  // registrable: package-installed code inside the resource.
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'clean.md'), '# Clean prompt\n');
+  await fs.mkdir(path.join(repo, 'resources', 'skills', 'with-packages', 'node_modules', 'pinned'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'with-packages', 'node_modules', 'pinned', 'index.js'), 'module.exports = 1;\n');
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'with-packages', 'SKILL.md'), '# With packages\n');
+
+  const response = run(['register', '--all', '--repo', repo]);
+  assert.equal(response.status, 2, response.stderr);
+  const output = result(response);
+  assert.equal(output.apiVersion, 1);
+  assert.equal(output.command, 'register');
+  assert.equal(output.ok, false);
+  assert.equal(output.exitCode, 2);
+  assert.equal(output.errorCode, 'VALIDATION_ERROR');
+  assert.match(output.error, /node_modules/);
+  // All-or-nothing: the clean candidate is not registered either.
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+});
+
+test('register mode exclusivity: exactly one of --source, --list, or --all', async (t) => {
+  const { repo } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Deploy prompt\n');
+
+  const failures = [
+    { args: ['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--list', '--repo', repo], message: /--source cannot be combined/ },
+    { args: ['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--all', '--repo', repo], message: /--source cannot be combined/ },
+    { args: ['register', '--list', '--all', '--repo', repo], message: /--list and --all are mutually exclusive/ },
+    { args: ['register', '--list', '--all', '--source', 'resources/prompts/deploy.md', '--repo', repo], message: /--list and --all are mutually exclusive/ },
+    { args: ['register', '--type', 'theme', '--list', '--repo', repo], message: /Unsupported resource type/ },
+    { args: ['register', '--type', 'prompt', '--repo', repo], message: /register requires explicit --type and --source/ },
+  ];
+  for (const { args, message } of failures) {
+    const response = run(args);
+    assert.equal(response.status, 2, `${args.join(' ')}: ${response.stderr}\n${response.stdout}`);
+    const output = result(response);
+    assert.equal(output.ok, false);
+    assert.equal(output.exitCode, 2);
+    assert.equal(output.errorCode, 'VALIDATION_ERROR');
+    assert.match(output.error, message);
+  }
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+
+  // --list and --all are register-only options.
+  for (const args of [['status', '--list', '--repo', repo], ['plan', '--all', '--repo', repo]]) {
+    const response = run(args);
+    assert.equal(response.status, 2, response.stderr);
+    assert.match(result(response).error, /only supported by register/);
+  }
+});
+
+test('register reports an accurate concurrency diagnostic when the manifest changes during the write', async (t) => {
+  const { repo } = await fixture(t);
+  const root = path.dirname(repo);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Repository prompt\n');
+  // The concurrent change: another process registers a different prompt
+  // while this register write is in flight.
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'concurrent.md'), '# Concurrent prompt\n');
+  const concurrentManifest = JSON.stringify({
+    schemaVersion: 1,
+    resources: [
+      { type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' },
+      { type: 'prompt', source: 'resources/prompts/concurrent.md', target: 'prompts/concurrent.md' },
+    ],
+    dependencies: [],
+  });
+  // Deterministic synchronization: the hold marker makes the atomic writer
+  // wait between its temp-file write and its before-rename comparison read,
+  // so the concurrent change lands exactly in that window without racing it.
+  const marker = path.join(root, 'hold-before-compare');
+  await fs.writeFile(marker, '');
+  const args = ['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--repo', repo];
+  const pending = runAsync(args, { PI_SYNC_TEST_HOLD_BEFORE_COMPARE: marker });
+  // Bounded wait for the atomic writer's temp file: its appearance means the
+  // write has entered and is held in the comparison window.
+  const tempDeadline = Date.now() + 15000;
+  for (;;) {
+    const tempFile = (await fs.readdir(repo)).find((name) => name.startsWith('pi-sync.json.') && name.endsWith('.tmp'));
+    if (tempFile) break;
+    if (Date.now() > tempDeadline) {
+      await fs.rm(marker, { force: true }); // release the hold so the CLI exits
+      await pending;
+      assert.fail('the atomic writer did not reach the comparison window in time');
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  // Apply the concurrent change while the write is held, then release it.
+  await fs.writeFile(manifestPath, concurrentManifest);
+  await fs.rm(marker);
+  const response = await pending;
+  assert.equal(response.status, 2, response.stderr || response.stdout);
+  const output = result(response);
+  assert.equal(output.apiVersion, 1);
+  assert.equal(output.command, 'register');
+  assert.equal(output.ok, false);
+  assert.equal(output.exitCode, 2);
+  assert.equal(output.errorCode, 'VALIDATION_ERROR');
+  // The diagnostic names the operation that was actually in flight, keeps
+  // the retry guidance, and no longer mislabels the register write as a
+  // remove.
+  assert.match(output.error, /pi-sync\.json changed during register/);
+  assert.doesNotMatch(output.error, /during remove/);
+  assert.match(output.error, /retry without overwriting concurrent changes/);
+  // The concurrent content is intact: the held write was refused before its
+  // rename, so the manifest is still byte-identical to the concurrent change
+  // and no temp file from the refused write remains.
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), concurrentManifest);
+  assert.ok(!(await fs.readdir(repo)).some((name) => name.startsWith('pi-sync.json.') && name.endsWith('.tmp')), 'no temp file from the refused write remains');
+  // The retry guidance holds: retrying on top of the concurrent change
+  // succeeds and keeps the concurrent entry.
+  const retry = run(args);
+  assert.equal(retry.status, 0, retry.stderr || retry.stdout);
+  assert.equal(result(retry).action, 'registered');
+  const finalManifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  assert.deepEqual(finalManifest.resources, [
+    { type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' },
+    { type: 'prompt', source: 'resources/prompts/concurrent.md', target: 'prompts/concurrent.md' },
+    { type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' },
+  ]);
+});
+
 test('declared targets that already exist unmanaged are reported as collisions and never overwritten', async (t) => {
   const { repo, agentDir } = await extendedFixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
@@ -2908,3 +3711,73 @@ test('push publishes a valid ahead commit that edits a directory resource source
   assert.equal(gitAt(repo, ['rev-list', '--count', '@{upstream}..HEAD']), '0');
   assert.equal(gitAt(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0], gitAt(repo, ['rev-parse', 'HEAD']), 'remote advanced to local HEAD');
 })
+
+test('omitted --repo resolves PI_SYNC_REPO_DIR, and an explicit --repo beats it', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-repo-default-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const envRepo = path.join(root, 'env-repo');
+  const flagRepo = path.join(root, 'flag-repo');
+  // The working directory is an unrelated directory that also contains a
+  // valid setup repository: with the removed cwd fallback this decoy must
+  // never be selected.
+  const workDir = path.join(root, 'elsewhere');
+  await writeRepo(envRepo, 'env-skill');
+  await writeRepo(flagRepo, 'flag-skill');
+  await writeRepo(workDir, 'cwd-skill');
+
+  const flagged = run(['apply', '--repo', flagRepo, '--agent-dir', path.join(root, 'agent-flag')], repoDefaultEnv({ PI_SYNC_REPO_DIR: envRepo }), { cwd: workDir });
+  assert.equal(flagged.status, 0, `${flagged.stderr}\n${flagged.stdout}`);
+  assert.equal(result(flagged).repository, flagRepo, 'the explicit --repo flag beats PI_SYNC_REPO_DIR and the working directory');
+
+  const envResolved = run(['apply', '--agent-dir', path.join(root, 'agent-env')], repoDefaultEnv({ PI_SYNC_REPO_DIR: envRepo }), { cwd: workDir });
+  assert.equal(envResolved.status, 0, `${envResolved.stderr}\n${envResolved.stdout}`);
+  const envOutput = result(envResolved);
+  assert.equal(envOutput.repository, envRepo, 'an omitted --repo resolves PI_SYNC_REPO_DIR over the working directory');
+  assert.equal(envOutput.actions[0].target, 'skills/env-skill');
+});
+
+test('PI_SYNC_REPO_DIR is used verbatim without ~ expansion', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-repo-verbatim-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const workDir = path.join(root, 'work');
+  const home = path.join(root, 'home');
+  await fs.mkdir(workDir);
+  await fs.mkdir(home);
+  // A literal "~" directory in the working directory: the environment value
+  // "~/setup" must resolve here, not to the (empty) home directory.
+  const verbatimRepo = path.join(workDir, '~', 'setup');
+  await writeRepo(verbatimRepo, 'verbatim-skill');
+
+  const response = run(['apply', '--agent-dir', path.join(root, 'agent')], repoDefaultEnv({ HOME: home, USERPROFILE: home, PI_SYNC_REPO_DIR: '~/setup' }), { cwd: workDir });
+  assert.equal(response.status, 0, `${response.stderr}\n${response.stdout}`);
+  assert.equal(result(response).repository, path.join(workDir, '~', 'setup'), 'PI_SYNC_REPO_DIR is used verbatim and its ~ is not expanded');
+  await assert.rejects(fs.access(path.join(home, 'setup')), 'a ~-expanded repository path must not be consulted');
+});
+
+test('omitted --repo without PI_SYNC_REPO_DIR defaults to ~/.pi-sync/setup under a hermetic home', async (t) => {
+  // Portable home override: Node resolves os.homedir() from HOME on POSIX
+  // hosts and from USERPROFILE on Windows, so both are pointed at the
+  // temporary home; on WSL (a POSIX host) HOME applies. The real user home
+  // is never touched.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-repo-home-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  const workDir = path.join(root, 'elsewhere');
+  const defaultRepo = path.join(home, '.pi-sync', 'setup');
+  await writeRepo(defaultRepo, 'home-skill');
+  await writeRepo(workDir, 'cwd-skill'); // decoy: the removed cwd fallback would select this
+
+  const response = run(['apply', '--agent-dir', path.join(root, 'agent')], repoDefaultEnv({ HOME: home, USERPROFILE: home }), { cwd: workDir });
+  assert.equal(response.status, 0, `${response.stderr}\n${response.stdout}`);
+  const output = result(response);
+  assert.equal(output.repository, defaultRepo, 'the built-in default under the user home is used, not the working directory');
+  assert.equal(output.actions[0].target, 'skills/home-skill');
+});
+
+test('bootstrap still rejects --repo in favor of --repo-dir', () => {
+  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', 'unused', '--repo-dir', path.join(os.tmpdir(), 'never')], repoDefaultEnv());
+  assert.equal(response.status, 2, `${response.stderr}\n${response.stdout}`);
+  const output = result(response);
+  assert.equal(output.ok, false);
+  assert.equal(output.error, 'bootstrap uses --repo-dir, not --repo');
+});

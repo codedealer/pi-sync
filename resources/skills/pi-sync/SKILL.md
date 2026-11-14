@@ -11,6 +11,7 @@ Use `pi-sync` as the only interface for inspecting and changing resources manage
 
 - The **setup repository** is the user's private repository and source of truth for explicitly managed resources. The public `pi-sync` CLI package does not contain a user's setup.
 - The **local Pi installation** defaults to `~/.pi/agent`; `PI_CODING_AGENT_DIR` or `--agent-dir PATH` selects another directory.
+- An omitted `--repo` resolves the setup repository exactly like the pi-sync extension: an explicit `--repo PATH` flag first, then `PI_SYNC_REPO_DIR` (used verbatim, no `~` expansion), then the default `~/.pi-sync/setup`. There is no current-working-directory fallback; pass `--repo PATH` when the repository lives elsewhere.
 - Only entries declared in the manifest are managed. Unlisted resources, credentials, sessions, caches, and other local-only state must remain local.
 - The CLI's `.pi-sync/state.json` and backups are local bookkeeping under the agent directory, not repository content.
 - Never add or copy auth files, API keys, OAuth tokens, sessions, caches, or other credentials into the setup repository. Secret detection is best effort, not a guarantee. A private repository is not a secret store.
@@ -24,7 +25,7 @@ pi-sync status --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
 pi-sync plan --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
 ```
 
-Omit `--agent-dir` to use `PI_CODING_AGENT_DIR`, then the default `~/.pi/agent`. `status` and `plan` are read-only. Review `actions`, `conflicts`, and `staleResources` in the JSON before taking an action. A stale resource remains installed; ordinary apply does not prune it.
+Omit `--agent-dir` to use `PI_CODING_AGENT_DIR`, then the default `~/.pi/agent`. Omit `--repo` to use `PI_SYNC_REPO_DIR` (verbatim, no `~` expansion), then the default `~/.pi-sync/setup` — the same resolution the extension uses, with no current-working-directory fallback. `status` and `plan` are read-only. Review `actions`, `conflicts`, and `staleResources` in the JSON before taking an action. A stale resource remains installed; ordinary apply does not prune it.
 
 ## Adding or editing user-level resources
 
@@ -32,8 +33,44 @@ When asked to add or edit a user-level (not project-scoped) resource, first dete
 
 - **Managed resource:** never edit the installed copy in the agent directory — it is the output of `apply`, not an input. Edit the source in the setup repository (the manifest-declared `resources/<type-root>/` path) and run `pi-sync apply` to reconcile the local installation. Publish only with an explicit push authorization (see Push only when explicitly authorized). An in-place edit of an installed managed copy is local-only divergence: `status` reports it as a review item (the extension's footer shows `!n`) and keeps counting it until resolved. The clean recovery is to port the content into the setup repository and apply again — once local and repository content match, the resource re-baselines as unchanged.
 - **Unmanaged existing file:** edit it directly. Pi Sync never touches unlisted resources or undeclared settings fields.
-- **New resource:** manage by default. Create the resource, then bring it under management with `pi-sync add` (see Add only a specifically selected local resource) rather than leaving it unmanaged, and apply it through Pi Sync.
+- **New resource:** manage by default. The sanctioned flow is repository-first: author the content in the setup repository under the matching `resources/<type-root>/` path, bring it under management with `pi-sync register` (see Register a repository-authored resource), and apply it through Pi Sync. When the user explicitly asks to import a specifically named existing local resource instead, use `pi-sync add` (see Add only a specifically selected local resource).
 - **Settings:** managed per field, per the manifest's `settings` declarations. Local changes to managed fields belong to the back-sync flow (see Back-sync local setting changes when requested); undeclared fields remain local and can be edited directly.
+
+## Register a repository-authored resource
+
+The repository-first flow is the sanctioned way to make new content managed: author it in the setup repository under the matching `resources/<type-root>/` path, declare it with `pi-sync register`, reconcile with `pi-sync apply`, and publish only with an explicit `pi-sync push`. A file dropped into `resources/` without a manifest entry is not managed — `apply` will not install it and `push` will not include it. Register through the CLI; never hand-edit `pi-sync.json`.
+
+Single registration declares one repository-present resource. `--source` is a repository-relative path under `resources/` (unlike `add`, whose `--source` is a local-installation path), and the agent-relative target is derived from it (for example, `resources/prompts/deploy.md` registers as target `prompts/deploy.md`):
+
+```sh
+pi-sync register --type prompt --source resources/prompts/deploy.md --repo /path/to/private-setup
+pi-sync register --type skill --source resources/skills/NAME --repo /path/to/private-setup
+pi-sync register --type extension --source resources/extensions/NAME --repo /path/to/private-setup
+pi-sync register --type agent --source resources/agents/NAME.md --repo /path/to/private-setup
+pi-sync register --type role --source resources/roles/NAME.md --repo /path/to/private-setup
+```
+
+The repository content must already exist with the per-type shape (skills are direct child directories of `resources/skills/`, extensions are a file or directory under `resources/extensions/`, and prompts, agents, and roles are single `.md` files directly under their root), and the same symlink and `node_modules` prohibitions as `add` apply. `register` writes only the manifest entry: no import, no copy, no local-installation write, and no commit or push. The subsequent `apply` copies the resource into the local installation and an authorized `push` publishes it, exactly as for `add`. It does not require or use `--agent-dir`. Re-registering an existing exact source+target declaration is an idempotent no-op (`action: already-registered`, exit `0`, manifest unchanged). Any other overlap (the target declared under a different source, the source declared under a different target, or a nested overlap) is `RESOURCE_COLLISION` (exit `2`) and writes nothing. A missing source, a source outside the type's root, an unsupported type, or combining modes is a validation error (exit `2`). Suspected secret material produces `SECRET_REVIEW_REQUIRED` (`ok: false`, exit `2`): nothing is registered and the suspected value is never echoed; review the `reviewRequired` findings, remove the material, and retry.
+
+For the "several new files dropped into the repository" case, use the discovery and batch modes:
+
+```sh
+pi-sync register --list --repo /path/to/private-setup
+pi-sync register --all --repo /path/to/private-setup
+pi-sync register --list --type prompt --repo /path/to/private-setup
+pi-sync register --all --type prompt --repo /path/to/private-setup
+```
+
+`--list` is read-only: it reports every resource present directly under a type root that the manifest does not declare (each with its inferred `type`, `source`, and derived `target`) and changes nothing. `--all` registers the same candidate set in one all-or-nothing step: it secret-scans every candidate and collision-checks against the existing declarations and the candidate set itself, and any failure registers nothing; otherwise a single atomic manifest write adds every entry (`action: registered`), and with zero candidates it is a no-op (`action: up-to-date`). `--type` is required for single registration and optional for `--list`/`--all`, where it narrows the roots scanned (a missing type root simply has no candidates). Exactly one of the three modes may be selected — a single `--source`, `--list`, or `--all`; combining `--source` with `--list` or `--all`, or `--list` with `--all`, is a validation error (exit `2`).
+
+Complete the repository-first flow with the ordinary reconcile and publish steps:
+
+```sh
+pi-sync apply --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
+pi-sync push --repo /path/to/private-setup
+```
+
+Publish with `pi-sync push --publish` only under explicit authorization (see Push only when explicitly authorized).
 
 ## Apply when requested
 
@@ -159,7 +196,7 @@ Pi Sync removes only previously managed stale resources that still match their s
 
 Every response is JSON with `apiVersion: 1`. Successful operations have `ok: true`. Conflicts and blocked operations have `ok: false`; inspect structured `conflicts`, `actions`, `staleResources`, `reviewRequired`, or `details` instead of parsing prose. Error responses include `errorCode`, a readable `error`, `details`, and `exitCode`.
 
-- Exit `0`: operation succeeded (including a read-only plan that reports eligible actions and a completed `remove`).
+- Exit `0`: operation succeeded (including a read-only plan, a read-only `register --list`, a completed `remove`, and a completed or already-registered `register`).
 - Exit `1`: an operational conflict, required first-install approval, package-manager failure, untrustworthy update metadata, a failed explicit `remove --uninstall`, or a stale item that cannot safely be pruned. Stop and explain the structured result; do not override it.
 - Exit `2`: invalid input, unsupported operation, or repository/manifest validation failure. Correct the input only with the user's authorization, then re-plan.
 

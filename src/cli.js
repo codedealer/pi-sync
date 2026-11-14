@@ -25,6 +25,11 @@ const RESOURCE_RULES = {
 const RESOURCE_TARGET_ROOTS = Object.values(RESOURCE_RULES).map((rule) => `${rule.targetRoot}/`);
 const BUNDLED_SKILL = fileURLToPath(new URL('../resources/skills/pi-sync', import.meta.url));
 const BUNDLED_EXTENSION = fileURLToPath(new URL('../resources/extensions/pi-sync', import.meta.url));
+// Built-in setup repository default under the user's home, shared by the
+// --repo and --repo-dir option defaults so the two cannot drift. It mirrors
+// the pi-sync extension's fallback after an explicit --repo and
+// PI_SYNC_REPO_DIR.
+const DEFAULT_SETUP_REPO = path.join(os.homedir(), '.pi-sync', 'setup');
 
 function fail(error, code = VALIDATION_ERROR) {
   const command = process.argv[2] ?? null;
@@ -485,13 +490,197 @@ async function addResource(repo, agentDir, type, source) {
   return { apiVersion: 1, command: 'add', ok: true, exitCode: 0, type, source: relative, target, repositorySource: managedSource, action: 'added', reviewRequired: [] };
 }
 
-async function writeJsonFileAtomic(file, value, previousText) {
+// Register is the inverse-direction complement of add: the resource content
+// must already be present under the type's repository sourceRoot, and only
+// the manifest entry is written. There is no import or copy, no
+// local-installation write, and no commit or push; the subsequent apply
+// copies the resource into the local installation and push publishes it,
+// exactly as for resources added through add.
+async function registerResource(repo, type, source) {
+  const rule = RESOURCE_ADD_RULES[type];
+  if (!rule) throw new Error(`Unsupported resource type: ${type}`);
+  if (typeof source !== 'string' || source.length === 0) throw new Error('--source must be a non-empty path');
+  if (source.includes('\\')) throw new Error('Relative --source paths must use POSIX separators');
+  if (path.isAbsolute(source)) throw new Error('register --source must be a repository-relative path under resources/ (for example, resources/prompts/example.md)');
+  validateRelativePath(source, '--source');
+  // The per-type shape rules are expressed against the agent-relative local
+  // root; the repository source is the same path under resources/, and the
+  // target is derived by substituting the type's localRoot.
+  const localRelative = path.posix.relative('resources', source);
+  if (!rule.pattern.test(localRelative)) throw new Error(rule.patternError.split(rule.localRoot).join(`resources/${rule.localRoot}`));
+  const target = localRelative;
+  const sourcePath = resolveInside(repo, source, '--source');
+  await validateResourceSource(repo, sourcePath, source, rule);
+  const findings = await findLikelySecrets(sourcePath, source);
+  if (findings.length) {
+    return {
+      apiVersion: 1, command: 'register', ok: false, errorCode: 'SECRET_REVIEW_REQUIRED', exitCode: VALIDATION_ERROR,
+      error: 'Registration was not performed; review suspected secret material and remove it before retrying',
+      reviewRequired: findings, details: { reviewRequired: findings },
+    };
+  }
+  const declarations = await validateRepository(repo);
+  if (declarations.resources.some((item) => item.source === source && item.target === target)) {
+    return { apiVersion: 1, command: 'register', ok: true, exitCode: 0, type, source, target, action: 'already-registered' };
+  }
+  if (declarations.resources.some((item) => pathsOverlap(item.target, target) || pathsOverlap(item.source, source))) {
+    const error = new Error(`Resource collision: ${target} or ${source} is already declared`);
+    error.errorCode = 'RESOURCE_COLLISION';
+    error.details = { type, source, target };
+    throw error;
+  }
+  const manifestPath = path.join(repo, MANIFEST_FILE);
+  const manifestText = await fs.readFile(manifestPath, 'utf8');
+  const manifest = JSON.parse(manifestText);
+  // The manifest write reuses the same atomic, concurrency-guarded write as
+  // remove: an exclusively created temp file whose manifest text is compared
+  // before rename, so a concurrent change is never overwritten.
+  await writeJsonFileAtomic(manifestPath, { ...manifest, resources: [...manifest.resources, { type, source, target }] }, manifestText, 'register');
+  return { apiVersion: 1, command: 'register', ok: true, exitCode: 0, type, source, target, action: 'registered' };
+}
+
+// Discovery for register --list and --all: candidates are the resources
+// present directly under a type root that the manifest does not declare.
+// The per-type shape rules are reused: .md files directly under the
+// prompts/agents/roles roots, direct child directories under the skills
+// root, and direct file-or-directory children under the extensions root.
+// Files under any other path in resources/ are not resources and are
+// ignored. Candidates are reported in RESOURCE_RULES type order and by
+// name within a root, so --list and --all agree on the candidate set.
+async function unregisteredCandidates(repo, resources, type) {
+  const types = type ? [type] : Object.keys(RESOURCE_ADD_RULES);
+  const candidates = [];
+  for (const candidateType of types) {
+    const rule = RESOURCE_ADD_RULES[candidateType];
+    const rootPath = path.join(repo, ...rule.sourceRoot.split('/'));
+    let entries;
+    try {
+      entries = await fs.readdir(rootPath, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === 'ENOENT') continue; // a missing type root has no candidates
+      throw error;
+    }
+    const names = entries
+      .filter((entry) => {
+        const isDirectory = entry.isDirectory();
+        const isFile = entry.isFile();
+        if (!isDirectory && !isFile) return false; // symbolic links and other entries are not resources
+        if (rule.shape === 'directory') return isDirectory;
+        if (rule.shape === 'file') return isFile && entry.name.endsWith('.md');
+        return true;
+      })
+      .filter((entry) => rule.pattern.test(`${rule.localRoot}/${entry.name}`))
+      .map((entry) => entry.name)
+      .sort();
+    for (const name of names) {
+      const source = `${rule.sourceRoot}/${name}`;
+      const target = `${rule.localRoot}/${name}`;
+      if (resources.some((item) => item.source === source && item.target === target)) continue;
+      candidates.push({ type: candidateType, source, target });
+    }
+  }
+  return candidates;
+}
+
+// register --list: read-only discovery. It validates the repository up
+// front, reports the unregistered candidates with their inferred type,
+// source, and derived target, and changes nothing.
+async function listUnregisteredResources(repo, type) {
+  const resources = (await validateRepository(repo)).resources;
+  const unregistered = await unregisteredCandidates(repo, resources, type);
+  return { apiVersion: 1, command: 'register', ok: true, exitCode: 0, unregistered };
+}
+
+function resourceCollision(candidate, other) {
+  const error = new Error(`Resource collision: ${candidate.target} or ${candidate.source} overlaps ${other.target} (${other.source})`);
+  error.errorCode = 'RESOURCE_COLLISION';
+  error.details = { source: candidate.source, target: candidate.target, conflictingSource: other.source, conflictingTarget: other.target };
+  return error;
+}
+
+// register --all: batch registration of the same candidate set --list
+// reports. It is all-or-nothing: the repository content of every candidate
+// is validated, every candidate is secret-scanned, and a collision
+// pre-flight runs against the existing declarations and the candidate set
+// itself; any failure registers nothing. Otherwise a single atomic,
+// concurrency-guarded manifest write appends every new entry. As with
+// single mode there is no copy, no local-installation write, and no commit
+// or push; apply performs the copy afterward.
+async function registerAllResources(repo, type) {
+  const declarations = await validateRepository(repo);
+  const candidates = await unregisteredCandidates(repo, declarations.resources, type);
+  if (candidates.length === 0) {
+    return { apiVersion: 1, command: 'register', ok: true, exitCode: 0, action: 'up-to-date', registered: [] };
+  }
+  // Every candidate must be registrable the way single mode registers it,
+  // so the manifest that is about to be written stays valid.
+  for (const candidate of candidates) {
+    const rule = RESOURCE_ADD_RULES[candidate.type];
+    const sourcePath = resolveInside(repo, candidate.source, '--source');
+    await validateResourceSource(repo, sourcePath, candidate.source, rule);
+  }
+  // All-or-nothing secret review: every candidate is scanned up front and
+  // any finding aborts the whole batch with all findings reported. The
+  // suspected value is never echoed.
+  const findings = [];
+  for (const candidate of candidates) {
+    const sourcePath = resolveInside(repo, candidate.source, '--source');
+    findings.push(...(await findLikelySecrets(sourcePath, candidate.source)));
+  }
+  if (findings.length) {
+    return {
+      apiVersion: 1, command: 'register', ok: false, errorCode: 'SECRET_REVIEW_REQUIRED', exitCode: VALIDATION_ERROR,
+      error: 'Registration was not performed; review suspected secret material and remove it before retrying',
+      reviewRequired: findings, details: { reviewRequired: findings },
+    };
+  }
+  // Collision pre-flight against the existing declarations and against the
+  // candidate set itself (case-insensitive target/source overlap).
+  for (let i = 0; i < candidates.length; i += 1) {
+    const candidate = candidates[i];
+    const conflict = [...declarations.resources, ...candidates.slice(i + 1)]
+      .find((other) => pathsOverlap(other.target, candidate.target) || pathsOverlap(other.source, candidate.source));
+    if (conflict) throw resourceCollision(candidate, conflict);
+  }
+  const manifestPath = path.join(repo, MANIFEST_FILE);
+  const manifestText = await fs.readFile(manifestPath, 'utf8');
+  const manifest = JSON.parse(manifestText);
+  await writeJsonFileAtomic(manifestPath, { ...manifest, resources: [...manifest.resources, ...candidates] }, manifestText, 'register');
+  return { apiVersion: 1, command: 'register', ok: true, exitCode: 0, action: 'registered', registered: candidates };
+}
+
+// Test-only, environment-gated hold point for deterministic concurrency
+// tests: while PI_SYNC_TEST_HOLD_BEFORE_COMPARE names an existing file, the
+// atomic writer waits (bounded) after writing its temp file and before the
+// before-rename comparison read, so a test can apply a concurrent change in
+// that window without racing it (the temp file's appearance marks the
+// window). It is never set outside tests, and the wait is capped so a stale
+// marker cannot wedge the writer indefinitely.
+async function holdForTestBeforeCompare() {
+  const marker = process.env.PI_SYNC_TEST_HOLD_BEFORE_COMPARE;
+  if (!marker) return;
+  const deadline = Date.now() + 30000;
+  for (;;) {
+    const holding = await fs.access(marker).then(() => true, () => false);
+    if (!holding || Date.now() > deadline) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+// Shared atomic, concurrency-guarded manifest and lockfile write: an
+// exclusively created temp file whose sibling's text is compared before the
+// rename, so a concurrent change is never overwritten. `operation` names the
+// command performing the write (for example 'remove', 'register', or 'sync')
+// so a concurrent-change failure reports the operation that was actually in
+// flight, not a stale one.
+async function writeJsonFileAtomic(file, value, previousText, operation) {
   const info = await fs.stat(file);
   const temporary = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   try {
     await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { flag: 'wx', mode: info.mode & 0o777 });
+    await holdForTestBeforeCompare();
     if (await fs.readFile(file, 'utf8') !== previousText) {
-      throw new Error(`${path.basename(file)} changed during remove; retry without overwriting concurrent changes`);
+      throw new Error(`${path.basename(file)} changed during ${operation}; retry without overwriting concurrent changes`);
     }
     await fs.rename(temporary, file);
   } catch (error) {
@@ -552,7 +741,7 @@ async function removeResource(repo, type, target) {
   }
   let manifestWritten = false;
   try {
-    await writeJsonFileAtomic(manifestPath, nextManifest, manifestText);
+    await writeJsonFileAtomic(manifestPath, nextManifest, manifestText, 'remove');
     manifestWritten = true;
     try {
       await fs.rm(entry.sourcePath, { recursive: true });
@@ -621,9 +810,9 @@ async function removeDependency(repo, source, agentDir, uninstall) {
   let manifestWritten = false;
   let lockWritten = false;
   try {
-    await writeJsonFileAtomic(manifestPath, nextManifest, manifestText);
+    await writeJsonFileAtomic(manifestPath, nextManifest, manifestText, 'remove');
     manifestWritten = true;
-    await writeJsonFileAtomic(lockPath, nextLock, lockText);
+    await writeJsonFileAtomic(lockPath, nextLock, lockText, 'remove');
     lockWritten = true;
     try {
       await validateRepository(repo);
@@ -1060,7 +1249,7 @@ async function syncSettings(repo, agentDir, declarations, state, applyChanges) {
     error.details = { reviewRequired: findings };
     throw error;
   }
-  await writeJsonFileAtomic(manifestPath, nextManifest, manifestText);
+  await writeJsonFileAtomic(manifestPath, nextManifest, manifestText, 'sync');
   try {
     await validateRepository(repo);
   } catch (error) {
@@ -1961,10 +2150,16 @@ async function main() {
     console.log(JSON.stringify({ apiVersion: 1, command: 'version', ok: true, exitCode: 0, name: packageJson.name, version: packageJson.version }, null, 2));
     return;
   }
-  if (!['status', 'plan', 'apply', 'add', 'remove', 'prune', 'bootstrap', 'update', 'push', 'sync'].includes(command)) {
-    throw new Error('Usage: pi-sync --version | pi-sync <status|plan|apply|add|remove|prune|update|push|bootstrap|sync> [--repo PATH] [--repo-url URL --repo-dir PATH] [--agent-dir PATH] [--type skill|extension|prompt|agent|role|dependency --target VALUE | --source VALUE] [--confirm] [--approve] [--apply] [--push] [--publish] [--uninstall]');
+  if (!['status', 'plan', 'apply', 'add', 'remove', 'register', 'prune', 'bootstrap', 'update', 'push', 'sync'].includes(command)) {
+    throw new Error('Usage: pi-sync --version | pi-sync <status|plan|apply|add|remove|register|prune|update|push|bootstrap|sync> [--repo PATH] [--repo-url URL --repo-dir PATH] [--agent-dir PATH] [--type skill|extension|prompt|agent|role|dependency --target VALUE | --source VALUE] [--list] [--all] [--confirm] [--approve] [--apply] [--push] [--publish] [--uninstall]');
   }
-  const options = { repo: process.cwd(), repoDir: path.join(os.homedir(), '.pi-sync', 'setup'), agentDir: process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent'), binDir: path.join(os.homedir(), '.local', 'bin'), confirm: false, approve: false, applyUpdate: false, pushUpdate: false, publish: false, uninstall: false };
+  // Repository commands resolve the setup repository exactly like the pi-sync
+  // extension: an explicit --repo flag first, then PI_SYNC_REPO_DIR used
+  // verbatim (no ~ expansion), then the built-in default under the user home.
+  // The former current-working-directory fallback is removed on purpose: a
+  // repository command run from an unrelated directory operates on the
+  // environment or default repository.
+  const options = { repo: process.env.PI_SYNC_REPO_DIR ?? DEFAULT_SETUP_REPO, repoDir: DEFAULT_SETUP_REPO, agentDir: process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent'), binDir: path.join(os.homedir(), '.local', 'bin'), confirm: false, approve: false, applyUpdate: false, pushUpdate: false, publish: false, uninstall: false, list: false, all: false };
   for (let i = 3; i < process.argv.length; i++) {
     const arg = process.argv[i];
     if (['--repo', '--repo-url', '--repo-dir', '--agent-dir', '--bin-dir', '--type', '--source', '--target'].includes(arg)) {
@@ -1984,9 +2179,13 @@ async function main() {
     else if (arg === '--push') options.pushUpdate = true;
     else if (arg === '--publish') options.publish = true;
     else if (arg === '--uninstall') options.uninstall = true;
+    else if (arg === '--list') options.list = true;
+    else if (arg === '--all') options.all = true;
     else throw new Error(`Unknown option: ${arg}`);
   }
   if (options.confirm && command !== 'prune') throw new Error('--confirm is only supported by prune');
+  if (options.list && command !== 'register') throw new Error('--list is only supported by register');
+  if (options.all && command !== 'register') throw new Error('--all is only supported by register');
   if (options.approve && !['apply', 'update'].includes(command)) throw new Error('--approve is only supported by apply or update');
   if (options.applyUpdate && !['update', 'sync'].includes(command)) throw new Error('--apply is only supported by update or sync');
   if (options.pushUpdate && command !== 'update') throw new Error('--push is only supported by update');
@@ -1994,6 +2193,14 @@ async function main() {
   if (options.publish && command !== 'push') throw new Error('--publish is only supported by push');
   if (command === 'add' && (!options.type || !options.source)) throw new Error('add requires explicit --type and --source options');
   if (command === 'add' && !['skill', 'extension', 'prompt', 'agent', 'role', 'dependency'].includes(options.type)) throw new Error(`Unsupported resource type: ${options.type}`);
+  // Exactly one of the three register modes is selected: a single
+  // registration via --source, --list, or --all. --type is required for
+  // single registration and optional (narrowing the roots scanned) for
+  // --list and --all.
+  if (command === 'register' && options.type && !['skill', 'extension', 'prompt', 'agent', 'role'].includes(options.type)) throw new Error(`Unsupported resource type: ${options.type}`);
+  if (command === 'register' && options.list && options.all) throw new Error('register --list and --all are mutually exclusive; select exactly one of --source, --list, or --all');
+  if (command === 'register' && options.source && (options.list || options.all)) throw new Error('register --source cannot be combined with --list or --all; select exactly one of --source, --list, or --all');
+  if (command === 'register' && !options.list && !options.all && (!options.type || !options.source)) throw new Error('register requires explicit --type and --source options');
   if (command === 'remove' && !options.type) throw new Error('remove requires explicit --type and --target (or --source for dependencies)');
   if (command === 'remove' && !['skill', 'extension', 'prompt', 'agent', 'role', 'dependency'].includes(options.type)) throw new Error(`Unsupported resource type: ${options.type}`);
   if (command === 'remove' && options.type === 'dependency') {
@@ -2036,6 +2243,22 @@ async function main() {
     }
     const output = await removeResource(repo, options.type, options.target);
     console.log(JSON.stringify(output, null, 2));
+    return;
+  }
+  // register declares repository-present content as managed by writing
+  // the manifest entry only: no import or copy, no local-installation
+  // write, and no commit or push. The three exclusive modes are --source
+  // (single registration), --list (read-only discovery), and --all (batch
+  // registration). It dispatches before the agent directory check, exactly
+  // like remove, and none of the modes requires or uses --agent-dir.
+  if (command === 'register') {
+    const output = options.list
+      ? await listUnregisteredResources(repo, options.type)
+      : options.all
+        ? await registerAllResources(repo, options.type)
+        : await registerResource(repo, options.type, options.source);
+    console.log(JSON.stringify(output, null, 2));
+    if (!output.ok) process.exitCode = output.exitCode;
     return;
   }
   let agentInfo = await fs.lstat(agentDir).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
