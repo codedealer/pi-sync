@@ -116,9 +116,10 @@ pi-sync sync [--repo PATH] [--agent-dir PATH]
 pi-sync sync --apply [--repo PATH] [--agent-dir PATH]
 pi-sync prune [--repo PATH] [--agent-dir PATH]
 pi-sync prune --confirm [--repo PATH] [--agent-dir PATH]
+pi-sync --version
 ```
 
-The target defaults to `PI_CODING_AGENT_DIR`, then `~/.pi/agent`. Each command emits JSON. `status` and `plan` report `install`, `update`, `unchanged`, `local-divergence`, `conflict`, or `collision` actions. Apply installs absent resources, reconciles tracked changes, and leaves unlisted resources and settings untouched. Unknown pre-existing resource paths and settings collisions are never overwritten.
+The target defaults to `PI_CODING_AGENT_DIR`, then `~/.pi/agent`. Each command emits JSON. `--version` reports the installed CLI package name and version in the same JSON envelope and does not touch a repository or agent directory. `status` and `plan` report `install`, `update`, `unchanged`, `local-divergence`, `conflict`, or `collision` actions. Apply installs absent resources, reconciles tracked changes, and leaves unlisted resources and settings untouched. Unknown pre-existing resource paths and settings collisions are never overwritten.
 
 `add` supports explicitly importing one resource of each type from the local Pi agent directory: a skill directory from `skills/NAME`, an extension file or directory from `extensions/NAME`, or a single `.md` file from `prompts/NAME.md`, `agents/NAME.md`, or `roles/NAME.md`. It copies only the selected file or directory to the matching `resources/<type-root>/` path and appends the corresponding manifest resource. `add --type dependency` declares only the selected npm package or GitHub repository; it does not edit pins or install packages. Run `update` to preview mature exact pins, then `update --apply` to explicitly apply eligible updates. Managed package updates must be performed through `pi-sync update`; ordinary `apply` uses lockfile pins without registry/GitHub update lookups. First-time installs require interactive confirmation or explicit `--approve` for non-interactive use. Known credential-store paths and likely secret material stop resource import and are reported for review; the scanner is best-effort and does not guarantee arbitrary content is secret-free.
 

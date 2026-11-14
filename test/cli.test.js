@@ -341,6 +341,26 @@ test('supported agent commands share a versioned JSON response contract', async 
   }
 });
 
+test('--version reports the installed package name and version without touching repositories', async () => {
+  const response = run(['--version']);
+  assert.equal(response.status, 0, response.stderr);
+  const output = result(response);
+  assert.equal(output.apiVersion, 1);
+  assert.equal(output.command, 'version');
+  assert.equal(output.ok, true);
+  assert.equal(output.exitCode, 0);
+  const packageJson = JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(output.name, packageJson.name);
+  assert.equal(output.version, packageJson.version);
+
+  const extra = run(['--version', 'extra']);
+  assert.equal(extra.status, 2);
+  const extraOutput = result(extra);
+  assert.equal(extraOutput.ok, false);
+  assert.equal(extraOutput.errorCode, 'VALIDATION_ERROR');
+  assert.equal(extraOutput.exitCode, 2);
+});
+
 test('agent API reports conflicts and invalid operations as structured JSON with meaningful exits', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const target = path.join(agentDir, 'skills', 'hello');

@@ -1955,8 +1955,14 @@ async function managedPush(repo, declarations, publish = false) {
 
 async function main() {
   const command = process.argv[2];
+  if (command === '--version') {
+    if (process.argv.length > 3) throw new Error('--version does not accept additional arguments');
+    const packageJson = await readJson(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'package metadata');
+    console.log(JSON.stringify({ apiVersion: 1, command: 'version', ok: true, exitCode: 0, name: packageJson.name, version: packageJson.version }, null, 2));
+    return;
+  }
   if (!['status', 'plan', 'apply', 'add', 'remove', 'prune', 'bootstrap', 'update', 'push', 'sync'].includes(command)) {
-    throw new Error('Usage: pi-sync <status|plan|apply|add|remove|prune|update|push|bootstrap|sync> [--repo PATH] [--repo-url URL --repo-dir PATH] [--agent-dir PATH] [--type skill|extension|prompt|agent|role|dependency --target VALUE | --source VALUE] [--confirm] [--approve] [--apply] [--push] [--publish] [--uninstall]');
+    throw new Error('Usage: pi-sync --version | pi-sync <status|plan|apply|add|remove|prune|update|push|bootstrap|sync> [--repo PATH] [--repo-url URL --repo-dir PATH] [--agent-dir PATH] [--type skill|extension|prompt|agent|role|dependency --target VALUE | --source VALUE] [--confirm] [--approve] [--apply] [--push] [--publish] [--uninstall]');
   }
   const options = { repo: process.cwd(), repoDir: path.join(os.homedir(), '.pi-sync', 'setup'), agentDir: process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent'), binDir: path.join(os.homedir(), '.local', 'bin'), confirm: false, approve: false, applyUpdate: false, pushUpdate: false, publish: false, uninstall: false };
   for (let i = 3; i < process.argv.length; i++) {
