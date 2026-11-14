@@ -983,15 +983,13 @@ async function buildPlan(repo, agentDir, declarations, state) {
   return { resources, settings, stale };
 }
 
-// Back-syncs local-only managed setting changes into the setup manifest.
-// A field is eligible only when the three-way comparison says the repository
-// is unchanged and the local installation diverged from the last applied
-// baseline. Conflicts, collisions (no baseline), and locally removed fields
-// are reported for manual review and never written. The manifest is the only
-// file this command modifies; it is rewritten with the same atomic
-// read-check-rename pattern as add/remove and re-validated after the write.
-async function syncSettings(repo, agentDir, declarations, state, applyChanges) {
-  const plan = await buildPlan(repo, agentDir, declarations, state);
+// Read-only sync classification shared by the `sync` preview/apply and the
+// status/plan `sync` block, so every consumer sees identical content:
+// syncable fields (local-only and portable, with from/to), conflicts (changed
+// in both places or without a baseline), rejected (non-portable local
+// values), and review (locally removed managed fields). No manifest write,
+// no re-baseline, no lock.
+function syncClassification(plan) {
   const syncable = [];
   const conflicts = [];
   const rejected = [];
@@ -1014,6 +1012,19 @@ async function syncSettings(repo, agentDir, declarations, state, applyChanges) {
       }
     }
   }
+  return { syncable, conflicts, rejected, review };
+}
+
+// Back-syncs local-only managed setting changes into the setup manifest.
+// A field is eligible only when the three-way comparison says the repository
+// is unchanged and the local installation diverged from the last applied
+// baseline. Conflicts, collisions (no baseline), and locally removed fields
+// are reported for manual review and never written. The manifest is the only
+// file this command modifies; it is rewritten with the same atomic
+// read-check-rename pattern as add/remove and re-validated after the write.
+async function syncSettings(repo, agentDir, declarations, state, applyChanges) {
+  const plan = await buildPlan(repo, agentDir, declarations, state);
+  const { syncable, conflicts, rejected, review } = syncClassification(plan);
 
   if (!applyChanges) {
     return { apiVersion: 1, command: 'sync', ok: true, exitCode: 0, repository: repo, agentDirectory: agentDir, mode: 'preview',
@@ -1654,6 +1665,51 @@ function managedGitPath(relative, resourceSources) {
   return relative === MANIFEST_FILE || relative === LOCK_FILE || resourceSources.some((source) => relative === source || relative.startsWith(`${source}/`));
 }
 
+// Read-only publish state of the setup repository relative to its upstream,
+// computed with the same git primitives the managed push uses: working-tree
+// dirt from `git status --porcelain --untracked-files=no` (untracked files do
+// not count: managed-only push never stages them, so they are not
+// publishable changes) and ahead/behind from
+// `git rev-list --left-right --count HEAD...@{upstream}`. Returns null when
+// the setup directory is not the root of a git working tree (status still
+// works in that case for manifest validation), and null ahead/behind when no
+// upstream can be resolved (no remote, no upstream configured, detached HEAD,
+// or an upstream ref that cannot be compared, such as an unfetched one).
+async function repositoryPublishState(repo) {
+  const top = await gitResult(repo, ['rev-parse', '--show-toplevel']);
+  if (top.status !== 0) return null;
+  if (path.resolve(top.output) !== path.resolve(repo)) return null;
+  const dirty = await gitResult(repo, ['status', '--porcelain', '--untracked-files=no']);
+  if (dirty.status !== 0) throw new Error(`Could not inspect the setup repository working tree: ${dirty.errorText || `git exited ${dirty.status}`}`);
+  let ahead = null;
+  let behind = null;
+  const upstream = await gitResult(repo, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']);
+  if (upstream.status === 0) {
+    const counts = await gitResult(repo, ['rev-list', '--left-right', '--count', `HEAD...${upstream.output}`]);
+    if (counts.status === 0) {
+      const [left, right] = counts.output.split(/\s+/).map(Number);
+      if (Number.isInteger(left) && Number.isInteger(right)) { ahead = left; behind = right; }
+    }
+  }
+  return { dirty: dirty.output.length > 0, ahead, behind };
+}
+
+// Derives the footer-ready summary from the reporting blocks. Counts follow
+// the two-stage pipeline with no double counting (a change always lives in
+// exactly one stage): syncable fields, working-tree dirt, and ahead commits
+// are local-pending; behind commits and unapplied install/update actions are
+// remote-pending; conflict/collision actions, rejected and locally removed
+// fields, and locally diverged resources need review. syncable counts fields
+// (the sync unit); review counts manifest items (actions).
+function deriveStatusSummary(publishState, sync, conflicts, actions) {
+  const localPending = sync.syncable.length + (publishState ? (publishState.dirty ? 1 : 0) + (publishState.ahead ?? 0) : 0);
+  const remotePending = (publishState?.behind ?? 0) + actions.filter((item) => item.action === 'install' || item.action === 'update').length;
+  const needsReview = conflicts.length + sync.rejected.length + sync.review.length +
+    actions.filter((item) => item.type !== 'setting' && item.action === 'local-divergence').length;
+  const clean = localPending === 0 && remotePending === 0 && needsReview === 0;
+  return { localPending, remotePending, needsReview, clean };
+}
+
 // Returns the resource sources declared in the setup manifest at the given
 // commit, or an empty list when that commit predates the manifest. Malformed
 // manifests at ahead commits fail closed so they are reconciled manually.
@@ -2089,8 +2145,25 @@ async function main() {
     const conflicts = actions.filter((item) => ['collision', 'conflict'].includes(item.action) || item.fields?.some((field) => ['collision', 'conflict'].includes(field.action)));
     const staleResources = plan.stale.map(({ target, state: staleState, localSnapshot, overlaps }) => ({ target, state: staleState,
       installed: localSnapshot !== null, pruneAvailable: overlaps.length === 0, ...(overlaps.length ? { overlaps } : {}) }));
+    // status and plan are read-only reporting commands: they gain the
+    // repository publish-state block (omitted when the setup directory is not
+    // a git working tree), the read-only sync classification (identical
+    // content to a `sync` preview), and the derived summary. apply and prune
+    // keep their existing contracts and take the agent lock as before; these
+    // blocks never write and take no lock.
+    const reporting = command === 'status' || command === 'plan';
+    let publishState;
+    let sync;
+    let summary;
+    if (reporting) {
+      publishState = await repositoryPublishState(repo);
+      sync = syncClassification(plan);
+      summary = deriveStatusSummary(publishState, sync, conflicts, actions);
+    }
     const output = { apiVersion: 1, command, ok: conflicts.length === 0, exitCode: conflicts.length ? OPERATION_ERROR : 0,
-      repository: repo, agentDirectory: agentDir, actions, conflicts, staleResources,
+      ...(reporting ? (publishState ? { repository: publishState } : {}) : { repository: repo }),
+      agentDirectory: agentDir, actions, conflicts, staleResources,
+      ...(reporting ? { sync, summary } : {}),
       packages: declarations.lock.packages.map((item) => ({ package: packageIdentity(item), pin: packageRevision(item), action: command === 'apply' ? 'pinned-install' : 'locked' })),
       dependencyModel: 'exact top-level pins; Pi controls transitive dependencies, which Pi Sync does not lock or claim reproducible' };
 

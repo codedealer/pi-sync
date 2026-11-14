@@ -292,7 +292,7 @@ test('bootstrap detects manifest-owned skill target collisions without editing t
 
 test('public npm package allowlist includes the CLI, skill, and extension but excludes tests and scratch data', async () => {
   const packageJson = JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8'));
-  assert.deepEqual(packageJson.files, ['README.md', 'src/cli.js', 'src/packages.js', 'src/prerequisites.js', 'resources/skills/pi-sync/SKILL.md', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/README.md']);
+  assert.deepEqual(packageJson.files, ['README.md', 'src/cli.js', 'src/packages.js', 'src/prerequisites.js', 'resources/skills/pi-sync/SKILL.md', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/status.js', 'resources/extensions/pi-sync/README.md']);
   const packed = spawnSync('npm', ['pack', '--dry-run', '--json'], { encoding: 'utf8', cwd: path.dirname(fileURLToPath(new URL('../package.json', import.meta.url))) });
   assert.equal(packed.status, 0, packed.stderr);
   const files = JSON.parse(packed.stdout)[0].files.map((item) => item.path);
@@ -301,8 +301,9 @@ test('public npm package allowlist includes the CLI, skill, and extension but ex
   assert.ok(files.includes('src/packages.js'));
   assert.ok(files.includes('resources/skills/pi-sync/SKILL.md'));
   assert.ok(files.includes('resources/extensions/pi-sync/index.ts'));
+  assert.ok(files.includes('resources/extensions/pi-sync/status.js'));
   assert.ok(!files.some((item) => /^(?:test(?:\/|$)|test-support(?:\/|$)|\.scratch(?:\/|$)|resources\/skills\/(?!pi-sync\/))/.test(item)));
-  assert.deepEqual(files.sort(), ['README.md', 'package.json', 'resources/extensions/pi-sync/README.md', 'resources/extensions/pi-sync/index.ts', 'resources/skills/pi-sync/SKILL.md', 'src/cli.js', 'src/packages.js', 'src/prerequisites.js']);
+  assert.deepEqual(files.sort(), ['README.md', 'package.json', 'resources/extensions/pi-sync/README.md', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/status.js', 'resources/skills/pi-sync/SKILL.md', 'src/cli.js', 'src/packages.js', 'src/prerequisites.js']);
 });
 
 test('supported agent commands share a versioned JSON response contract', async (t) => {
@@ -896,6 +897,202 @@ test('sync recovers from a torn settings read and fails clearly on genuinely inv
   assert.equal(output.ok, true, JSON.stringify(output));
   assert.deepEqual(output.synced.map((item) => item.path), ['/theme']);
   assert.equal(JSON.parse(await fs.readFile(manifestPath, 'utf8')).settings[0].fields[0].value, 'light');
+});
+
+test('status and plan report the repository publish state for git setups', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  const agentDir = path.join(root, 'agent');
+  await fs.mkdir(agentDir);
+  const args = ['--repo', repo, '--agent-dir', agentDir];
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const statusOutput = (processResult) => {
+    assert.equal(processResult.status, 0, processResult.stderr);
+    return result(processResult);
+  };
+
+  // Clean at upstream: no dirt, no ahead, no behind.
+  assert.deepEqual(statusOutput(run(['status', ...args])).repository, { dirty: false, ahead: 0, behind: 0 });
+  assert.deepEqual(statusOutput(run(['plan', ...args])).repository, { dirty: false, ahead: 0, behind: 0 });
+
+  // Uncommitted manifest change: the tracked tree is dirty.
+  await fs.appendFile(manifestPath, '\n');
+  assert.deepEqual(statusOutput(run(['status', ...args])).repository, { dirty: true, ahead: 0, behind: 0 });
+
+  // Local commit: one ahead of upstream.
+  gitAt(repo, ['commit', '-am', 'local manifest change']);
+  assert.deepEqual(statusOutput(run(['status', ...args])).repository, { dirty: false, ahead: 1, behind: 0 });
+
+  // Remote advancement committed in a clone of the bare origin: one behind.
+  const clone = path.join(root, 'second-clone');
+  gitAt(root, ['clone', bare, clone]);
+  gitAt(clone, ['config', 'user.name', 'Pi Sync Test']);
+  gitAt(clone, ['config', 'user.email', 'pi-sync-test@example.invalid']);
+  await fs.appendFile(path.join(clone, 'resources', 'skills', 'hello', 'SKILL.md'), '# Remote update\n');
+  gitAt(clone, ['commit', '-am', 'remote change']);
+  gitAt(clone, ['push', 'origin', 'main']);
+  gitAt(repo, ['fetch', '--quiet']);
+  assert.deepEqual(statusOutput(run(['status', ...args])).repository, { dirty: false, ahead: 1, behind: 1 });
+
+  // No remote configured: ahead/behind are null, dirt is still reported.
+  const isolated = path.join(root, 'isolated');
+  gitAt(root, ['init', '--initial-branch=main', isolated]);
+  gitAt(isolated, ['config', 'user.name', 'Pi Sync Test']);
+  gitAt(isolated, ['config', 'user.email', 'pi-sync-test@example.invalid']);
+  for (const file of ['pi-sync.json', 'pi-sync.lock.json']) await fs.cp(path.join(repo, file), path.join(isolated, file));
+  await fs.cp(path.join(repo, 'resources'), path.join(isolated, 'resources'), { recursive: true });
+  gitAt(isolated, ['add', '--all']);
+  gitAt(isolated, ['commit', '-m', 'initial setup']);
+  const isolatedOutput = statusOutput(run(['status', '--repo', isolated, '--agent-dir', agentDir]));
+  assert.deepEqual(isolatedOutput.repository, { dirty: false, ahead: null, behind: null });
+  assert.deepEqual(isolatedOutput.summary, { localPending: 0, remotePending: 1, needsReview: 0, clean: false },
+    'without an upstream the summary degrades to unapplied actions');
+
+  // Non-git setup directory: the repository block is omitted entirely.
+  const { repo: plainRepo, agentDir: plainAgentDir } = await fixture(t);
+  const nonGit = statusOutput(run(['status', '--repo', plainRepo, '--agent-dir', plainAgentDir]));
+  assert.equal('repository' in nonGit, false);
+  assert.equal('repository' in statusOutput(run(['plan', '--repo', plainRepo, '--agent-dir', plainAgentDir])), false);
+  assert.deepEqual(nonGit.summary, { localPending: 0, remotePending: 1, needsReview: 0, clean: false });
+});
+
+test('status and plan carry the sync preview classification without writing or locking', async (t) => {
+  const { repo, agentDir, manifestPath, localPath } = await settingsFixture(t, [
+    { path: '/theme', value: 'dark' },
+    { path: '/defaultProvider', value: 'github-copilot' },
+    { path: '/providers/local', value: { baseUrl: 'http://llama-swap:8080/v1', apiKey: '$LLAMA_SWAP_API_KEY' } },
+    { path: '/defaultThinkingLevel', value: 'medium' },
+  ]);
+  // One field per classification: local-only change (syncable), both-sides
+  // change (conflict), non-portable local value (rejected), local removal
+  // (review).
+  const local = JSON.parse(await fs.readFile(localPath, 'utf8'));
+  local.theme = 'light';
+  local.defaultProvider = 'openrouter';
+  local.providers.local.apiKey = 'sk-supersecret12345';
+  delete local.defaultThinkingLevel;
+  await fs.writeFile(localPath, `${JSON.stringify(local, null, 2)}\n`);
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.settings[0].fields.find((field) => field.path === '/defaultProvider').value = 'acme';
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const preview = result(run(['sync', '--repo', repo, '--agent-dir', agentDir]));
+  assert.equal(preview.syncable.length, 1);
+  assert.equal(preview.conflicts.length, 1);
+  assert.equal(preview.rejected.length, 1);
+  assert.equal(preview.review.length, 1);
+  const expected = { syncable: preview.syncable, conflicts: preview.conflicts, rejected: preview.rejected, review: preview.review };
+
+  const snapshots = {
+    manifest: await fs.readFile(manifestPath, 'utf8'),
+    lockfile: await fs.readFile(path.join(repo, 'pi-sync.lock.json'), 'utf8'),
+    state: await fs.readFile(path.join(agentDir, '.pi-sync', 'state.json'), 'utf8'),
+    local: await fs.readFile(localPath, 'utf8'),
+  };
+  for (const command of ['status', 'plan']) {
+    const processResult = run([command, '--repo', repo, '--agent-dir', agentDir]);
+    // The conflicted field is an operational conflict: exit 1, as before.
+    assert.equal(processResult.status, 1, processResult.stderr);
+    const output = result(processResult);
+    assert.deepEqual({ syncable: output.sync.syncable, conflicts: output.sync.conflicts, rejected: output.sync.rejected, review: output.sync.review }, expected);
+    assert.match(output.sync.rejected[0].reason, /credential-like key/);
+  }
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), snapshots.manifest, 'must not write the manifest');
+  assert.equal(await fs.readFile(path.join(repo, 'pi-sync.lock.json'), 'utf8'), snapshots.lockfile, 'must not write the lockfile');
+  assert.equal(await fs.readFile(path.join(agentDir, '.pi-sync', 'state.json'), 'utf8'), snapshots.state, 'must not re-baseline');
+  assert.equal(await fs.readFile(localPath, 'utf8'), snapshots.local, 'must not touch the local installation');
+  await assert.rejects(fs.access(path.join(agentDir, '.pi-sync', 'apply.lock')), 'must not take the agent lock');
+});
+
+test('summary local pending combines syncable fields, repository dirt, and ahead commits', async (t) => {
+  const { root, repo } = await pushFixture(t);
+  const agentDir = path.join(root, 'agent');
+  await fs.mkdir(agentDir);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.settings = [{ target: 'settings.json', fields: [{ path: '/theme', value: 'dark' }] }];
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  assert.equal(run(['apply', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  // One ahead commit: the manifest change is committed locally, not pushed.
+  gitAt(repo, ['commit', '-am', 'declare settings']);
+  // A dirty tracked tree: an uncommitted manifest change.
+  await fs.appendFile(manifestPath, '\n');
+  // One syncable field: a local-only settings change.
+  const localPath = path.join(agentDir, 'settings.json');
+  await fs.writeFile(localPath, `${JSON.stringify({ theme: 'light' }, null, 2)}\n`);
+
+  const processResult = run(['status', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(processResult.status, 0, processResult.stderr);
+  const output = result(processResult);
+  assert.deepEqual(output.repository, { dirty: true, ahead: 1, behind: 0 });
+  assert.deepEqual(output.sync.syncable.map((item) => item.path), ['/theme']);
+  assert.deepEqual(output.summary, { localPending: 3, remotePending: 0, needsReview: 0, clean: false });
+  const plan = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(plan.status, 0, plan.stderr);
+  assert.deepEqual(result(plan).summary, output.summary);
+});
+
+test('summary remote pending combines behind commits and unapplied install actions', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  const agentDir = path.join(root, 'agent');
+  await fs.mkdir(agentDir);
+  // One behind commit: made in a clone of the bare origin, then fetched.
+  const clone = path.join(root, 'second-clone');
+  gitAt(root, ['clone', bare, clone]);
+  gitAt(clone, ['config', 'user.name', 'Pi Sync Test']);
+  gitAt(clone, ['config', 'user.email', 'pi-sync-test@example.invalid']);
+  await fs.appendFile(path.join(clone, 'resources', 'skills', 'hello', 'SKILL.md'), '# Remote update\n');
+  gitAt(clone, ['commit', '-am', 'remote change']);
+  gitAt(clone, ['push', 'origin', 'main']);
+  gitAt(repo, ['fetch', '--quiet']);
+
+  const processResult = run(['status', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(processResult.status, 0, processResult.stderr);
+  const output = result(processResult);
+  assert.deepEqual(output.repository, { dirty: false, ahead: 0, behind: 1 });
+  assert.deepEqual(output.actions.map((item) => item.action), ['install']);
+  assert.deepEqual(output.summary, { localPending: 0, remotePending: 2, needsReview: 0, clean: false });
+});
+
+test('summary review combines conflicts and locally diverged resources', async (t) => {
+  const { repo, agentDir, manifestPath, localPath } = await settingsFixture(t, [
+    { path: '/theme', value: 'dark' },
+    { path: '/defaultProvider', value: 'github-copilot' },
+  ]);
+  // A both-sides field change: a setting action in the conflicts aggregate.
+  const local = JSON.parse(await fs.readFile(localPath, 'utf8'));
+  local.defaultProvider = 'openrouter';
+  await fs.writeFile(localPath, `${JSON.stringify(local, null, 2)}\n`);
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.settings[0].fields.find((field) => field.path === '/defaultProvider').value = 'acme';
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  // A locally edited resource: a local-only divergence.
+  await fs.writeFile(path.join(agentDir, 'skills', 'hello', 'SKILL.md'), '# Local edit\n');
+
+  const processResult = run(['status', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(processResult.status, 1, processResult.stderr);
+  const output = result(processResult);
+  assert.equal('repository' in output, false, 'non-git setup: the repository block is omitted');
+  assert.deepEqual(output.summary, { localPending: 0, remotePending: 0, needsReview: 2, clean: false });
+});
+
+test('summary is clean exactly when every count is zero', async (t) => {
+  const { root, repo } = await pushFixture(t);
+  const agentDir = path.join(root, 'agent');
+  await fs.mkdir(agentDir);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.settings = [{ target: 'settings.json', fields: [{ path: '/theme', value: 'dark' }] }];
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  assert.equal(run(['apply', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  gitAt(repo, ['commit', '-am', 'declare settings']);
+  gitAt(repo, ['push', '--quiet', 'origin', 'main']);
+
+  const processResult = run(['status', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(processResult.status, 0, processResult.stderr);
+  const output = result(processResult);
+  assert.deepEqual(output.repository, { dirty: false, ahead: 0, behind: 0 });
+  assert.deepEqual(output.sync, { syncable: [], conflicts: [], rejected: [], review: [] });
+  assert.deepEqual(output.summary, { localPending: 0, remotePending: 0, needsReview: 0, clean: true });
 });
 
 test('serializes concurrent applies and leaves one consistent managed installation', async (t) => {

@@ -13,6 +13,7 @@
     "src/prerequisites.js",
     "resources/skills/pi-sync/SKILL.md",
     "resources/extensions/pi-sync/index.ts",
+    "resources/extensions/pi-sync/status.js",
     "resources/extensions/pi-sync/README.md"
   ],
   "scripts": {

@@ -1,6 +1,6 @@
 ---
 name: pi-sync
-description: Inspect and safely operate the explicitly managed Pi setup using the pi-sync CLI.
+description: Use before adding, editing, or removing any skill, prompt, agent, role, extension, or settings file under the active agent directory (default ~/.pi/agent, or wherever PI_CODING_AGENT_DIR points); also for operating the explicitly managed Pi setup with the pi-sync CLI.
 ---
 
 # Pi Sync agent workflow
@@ -25,6 +25,15 @@ pi-sync plan --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
 ```
 
 Omit `--agent-dir` to use `PI_CODING_AGENT_DIR`, then the default `~/.pi/agent`. `status` and `plan` are read-only. Review `actions`, `conflicts`, and `staleResources` in the JSON before taking an action. A stale resource remains installed; ordinary apply does not prune it.
+
+## Adding or editing user-level resources
+
+When asked to add or edit a user-level (not project-scoped) resource, first determine whether the target is managed, before changing anything. The setup manifest (`pi-sync.json` at the setup repository root) is authoritative: its `resources` entries declare managed resources and its `settings` entries declare managed settings targets and fields. `pi-sync status --repo ... --agent-dir ...` exposes the same set: managed targets appear in `actions` (a locally edited managed resource shows `action: "local-divergence"`) and removed-but-installed targets appear in `staleResources`.
+
+- **Managed resource:** never edit the installed copy in the agent directory — it is the output of `apply`, not an input. Edit the source in the setup repository (the manifest-declared `resources/<type-root>/` path) and run `pi-sync apply` to reconcile the local installation. Publish only with an explicit push authorization (see Push only when explicitly authorized). An in-place edit of an installed managed copy is local-only divergence: `status` reports it as a review item (the extension's footer shows `!n`) and keeps counting it until resolved. The clean recovery is to port the content into the setup repository and apply again — once local and repository content match, the resource re-baselines as unchanged.
+- **Unmanaged existing file:** edit it directly. Pi Sync never touches unlisted resources or undeclared settings fields.
+- **New resource:** manage by default. Create the resource, then bring it under management with `pi-sync add` (see Add only a specifically selected local resource) rather than leaving it unmanaged, and apply it through Pi Sync.
+- **Settings:** managed per field, per the manifest's `settings` declarations. Local changes to managed fields belong to the back-sync flow (see Back-sync local setting changes when requested); undeclared fields remain local and can be edited directly.
 
 ## Apply when requested
 
