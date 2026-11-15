@@ -1272,10 +1272,7 @@ async function syncSettings(repo, agentDir, declarations, state, applyChanges) {
 }
 
 function outputAction(item, key) {
-  // The resource-level action summarizes the whole resource; the per-file list
-  // exists to name which files update, delete, conflict, or diverge. Fully
-  // unchanged resources therefore carry no files field at all, keeping clean
-  // reporting constant-size per resource.
+  if (item.action === 'unchanged') return null;
   const changedFiles = (item.files ?? []).filter((file) => file.action !== 'unchanged');
   return { type: item.type ?? 'setting', [key]: item[key], action: item.action, ...(item.reason ? { reason: item.reason } : {}),
     ...(changedFiles.length ? { files: changedFiles.map(({ path: file, action, reason }) => ({ path: file, action, ...(reason ? { reason } : {}) })) } : {}) };
@@ -2374,9 +2371,12 @@ async function main() {
       return;
     }
     const actions = [
-      ...plan.resources.map((item) => outputAction(item, 'target')),
-      ...plan.settings.map((item) => ({ type: 'setting', target: item.target, action: item.action,
-        fields: item.fields.map((field) => ({ path: field.pointer, action: field.action, ...(field.reason ? { reason: field.reason } : {}) })) })),
+      ...plan.resources.map((item) => outputAction(item, 'target')).filter(Boolean),
+      ...plan.settings.flatMap((item) => {
+        const fields = item.fields.filter((field) => field.action !== 'unchanged');
+        return fields.length ? [{ type: 'setting', target: item.target, action: item.action,
+          fields: fields.map((field) => ({ path: field.pointer, action: field.action, ...(field.reason ? { reason: field.reason } : {}) })) }] : [];
+      }),
       ...plan.stale.map((item) => ({ type: 'resource', target: item.target, action: 'stale', installed: item.localSnapshot !== null,
         state: item.state, pruneAvailable: item.overlaps.length === 0, ...(item.overlaps.length ? { overlaps: item.overlaps } : {}) })),
     ];

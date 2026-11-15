@@ -428,7 +428,7 @@ test('plan, apply and repeat apply through the real CLI subprocess; preserve unl
 
   const second = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(second.status, 0, second.stderr);
-  assert.equal(result(second).actions[0].action, 'unchanged');
+  assert.deepEqual(result(second).actions, []);
 });
 
 test('invalid manifest and unsupported declarations fail before changing the local installation', async (t) => {
@@ -554,7 +554,7 @@ test('reconciles independent resource files separately and conflicts only on the
   assert.equal(await fs.readFile(path.join(target, 'b.md'), 'utf8'), 'B second repository edit\n');
 });
 
-test('fully unchanged multi-file resources report no files field in status, plan, and apply', async (t) => {
+test('fully unchanged multi-file resources are omitted from actions in status, plan, and apply', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const source = path.join(repo, 'resources', 'skills', 'hello');
   await fs.writeFile(path.join(source, 'a.md'), 'A baseline\n');
@@ -563,9 +563,8 @@ test('fully unchanged multi-file resources report no files field in status, plan
   for (const command of ['status', 'plan', 'apply']) {
     const response = run([command, '--repo', repo, '--agent-dir', agentDir]);
     assert.equal(response.status, 0, `${command}: ${response.stderr}`);
-    const action = result(response).actions.find((item) => item.target === 'skills/hello');
-    assert.equal(action.action, 'unchanged');
-    assert.equal(Object.hasOwn(action, 'files'), false, `${command} omits files on a fully unchanged resource`);
+    assert.equal(result(response).actions.some((item) => item.target === 'skills/hello'), false,
+      `${command} omits a fully unchanged resource action`);
   }
 });
 
@@ -587,6 +586,30 @@ test('changed reporting names only the affected files of a multi-file resource',
     // does not appear.
     assert.deepEqual(action.files.map((file) => [file.path, file.action]).sort(),
       [['a.md', 'update'], ['b.md', 'delete']]);
+  }
+});
+
+test('status, plan, and apply omit unchanged settings fields and empty setting actions', async (t) => {
+  const expectedAction = { status: 'update', plan: 'update', apply: 'updated' };
+  for (const command of ['status', 'plan', 'apply']) {
+    const { repo, agentDir, manifestPath } = await settingsFixture(t, [
+      { path: '/theme', value: 'dark' },
+      { path: '/defaultProvider', value: 'github-copilot' },
+    ]);
+    const clean = run([command, '--repo', repo, '--agent-dir', agentDir]);
+    assert.equal(clean.status, 0, `${command}: ${clean.stderr}`);
+    assert.equal(result(clean).actions.some((item) => item.target === 'settings.json'), false,
+      `${command} omits a fully unchanged settings action`);
+
+    const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+    manifest.settings[0].fields[0].value = 'light';
+    await fs.writeFile(manifestPath, JSON.stringify(manifest));
+    const changed = run([command, '--repo', repo, '--agent-dir', agentDir]);
+    assert.equal(changed.status, 0, `${command}: ${changed.stderr}`);
+    const action = result(changed).actions.find((item) => item.target === 'settings.json');
+    assert.equal(action.action, expectedAction[command]);
+    assert.deepEqual(action.fields.map((field) => [field.path, field.action]), [['/theme', expectedAction[command]]],
+      `${command} reports only the changed settings field`);
   }
 });
 
@@ -680,7 +703,7 @@ test('merges explicitly managed settings fields and preserves unknown and machin
 
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(first.status, 1, 'pre-existing selected settings values are collisions');
-  assert.equal(result(first).actions[1].fields[0].action, 'collision');
+  assert.equal(result(first).actions.find((item) => item.target === 'settings.json').fields[0].action, 'collision');
   assert.equal(await fs.readFile(settingsPath, 'utf8').then(JSON.parse).then((value) => value.model.name), 'initial-model');
 
   // A selected field absent locally can be safely introduced while unrelated fields remain intact.
@@ -713,7 +736,7 @@ test('merges explicitly managed settings fields and preserves unknown and machin
   await fs.writeFile(settingsPath, JSON.stringify(partiallyMerged, null, 2));
   const conflict = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(conflict.status, 1);
-  assert.equal(result(conflict).actions[1].fields[0].action, 'conflict');
+  assert.equal(result(conflict).actions.find((item) => item.target === 'settings.json').fields[0].action, 'conflict');
   assert.equal(await fs.readFile(settingsPath, 'utf8').then(JSON.parse).then((value) => value.theme), 'local-theme');
   const backupDir = path.join(agentDir, '.pi-sync', 'backups');
   assert.ok((await fs.readdir(backupDir)).length > 0, 'prior settings are retained in recoverable backups');
@@ -1947,13 +1970,12 @@ test('apply installs new-type resources, is idempotent, and leaves unmanaged con
   const second = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(second.status, 0, second.stderr);
   assert.equal(result(second).ok, true);
-  assert.deepEqual(result(second).actions.map((item) => item.action).sort(), ['unchanged', 'unchanged', 'unchanged', 'unchanged', 'unchanged']);
+  assert.deepEqual(result(second).actions, []);
 
   // Unmanaged content under the same roots is invisible to plan/status and untouched by apply.
   const planned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(planned.status, 0, planned.stderr);
-  assert.deepEqual(result(planned).actions.map((item) => item.target).sort(),
-    ['agents/reviewer.md', 'extensions/github-copilot-usage', 'extensions/subagent/config.json', 'prompts/deploy.md', 'roles/moderator.md']);
+  assert.deepEqual(result(planned).actions, []);
   assert.equal(result(planned).conflicts.length, 0);
   assert.equal(result(planned).staleResources.length, 0);
   assert.equal(await fs.readFile(path.join(agentDir, 'prompts', 'unmanaged.md'), 'utf8'), '# Unmanaged prompt\n');
@@ -1968,7 +1990,7 @@ test('prompt, agent, and role resources reconcile with the same three-way semant
   }
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(first.status, 0, first.stderr);
-  for (const action of result(first).actions) assert.equal(action.action, 'unchanged');
+  assert.deepEqual(result(first).actions, []);
 
   // prompt: a local-only edit is preserved and reported as local-divergence.
   const prompt = path.join(agentDir, 'prompts', 'deploy.md');
@@ -2003,7 +2025,7 @@ test('multi-file extension directories are managed end to end with the same thre
   assert.equal(result(response).repositorySource, 'resources/extensions/github-copilot-usage');
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(first.status, 0, first.stderr);
-  assert.equal(result(first).actions[0].action, 'unchanged');
+  assert.deepEqual(result(first).actions, []);
 
   // Local-only change is preserved and reported with per-file detail.
   const targetIndex = path.join(agentDir, 'extensions', 'github-copilot-usage', 'index.ts');
@@ -2040,7 +2062,7 @@ test('a package update rewrite of a managed extension config file is reported, n
   assert.equal(response.status, 0, response.stderr);
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(first.status, 0, first.stderr);
-  assert.equal(result(first).actions[0].action, 'unchanged');
+  assert.deepEqual(result(first).actions, []);
   const config = path.join(agentDir, 'extensions', 'subagent', 'config.json');
 
   // A pinned package install rewrites the managed config file locally: local-only change.
@@ -3108,7 +3130,7 @@ test('a managed file target replaced by a directory conflicts at apply without c
   assert.equal(added.status, 0, added.stderr);
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(first.status, 0, first.stderr);
-  assert.equal(result(first).actions[0].action, 'unchanged');
+  assert.deepEqual(result(first).actions, []);
   const target = path.join(agentDir, 'prompts', 'deploy.md');
   const statePath = path.join(agentDir, '.pi-sync', 'state.json');
   const baselineState = await fs.readFile(statePath, 'utf8');
@@ -3162,7 +3184,7 @@ test('a managed extension directory replaced by a file conflicts at apply withou
   assert.equal(added.status, 0, added.stderr);
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(first.status, 0, first.stderr);
-  assert.equal(result(first).actions[0].action, 'unchanged');
+  assert.deepEqual(result(first).actions, []);
   const target = path.join(agentDir, 'extensions', 'tool');
   const statePath = path.join(agentDir, '.pi-sync', 'state.json');
   const baselineState = await fs.readFile(statePath, 'utf8');
@@ -3210,7 +3232,7 @@ test('file resource installs keep the repository file mode under a restrictive u
     assert.equal((await fs.stat(target)).mode & 0o777, repoMode);
     const repeated = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
     assert.equal(repeated.status, 0, repeated.stderr);
-    assert.equal(result(repeated).actions[0].action, 'unchanged');
+    assert.deepEqual(result(repeated).actions, []);
   } finally {
     process.umask(previousUmask);
   }
@@ -3222,7 +3244,7 @@ test('a failed file apply restores the previous file through rollback and keeps 
   assert.equal(added.status, 0, added.stderr);
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(first.status, 0, first.stderr);
-  assert.equal(result(first).actions[0].action, 'unchanged');
+  assert.deepEqual(result(first).actions, []);
   const target = path.join(agentDir, 'prompts', 'deploy.md');
   const original = await fs.readFile(target, 'utf8');
   const originalMode = (await fs.stat(target)).mode & 0o777;
@@ -3601,7 +3623,7 @@ test('a tracked file target replaced by a same-content same-mode directory repor
   await fs.chmod(target, baselineFile.mode);
   const recovered = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(recovered.status, 0, recovered.stderr);
-  assert.equal(result(recovered).actions[0].action, 'unchanged');
+  assert.deepEqual(result(recovered).actions, []);
 });
 
 test('a tracked extension directory replaced by a same-content same-mode file reports the kind mismatch without a repository change', async (t) => {
@@ -3646,7 +3668,7 @@ test('a tracked extension directory replaced by a same-content same-mode file re
   await fs.chmod(path.join(target, 'tool'), baselineFile.mode);
   const recovered = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(recovered.status, 0, recovered.stderr);
-  assert.equal(result(recovered).actions[0].action, 'unchanged');
+  assert.deepEqual(result(recovered).actions, []);
 });
 
 test('remove of a declared dependency without a lock pin reports the structured not-pinned error', async (t) => {

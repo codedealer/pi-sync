@@ -25,7 +25,7 @@ pi-sync status --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
 pi-sync plan --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
 ```
 
-Omit `--agent-dir` to use `PI_CODING_AGENT_DIR`, then the default `~/.pi/agent`. Omit `--repo` to use `PI_SYNC_REPO_DIR` (verbatim, no `~` expansion), then the default `~/.pi-sync/setup` — the same resolution the extension uses, with no current-working-directory fallback. `status` and `plan` are read-only. Review `actions`, `conflicts`, and `staleResources` in the JSON before taking an action. A stale resource remains installed; ordinary apply does not prune it. Per-file `files` entries in `actions` name only the files whose action is not `unchanged`; an `unchanged` resource carries no `files` field at all, which is the normal clean state.
+Omit `--agent-dir` to use `PI_CODING_AGENT_DIR`, then the default `~/.pi/agent`. Omit `--repo` to use `PI_SYNC_REPO_DIR` (verbatim, no `~` expansion), then the default `~/.pi-sync/setup` — the same resolution the extension uses, with no current-working-directory fallback. `status` and `plan` are read-only. Review `actions`, `conflicts`, and `staleResources` in the JSON before taking an action. A stale resource remains installed; ordinary apply does not prune it. `actions` includes only resources or settings targets with something to report: unchanged resource actions and fully unchanged settings targets are omitted, settings fields include only non-unchanged entries, and resource `files` include only non-unchanged files. Conflicts and stale resources remain explicit.
 
 ## Adding or editing user-level resources
 
