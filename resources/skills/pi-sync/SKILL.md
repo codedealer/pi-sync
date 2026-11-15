@@ -25,7 +25,7 @@ pi-sync status --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
 pi-sync plan --repo /path/to/private-setup --agent-dir "$PI_CODING_AGENT_DIR"
 ```
 
-Omit `--agent-dir` to use `PI_CODING_AGENT_DIR`, then the default `~/.pi/agent`. Omit `--repo` to use `PI_SYNC_REPO_DIR` (verbatim, no `~` expansion), then the default `~/.pi-sync/setup` — the same resolution the extension uses, with no current-working-directory fallback. `status` and `plan` are read-only. Review `actions`, `conflicts`, and `staleResources` in the JSON before taking an action. A stale resource remains installed; ordinary apply does not prune it.
+Omit `--agent-dir` to use `PI_CODING_AGENT_DIR`, then the default `~/.pi/agent`. Omit `--repo` to use `PI_SYNC_REPO_DIR` (verbatim, no `~` expansion), then the default `~/.pi-sync/setup` — the same resolution the extension uses, with no current-working-directory fallback. `status` and `plan` are read-only. Review `actions`, `conflicts`, and `staleResources` in the JSON before taking an action. A stale resource remains installed; ordinary apply does not prune it. Per-file `files` entries in `actions` name only the files whose action is not `unchanged`; an `unchanged` resource carries no `files` field at all, which is the normal clean state.
 
 ## Adding or editing user-level resources
 
@@ -168,7 +168,7 @@ Never infer permission to publish from a request to inspect, set up, apply, add,
 pi-sync push --repo /path/to/private-setup
 ```
 
-Review the listed paths and full patch with the user. The preview includes only `pi-sync.json` (including repository policy), `pi-sync.lock.json`, and files under resources explicitly registered by the manifest. Unrelated staged/unstaged files, ignored files, and unregistered resources are excluded. The publishing command prints the same managed commit preview to stderr immediately before committing/pushing. If the user explicitly asks to publish, run:
+Review the listed paths and full patch with the user. The preview includes only `pi-sync.json` (including repository policy), `pi-sync.lock.json`, and files under resources explicitly registered by the manifest. Unrelated staged/unstaged files, ignored files, and unregistered resources are excluded. The publishing command prints the same managed commit preview to stderr immediately before committing/pushing; read the full diff from the preview step, because the publish result no longer embeds the patch text. Its stdout JSON confirms the publication with a digest of that exact rendered preview (SHA-256 hex plus byte length) plus the published `changes` and `commit`. If the user explicitly asks to publish, run:
 
 ```sh
 pi-sync push --publish --repo /path/to/private-setup

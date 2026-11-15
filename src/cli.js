@@ -1272,8 +1272,13 @@ async function syncSettings(repo, agentDir, declarations, state, applyChanges) {
 }
 
 function outputAction(item, key) {
+  // The resource-level action summarizes the whole resource; the per-file list
+  // exists to name which files update, delete, conflict, or diverge. Fully
+  // unchanged resources therefore carry no files field at all, keeping clean
+  // reporting constant-size per resource.
+  const changedFiles = (item.files ?? []).filter((file) => file.action !== 'unchanged');
   return { type: item.type ?? 'setting', [key]: item[key], action: item.action, ...(item.reason ? { reason: item.reason } : {}),
-    ...(item.files?.length ? { files: item.files.map(({ path: file, action, reason }) => ({ path: file, action, ...(reason ? { reason } : {}) })) } : {}) };
+    ...(changedFiles.length ? { files: changedFiles.map(({ path: file, action, reason }) => ({ path: file, action, ...(reason ? { reason } : {}) })) } : {}) };
 }
 
 async function createBackup(agentDir, relative, source, isDirectory) {
@@ -2114,7 +2119,8 @@ async function managedPush(repo, declarations, publish = false) {
     if (!publish) return { apiVersion: 1, command: 'push', ok: true, exitCode: 0, repository: repo, branch, upstream,
       mode: 'preview', changes, patch, commitRequired, publicationAuthorized: false,
       note: 'Only these managed paths can be committed; rerun with --publish to authorize commit and push.' };
-    if (changes.length) process.stderr.write(`Pi Sync managed commit preview (before publication):\n${patch || '(no new working-tree diff; publishing already-committed managed changes)'}\n`);
+    const renderedPreview = patch || '(no new working-tree diff; publishing already-committed managed changes)';
+    if (changes.length) process.stderr.write(`Pi Sync managed commit preview (before publication):\n${renderedPreview}\n`);
 
     if (commitRequired) {
       const committedPaths = changes.filter((item) => item.status !== 'committed').map((item) => item.path);
@@ -2136,7 +2142,10 @@ async function managedPush(repo, declarations, publish = false) {
     });
     const commit = await requireGit(repo, ['rev-parse', 'HEAD'], 'Push succeeded but the local commit could not be identified');
     return { apiVersion: 1, command: 'push', ok: true, exitCode: 0, repository: repo, branch, upstream,
-      mode: 'published', changes, patch, commit, forcePush: false };
+      mode: 'published', changes,
+      patchSha256: crypto.createHash('sha256').update(renderedPreview, 'utf8').digest('hex'),
+      patchBytes: Buffer.byteLength(renderedPreview, 'utf8'),
+      commit, forcePush: false };
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -2393,8 +2402,7 @@ async function main() {
       ...(reporting ? (publishState ? { repository: publishState } : {}) : { repository: repo }),
       agentDirectory: agentDir, actions, conflicts, staleResources,
       ...(reporting ? { sync, summary } : {}),
-      packages: declarations.lock.packages.map((item) => ({ package: packageIdentity(item), pin: packageRevision(item), action: command === 'apply' ? 'pinned-install' : 'locked' })),
-      dependencyModel: 'exact top-level pins; Pi controls transitive dependencies, which Pi Sync does not lock or claim reproducible' };
+      packages: declarations.lock.packages.map((item) => ({ package: packageIdentity(item), pin: packageRevision(item), action: command === 'apply' ? 'pinned-install' : 'locked' })) };
 
     if (command === 'apply') {
       await fs.mkdir(agentDir, { recursive: true });
@@ -2441,7 +2449,11 @@ async function main() {
           }
         }
         if (declarations.lock.packages.length > 0 && conflicts.length === 0) {
-          output.packageInstalls = await installPinnedPackages(declarations.lock, { approved: true, previousPins: packagePins?.packages ?? {} });
+          // Each packages entry keeps its package/pin/action fields and merges
+          // in that package's install result; no separate packageInstalls
+          // array is emitted.
+          const installs = await installPinnedPackages(declarations.lock, { approved: true, previousPins: packagePins?.packages ?? {} });
+          output.packages = output.packages.map((entry) => ({ ...entry, ...(installs.find((item) => item.package === entry.package) ?? {}) }));
           packageInstallationCompleted = true;
           await savePackagePins(agentDir, declarations.lock);
         }

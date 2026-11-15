@@ -554,6 +554,72 @@ test('reconciles independent resource files separately and conflicts only on the
   assert.equal(await fs.readFile(path.join(target, 'b.md'), 'utf8'), 'B second repository edit\n');
 });
 
+test('fully unchanged multi-file resources report no files field in status, plan, and apply', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  const source = path.join(repo, 'resources', 'skills', 'hello');
+  await fs.writeFile(path.join(source, 'a.md'), 'A baseline\n');
+  await fs.writeFile(path.join(source, 'b.md'), 'B baseline\n');
+  assert.equal(run(['apply', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  for (const command of ['status', 'plan', 'apply']) {
+    const response = run([command, '--repo', repo, '--agent-dir', agentDir]);
+    assert.equal(response.status, 0, `${command}: ${response.stderr}`);
+    const action = result(response).actions.find((item) => item.target === 'skills/hello');
+    assert.equal(action.action, 'unchanged');
+    assert.equal(Object.hasOwn(action, 'files'), false, `${command} omits files on a fully unchanged resource`);
+  }
+});
+
+test('changed reporting names only the affected files of a multi-file resource', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  const source = path.join(repo, 'resources', 'skills', 'hello');
+  await fs.writeFile(path.join(source, 'a.md'), 'A baseline\n');
+  await fs.writeFile(path.join(source, 'b.md'), 'B baseline\n');
+  assert.equal(run(['apply', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  await fs.writeFile(path.join(source, 'a.md'), 'A repository edit\n');
+  await fs.rm(path.join(source, 'b.md'));
+  const expectedResourceAction = { status: 'update', plan: 'update', apply: 'updated' };
+  for (const command of ['status', 'plan', 'apply']) {
+    const response = run([command, '--repo', repo, '--agent-dir', agentDir]);
+    assert.equal(response.status, 0, `${command}: ${response.stderr}`);
+    const action = result(response).actions.find((item) => item.target === 'skills/hello');
+    assert.equal(action.action, expectedResourceAction[command]);
+    // Exactly the edited and deleted files; the unchanged SKILL.md sibling
+    // does not appear.
+    assert.deepEqual(action.files.map((file) => [file.path, file.action]).sort(),
+      [['a.md', 'update'], ['b.md', 'delete']]);
+  }
+});
+
+test('apply reports package install results in the single packages array without packageInstalls', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const lockPath = path.join(repo, 'pi-sync.lock.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.dependencies = [{ type: 'npm', name: 'fixture-package' }];
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  await fs.writeFile(lockPath, `${JSON.stringify({ schemaVersion: 1, packages: [
+    { type: 'npm', name: 'fixture-package', version: '1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' },
+  ] }, null, 2)}\n`);
+  const piEnv = await fakePi(t);
+  const applied = run(['apply', '--approve', '--repo', repo, '--agent-dir', agentDir], piEnv);
+  assert.equal(applied.status, 0, applied.stderr);
+  const output = result(applied);
+  assert.equal(Object.hasOwn(output, 'packageInstalls'), false, 'no separate packageInstalls array');
+  // The packages entry keeps its package/pin/action fields and carries the
+  // install result for that package.
+  assert.deepEqual(output.packages, [{ package: 'npm:fixture-package', pin: 'npm:fixture-package@1.0.0', action: 'installed' }]);
+});
+
+test('status, plan, and apply output no longer carry the dependencyModel boilerplate', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  for (const command of ['status', 'plan', 'apply']) {
+    const response = run([command, '--repo', repo, '--agent-dir', agentDir]);
+    assert.equal(response.status, 0, `${command}: ${response.stderr}`);
+    assert.equal(Object.hasOwn(result(response), 'dependencyModel'), false, `${command} omits dependencyModel`);
+    assert.doesNotMatch(response.stdout, /dependencyModel/);
+  }
+});
+
 test('initial replacement rename failures leave existing resource and settings intact', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const targetDir = path.join(agentDir, 'skills', 'hello');
@@ -1564,6 +1630,46 @@ test('push preview and publish include only explicit managed, non-ignored paths 
   assert.deepEqual(remoteFiles.stdout.trim().split(/\r?\n/).sort(), ['pi-sync.json', 'resources/skills/hello/SKILL.md']);
   assert.match(gitAt(repo, ['diff', '--cached', '--name-only']), /^unrelated\.txt$/);
   assert.equal(await fs.readFile(path.join(repo, 'unrelated.txt'), 'utf8'), 'unrelated content\n');
+});
+
+test('published push output omits the patch text and reports a digest of the stderr preview', async (t) => {
+  const { repo } = await pushFixture(t);
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Edited skill\n');
+  const published = run(['push', '--publish', '--repo', repo]);
+  assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
+  const output = result(published);
+  assert.equal(output.mode, 'published');
+  assert.equal(Object.hasOwn(output, 'patch'), false, 'publish JSON no longer embeds the patch text');
+  assert.match(output.patchSha256, /^[0-9a-f]{64}$/);
+  assert.ok(output.patchBytes > 0);
+  // The digest describes the exact patch text the stderr preview rendered:
+  // the text after the pre-publication preview header line.
+  const header = 'Pi Sync managed commit preview (before publication):\n';
+  const index = published.stderr.indexOf(header);
+  assert.ok(index >= 0, published.stderr);
+  const rendered = published.stderr.slice(index + header.length).replace(/\n$/, '');
+  assert.equal(output.patchSha256, createHash('sha256').update(rendered, 'utf8').digest('hex'));
+  assert.equal(output.patchBytes, Buffer.byteLength(rendered, 'utf8'));
+  // The stderr preview still carries the changed content; none of the patch
+  // content lines leak into the stdout JSON.
+  assert.match(published.stderr, /Edited skill/);
+  assert.doesNotMatch(published.stdout, /diff --git/);
+  assert.doesNotMatch(published.stdout, /Edited skill/);
+  assert.doesNotMatch(published.stdout, /# Hello/);
+});
+
+test('publish with no managed changes reports an empty result without patch or digest fields', async (t) => {
+  const { repo } = await pushFixture(t);
+  const published = run(['push', '--publish', '--repo', repo]);
+  assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
+  const output = result(published);
+  assert.equal(output.mode, 'published');
+  assert.deepEqual(output.changes, []);
+  assert.equal(output.commit, null);
+  assert.equal(Object.hasOwn(output, 'patch'), false);
+  assert.equal(Object.hasOwn(output, 'patchSha256'), false);
+  assert.equal(Object.hasOwn(output, 'patchBytes'), false);
+  assert.equal(published.stderr, '');
 });
 
 test('push stops for suspected credential content in a managed resource', async (t) => {

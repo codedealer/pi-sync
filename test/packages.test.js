@@ -54,7 +54,8 @@ test('apply uses exact npm pins; standalone pi update is unsupported and can mov
   assert.equal(approved.status, 0, approved.stderr || approved.stdout);
   assert.deepEqual((await entries(f)).map(({ tool, args }) => [tool, args]), [['pi', ['install', 'npm:widget@1.0.0']]]);
   assert.deepEqual(JSON.parse(await fs.readFile(f.piState, 'utf8')), { installed: ['npm:widget@1.0.0'] });
-  assert.match(output(approved).dependencyModel, /transitive/);
+  // The dependency model is documented in the README and skill, not repeated in output.
+  assert.equal(Object.hasOwn(output(approved), 'dependencyModel'), false);
 
   const updatedByPi = spawnSync(path.join(f.bin, 'pi'), ['update', '--extensions'], {
     encoding: 'utf8', env: { ...process.env, FAKE_LOG: f.log, FAKE_PI_STATE: f.piState },
