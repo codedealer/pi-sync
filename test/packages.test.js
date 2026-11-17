@@ -5,9 +5,21 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { shellFor } from '../src/packages.js';
 
 const cli = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const sha = '0123456789abcdef0123456789abcdef01234567';
+
+test('shellFor uses a shell only for bare Windows command names', () => {
+  assert.equal(shellFor('pi', 'win32'), true);
+  assert.equal(shellFor('npm', 'win32'), true);
+  assert.equal(shellFor('git', 'win32'), true);
+  assert.equal(shellFor('C:/Program Files/nodejs/node.exe', 'win32'), false);
+  assert.equal(shellFor('C:\\Users\\me\\.local\\bin\\gh.exe', 'win32'), false);
+  assert.equal(shellFor('pi', 'linux'), false);
+  assert.equal(shellFor('/usr/bin/node', 'linux'), false);
+  assert.equal(shellFor('pi', 'darwin'), false);
+});
 
 async function setup(t, { dependencies, packages, policy } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-packages-'));

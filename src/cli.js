@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { inspectRequiredTools, validateRequiredTools } from './prerequisites.js';
-import { discoverUpdates, installPinnedPackages, lockWithUpdates, rollbackPinnedPackages, validatePackageState, writeLockfile } from './packages.js';
+import { discoverUpdates, installPinnedPackages, shellFor, lockWithUpdates, rollbackPinnedPackages, validatePackageState, writeLockfile } from './packages.js';
 
 const MANIFEST_FILE = 'pi-sync.json';
 const LOCK_FILE = 'pi-sync.lock.json';
@@ -1637,11 +1637,12 @@ function approvalPrompt(item) {
   });
 }
 
-// The shell option mirrors packages.js: Windows .cmd shims (npm, pi) are not
-// directly executable by Node's spawn.
+// Bare command names on Windows may resolve to .cmd shims (pi, npm) that
+// Node's spawn cannot exec directly; shellFor decides when a shell is needed
+// while keeping path-qualified binaries (e.g. process.execPath) direct.
 function runCommand(executable, args, env = process.env) {
   return new Promise((resolve) => {
-    const child = spawn(executable, args, { env, stdio: ['ignore', 'pipe', 'pipe'], shell: process.platform === 'win32' });
+    const child = spawn(executable, args, { env, stdio: ['ignore', 'pipe', 'pipe'], shell: shellFor(executable) });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
@@ -1729,8 +1730,9 @@ async function runPiSync(command, repo, agentDir, approve = false) {
   const result = await runCommand(process.execPath, [fileURLToPath(import.meta.url), command, '--repo', repo, '--agent-dir', agentDir, ...(approve ? ['--approve'] : [])]);
   let output;
   try { output = JSON.parse(result.stdout); } catch {
+    const detail = (result.stderr || '').trim() || (result.stdout || '').trim() || (result.error ? result.error.message : '');
     return { status: result.status ?? 1, output: { apiVersion: 1, command, ok: false, errorCode: 'CLI_FAILED',
-      error: 'Pi Sync command returned no valid JSON output', exitCode: OPERATION_ERROR } };
+      error: `Pi Sync command returned no valid JSON output${detail ? `: ${detail.slice(0, 2000)}` : ''}`, exitCode: OPERATION_ERROR } };
   }
   return { status: result.status ?? output.exitCode ?? 1, output };
 }

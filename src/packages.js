@@ -9,10 +9,18 @@ function exactKeys(value, keys) {
 }
 
 // Windows PATH executables such as `pi` and `npm` are .cmd shims that Node's
-// spawn cannot exec directly (ENOENT); the shell resolves them via PATHEXT.
+// spawn cannot exec directly (ENOENT); a shell resolves them via PATHEXT.
+// Path-qualified executables are real binaries and must be executed directly:
+// with shell enabled Node does not quote the command line, so a path with a
+// space (C:\Program Files\nodejs\node.exe) would break under cmd.
+export function shellFor(executable, platform = process.platform) {
+  if (platform !== 'win32') return false;
+  return !/[\\/]/.test(executable) && !/\.[A-Za-z0-9]+$/.test(executable);
+}
+
 function run(executable, args) {
   return new Promise((resolve) => {
-    const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: process.platform === 'win32' });
+    const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: shellFor(executable) });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });

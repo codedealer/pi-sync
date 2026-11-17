@@ -3987,6 +3987,30 @@ test('bootstrap rerun resumes from an existing valid setup repository and applie
   assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'resume-skill', 'SKILL.md'), 'utf8'), '# Resumed\n', 'the new repository resource is applied on resume');
 });
 
+test('bootstrap surfaces the inner plan failure instead of hiding it', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-plan-error-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+  const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+
+  // The inner plan child is the first to load local state; a corrupted state
+  // file must surface as the nested plan result, not a bare CLI failure.
+  const stateFile = path.join(agentDir, '.pi-sync', 'state.json');
+  await fs.writeFile(stateFile, `${JSON.stringify({ schemaVersion: 2 }, null, 2)}\n`);
+  const failed = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(failed.status, 1, `${failed.stderr}\n${failed.stdout}`);
+  const output = result(failed);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'APPLY_CONFLICT');
+  assert.equal(output.plan.ok, false);
+  assert.match(output.plan.error, /Local Pi Sync state is invalid/);
+});
+
 test('bootstrap still collides when the destination exists but is not a setup repository', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-invalid-dest-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
