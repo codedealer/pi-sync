@@ -8,9 +8,11 @@ function exactKeys(value, keys) {
   return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join(',') === [...keys].sort().join(',');
 }
 
+// Windows PATH executables such as `pi` and `npm` are .cmd shims that Node's
+// spawn cannot exec directly (ENOENT); the shell resolves them via PATHEXT.
 function run(executable, args) {
   return new Promise((resolve) => {
-    const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: process.platform === 'win32' });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
@@ -145,20 +147,24 @@ export async function rollbackPinnedPackages(items, previousPins = {}) {
 
 export async function installPinnedPackages(lock, { approved = false, prompt = null, approvalRequired = () => true, previousPins = {} } = {}) {
   const results = [];
-  const attempted = [];
+  const installed = [];
   for (const item of lock.packages) {
     if (approvalRequired(item) && !approved && prompt && !await prompt(item)) throw Object.assign(new Error(`First-time installation approval was not granted for ${packageKey(item)}`), { errorCode: 'APPROVAL_REQUIRED' });
     if (approvalRequired(item) && !approved && !prompt) throw Object.assign(new Error(`First-time installation requires explicit approval for ${packageKey(item)}; rerun with --approve`), { errorCode: 'APPROVAL_REQUIRED' });
-    attempted.push(item);
     const result = await run('pi', ['install', spec(item)]);
     if (result.status !== 0) {
-      const rollbackErrors = await rollbackPinnedPackages(attempted, previousPins);
-      const error = Object.assign(new Error(`Pi package installation failed for ${packageKey(item)} at recorded pin ${spec(item)}${result.stderr ? `: ${result.stderr.trim()}` : ''}${rollbackErrors.length ? '; package rollback was incomplete' : '; previously installed package pins were restored'}`), {
-        errorCode: 'PACKAGE_INSTALL_FAILED', packagesRolledBack: true,
+      // Only packages installed in this run can be rolled back; when Pi could
+      // not even start, nothing was installed and no rollback is attempted.
+      const rollbackErrors = await rollbackPinnedPackages(installed, previousPins);
+      const failure = result.error ? `Pi could not be started (${result.error.message})` : result.stderr.trim() ? `Pi reported: ${result.stderr.trim()}` : `Pi exited ${result.status}`;
+      const rollbackNote = rollbackErrors.length ? '; package rollback was incomplete' : installed.length ? '; previously installed package pins were restored' : '';
+      const error = Object.assign(new Error(`Pi package installation failed for ${packageKey(item)} at recorded pin ${spec(item)}: ${failure}${rollbackNote}`), {
+        errorCode: 'PACKAGE_INSTALL_FAILED',
       });
       if (rollbackErrors.length) error.details = { message: error.message, rollbackErrors };
       throw error;
     }
+    installed.push(item);
     results.push({ package: packageKey(item), pin: spec(item), action: 'installed' });
   }
   return results;

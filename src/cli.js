@@ -1637,9 +1637,11 @@ function approvalPrompt(item) {
   });
 }
 
+// The shell option mirrors packages.js: Windows .cmd shims (npm, pi) are not
+// directly executable by Node's spawn.
 function runCommand(executable, args, env = process.env) {
   return new Promise((resolve) => {
-    const child = spawn(executable, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(executable, args, { env, stdio: ['ignore', 'pipe', 'pipe'], shell: process.platform === 'win32' });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
@@ -1723,8 +1725,8 @@ async function installBundledResources(repo) {
   return { ok: true, added: true, addedResources: toAdd.map(({ type, source, target }) => ({ type, source, target })) };
 }
 
-async function runPiSync(command, repo, agentDir) {
-  const result = await runCommand(process.execPath, [fileURLToPath(import.meta.url), command, '--repo', repo, '--agent-dir', agentDir]);
+async function runPiSync(command, repo, agentDir, approve = false) {
+  const result = await runCommand(process.execPath, [fileURLToPath(import.meta.url), command, '--repo', repo, '--agent-dir', agentDir, ...(approve ? ['--approve'] : [])]);
   let output;
   try { output = JSON.parse(result.stdout); } catch {
     return { status: result.status ?? 1, output: { apiVersion: 1, command, ok: false, errorCode: 'CLI_FAILED',
@@ -1733,64 +1735,82 @@ async function runPiSync(command, repo, agentDir) {
   return { status: result.status ?? output.exitCode ?? 1, output };
 }
 
-async function bootstrap(repoUrl, repoDir, agentDir, binDir) {
+async function bootstrap(repoUrl, repoDir, agentDir, binDir, approve = false) {
   const remote = validateBootstrapUrl(repoUrl);
   const destination = path.resolve(repoDir);
-  const existing = await fs.lstat(destination).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
-  if (existing) return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination already exists; choose an empty path', { repository: destination });
-  const access = await runCommand('git', ['ls-remote', remote.value]);
-  let authenticationMethod = 'git';
   const bin = path.resolve(binDir ?? path.join(os.homedir(), '.local', 'bin'));
-  if (access.status !== 0) {
-    let ghAuthenticated = false;
-    let ghAvailable = false;
-    let prerequisiteResult = null;
-    if (remote.githubSlug) {
-      prerequisiteResult = await inspectRequiredTools(['gh'], { binDir: bin });
-      ghAvailable = prerequisiteResult.ok;
-      if (!ghAvailable) return bootstrapResponse(false, 'PREREQUISITE_INSTALL_REQUIRED',
-        'GitHub CLI is required for this authentication handoff but could not be installed automatically.', {
-          repository: destination, prerequisites: prerequisiteResult.tools,
-          missingPrerequisites: prerequisiteResult.tools.filter((tool) => tool.status === 'failed'),
+  const existing = await fs.lstat(destination).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
+  let setup = null;
+  let checkout = null;
+  let stagingRoot = null;
+  let authenticationMethod = 'git';
+  if (existing) {
+    if (!existing.isDirectory()) {
+      return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination exists and is not a directory; choose an empty path', { repository: destination });
+    }
+    // A previous bootstrap (or the user) may already have placed the setup
+    // repository at the destination. Resume from it instead of requiring an
+    // empty path so a failed first run is rerun with the same command.
+    setup = await validateRepository(destination).catch(() => null);
+    if (!setup) {
+      return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination already exists but is not a valid Pi Sync setup repository; choose an empty path', { repository: destination });
+    }
+    checkout = destination;
+    authenticationMethod = null;
+  } else {
+    const access = await runCommand('git', ['ls-remote', remote.value]);
+    if (access.status !== 0) {
+      let ghAuthenticated = false;
+      let ghAvailable = false;
+      let prerequisiteResult = null;
+      if (remote.githubSlug) {
+        prerequisiteResult = await inspectRequiredTools(['gh'], { binDir: bin });
+        ghAvailable = prerequisiteResult.ok;
+        if (!ghAvailable) return bootstrapResponse(false, 'PREREQUISITE_INSTALL_REQUIRED',
+          'GitHub CLI is required for this authentication handoff but could not be installed automatically.', {
+            repository: destination, prerequisites: prerequisiteResult.tools,
+            missingPrerequisites: prerequisiteResult.tools.filter((tool) => tool.status === 'failed'),
+          });
+        const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` };
+        const status = await runCommand('gh', ['auth', 'status', '--hostname', 'github.com'], env);
+        ghAuthenticated = status.status === 0;
+      }
+      if (!ghAuthenticated) {
+        const resumeArgs = ['bootstrap', '--repo-url', remote.value, '--repo-dir', destination, '--agent-dir', path.resolve(agentDir), '--bin-dir', bin, ...(approve ? ['--approve'] : [])];
+        const ghTool = prerequisiteResult?.tools.find((tool) => tool.name === 'gh');
+        const ghExecutable = ghTool?.installPath ?? 'gh';
+        const authArgs = [ghExecutable, 'auth', 'login', '--hostname', 'github.com'];
+        return bootstrapResponse(false, 'AUTH_REQUIRED', 'Private setup repository access is unavailable. Complete the GitHub authentication handoff, then resume bootstrap.', {
+          repository: destination,
+          prerequisites: prerequisiteResult?.tools ?? [],
+          authentication: {
+            required: true,
+            cliAvailable: ghAvailable,
+            command: authArgs.join(' '),
+            commandArgs: authArgs,
+            credentialHandling: 'Pi Sync does not request, print, or store credentials',
+          },
+          resumeArgs,
         });
-      const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` };
-      const status = await runCommand('gh', ['auth', 'status', '--hostname', 'github.com'], env);
-      ghAuthenticated = status.status === 0;
+      }
+      authenticationMethod = 'github-cli';
     }
-    if (!ghAuthenticated) {
-      const resumeArgs = ['bootstrap', '--repo-url', remote.value, '--repo-dir', destination, '--agent-dir', path.resolve(agentDir), '--bin-dir', bin];
-      const ghTool = prerequisiteResult?.tools.find((tool) => tool.name === 'gh');
-      const ghExecutable = ghTool?.installPath ?? 'gh';
-      const authArgs = [ghExecutable, 'auth', 'login', '--hostname', 'github.com'];
-      return bootstrapResponse(false, 'AUTH_REQUIRED', 'Private setup repository access is unavailable. Complete the GitHub authentication handoff, then resume bootstrap.', {
-        repository: destination,
-        prerequisites: prerequisiteResult?.tools ?? [],
-        authentication: {
-          required: true,
-          cliAvailable: ghAvailable,
-          command: authArgs.join(' '),
-          commandArgs: authArgs,
-          credentialHandling: 'Pi Sync does not request, print, or store credentials',
-        },
-        resumeArgs,
-      });
-    }
-    authenticationMethod = 'github-cli';
-  }
-  const parent = path.dirname(destination);
-  await fs.mkdir(parent, { recursive: true });
-  const stagingRoot = await fs.mkdtemp(path.join(parent, '.pi-sync-bootstrap-'));
-  const checkout = path.join(stagingRoot, 'checkout');
-  try {
+    const parent = path.dirname(destination);
+    await fs.mkdir(parent, { recursive: true });
+    stagingRoot = await fs.mkdtemp(path.join(parent, '.pi-sync-bootstrap-'));
+    checkout = path.join(stagingRoot, 'checkout');
     const cloneEnv = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` };
     const clone = authenticationMethod === 'git'
       ? await runCommand('git', ['clone', '--quiet', '--', remote.value, checkout], cloneEnv)
       : await runCommand('gh', ['repo', 'clone', remote.githubSlug, checkout], cloneEnv);
-    if (clone.status !== 0) return bootstrapResponse(false, 'FETCH_FAILED',
-      authenticationMethod === 'git' ? 'GitHub access was detected but cloning the setup repository failed' : 'GitHub CLI authentication was detected but it could not fetch the setup repository',
-      { repository: destination });
-
-    const setup = await validateRepository(checkout);
+    if (clone.status !== 0) {
+      return bootstrapResponse(false, 'FETCH_FAILED',
+        authenticationMethod === 'git' ? 'GitHub access was detected but cloning the setup repository failed' : 'GitHub CLI authentication was detected but it could not fetch the setup repository',
+        { repository: destination });
+    }
+    setup = await validateRepository(checkout);
+  }
+  try {
     const prerequisites = await inspectRequiredTools(setup.requiredTools, { binDir: bin });
     if (!prerequisites.ok) return bootstrapResponse(false, 'PREREQUISITE_INSTALL_REQUIRED',
       'One or more required setup tools are unavailable. Resolve the listed handoff before applying the setup.', {
@@ -1814,11 +1834,13 @@ async function bootstrap(repoUrl, repoDir, agentDir, binDir) {
         ], plan: plan.output,
       });
     }
-    if (await fs.lstat(destination).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error))) {
-      return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination appeared during bootstrap; no content was replaced', { repository: destination });
+    if (checkout !== destination) {
+      if (await fs.lstat(destination).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error))) {
+        return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination appeared during bootstrap; no content was replaced', { repository: destination });
+      }
+      await fs.rename(checkout, destination);
     }
-    await fs.rename(checkout, destination);
-    const applied = await runPiSync('apply', destination, path.resolve(agentDir));
+    const applied = await runPiSync('apply', destination, path.resolve(agentDir), approve);
     return bootstrapResponse(applied.status === 0 && applied.output.ok, applied.status === 0 && applied.output.ok ? undefined : 'APPLY_CONFLICT',
       applied.status === 0 && applied.output.ok ? undefined : 'Bootstrap apply did not complete cleanly; inspect the structured apply result and resume after resolving it', {
         repository: destination, authenticationMethod, prerequisites: prerequisites.tools,
@@ -1829,7 +1851,7 @@ async function bootstrap(repoUrl, repoDir, agentDir, binDir) {
         apply: applied.output,
       });
   } finally {
-    await fs.rm(stagingRoot, { recursive: true, force: true }).catch(() => {});
+    if (stagingRoot) await fs.rm(stagingRoot, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -2192,7 +2214,7 @@ async function main() {
   if (options.confirm && command !== 'prune') throw new Error('--confirm is only supported by prune');
   if (options.list && command !== 'register') throw new Error('--list is only supported by register');
   if (options.all && command !== 'register') throw new Error('--all is only supported by register');
-  if (options.approve && !['apply', 'update'].includes(command)) throw new Error('--approve is only supported by apply or update');
+  if (options.approve && !['apply', 'update', 'bootstrap'].includes(command)) throw new Error('--approve is only supported by apply, update, or bootstrap');
   if (options.applyUpdate && !['update', 'sync'].includes(command)) throw new Error('--apply is only supported by update or sync');
   if (options.pushUpdate && command !== 'update') throw new Error('--push is only supported by update');
   if (options.pushUpdate && !options.applyUpdate) throw new Error('update --push requires --apply so package updates are explicitly approved');
@@ -2222,7 +2244,7 @@ async function main() {
   if (command === 'bootstrap') {
     if (!options.repoUrl) throw new Error('bootstrap requires --repo-url');
     if (process.argv.includes('--repo')) throw new Error('bootstrap uses --repo-dir, not --repo');
-    const output = await bootstrap(options.repoUrl, options.repoDir, options.agentDir, options.binDir);
+    const output = await bootstrap(options.repoUrl, options.repoDir, options.agentDir, options.binDir, options.approve);
     console.log(JSON.stringify(output, null, 2));
     if (!output.ok) process.exitCode = output.exitCode;
     return;

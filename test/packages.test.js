@@ -161,9 +161,11 @@ test('failed multi-package apply rolls back package installs, resources, setting
   assert.equal(await fs.readFile(statePath, 'utf8'), stateBefore);
   assert.equal(await fs.readFile(packageStatePath, 'utf8'), packageStateBefore);
   assert.deepEqual(JSON.parse(await fs.readFile(f.piState, 'utf8')), { installed: ['npm:first@0.9.0'] });
-  assert.deepEqual((await entries(f)).filter(({ tool, args }) => tool === 'pi').slice(-4).map(({ args }) => args), [
+  // The failed second package was never installed, so only the first is
+  // rolled back to its previous pin.
+  assert.deepEqual((await entries(f)).filter(({ tool, args }) => tool === 'pi').slice(-3).map(({ args }) => args), [
     ['install', 'npm:first@1.0.0'], ['install', 'npm:second@1.0.0'],
-    ['uninstall', 'npm:second@1.0.0'], ['install', 'npm:first@0.9.0'],
+    ['install', 'npm:first@0.9.0'],
   ]);
 });
 
@@ -187,9 +189,11 @@ test('failed multi-package update restores existing Pi pins and leaves the lockf
   assert.equal(await fs.readFile(lockPath, 'utf8'), lockBefore);
   assert.equal(await fs.readFile(packageStatePath, 'utf8'), packageStateBefore);
   assert.deepEqual(JSON.parse(await fs.readFile(f.piState, 'utf8')).installed.sort(), ['npm:first@0.9.0', 'npm:second@0.9.0']);
-  assert.deepEqual((await entries(f)).filter(({ tool, args }) => tool === 'pi').slice(-4).map(({ args }) => args), [
+  // The failed second package kept its old pin, so only the first is
+  // rolled back.
+  assert.deepEqual((await entries(f)).filter(({ tool, args }) => tool === 'pi').slice(-3).map(({ args }) => args), [
     ['install', 'npm:first@1.0.0'], ['install', 'npm:second@1.0.0'],
-    ['install', 'npm:second@0.9.0'], ['install', 'npm:first@0.9.0'],
+    ['install', 'npm:first@0.9.0'],
   ]);
 });
 
@@ -267,5 +271,18 @@ test('repository policy cannot lower seven days and malformed pins are rejected 
   const response = run(f, ['apply', '--approve']);
   assert.equal(response.status, 2);
   assert.match(output(response).error, /at least seven days/);
+  assert.deepEqual(await entries(f), []);
+});
+test('apply reports an unstartable Pi executable without claiming a package rollback', async (t) => {
+  const f = await setup(t, { dependencies: npmDependency, packages: npmPin });
+  const emptyBin = path.join(f.root, 'empty-bin');
+  await fs.mkdir(emptyBin);
+  const response = run(f, ['apply', '--approve'], { PATH: emptyBin });
+  assert.equal(response.status, 1, response.stderr || response.stdout);
+  assert.equal(output(response).errorCode, 'PACKAGE_INSTALL_FAILED');
+  assert.match(output(response).error, /Pi package installation failed for npm:widget at recorded pin npm:widget@1\.0\.0/);
+  if (process.platform === 'win32') assert.match(output(response).error, /Pi reported/);
+  else assert.match(output(response).error, /could not be started/);
+  assert.doesNotMatch(output(response).error, /rollback/);
   assert.deepEqual(await entries(f), []);
 });

@@ -327,7 +327,7 @@ test('public npm package allowlist includes the CLI, skill, and extension but ex
   assert.ok(files.includes('resources/extensions/pi-sync/index.ts'));
   assert.ok(files.includes('resources/extensions/pi-sync/status.js'));
   assert.ok(!files.some((item) => /^(?:test(?:\/|$)|test-support(?:\/|$)|\.scratch(?:\/|$)|resources\/skills\/(?!pi-sync\/))/.test(item)));
-  assert.deepEqual(files.sort(), ['README.md', 'package.json', 'resources/extensions/pi-sync/README.md', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/status.js', 'resources/skills/pi-sync/SKILL.md', 'src/cli.js', 'src/packages.js', 'src/prerequisites.js']);
+  assert.deepEqual(files.sort(), ['LICENSE', 'README.md', 'package.json', 'resources/extensions/pi-sync/README.md', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/status.js', 'resources/skills/pi-sync/SKILL.md', 'src/cli.js', 'src/packages.js', 'src/prerequisites.js']);
 });
 
 test('supported agent commands share a versioned JSON response contract', async (t) => {
@@ -3908,4 +3908,103 @@ test('bootstrap still rejects --repo in favor of --repo-dir', () => {
   const output = result(response);
   assert.equal(output.ok, false);
   assert.equal(output.error, 'bootstrap uses --repo-dir, not --repo');
+});
+test('bootstrap --approve resumes a first run blocked on first-install approval from the existing setup repository', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-approve-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = path.join(root, 'remote-fixture');
+  await fs.mkdir(path.join(sourceRepo, 'resources', 'skills', 'hello'), { recursive: true });
+  await fs.writeFile(path.join(sourceRepo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Private fixture\n');
+  await fs.writeFile(path.join(sourceRepo, 'pi-sync.json'), JSON.stringify({
+    schemaVersion: 1,
+    resources: [{ type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' }],
+    dependencies: [{ type: 'npm', name: 'widget' }],
+  }));
+  await fs.writeFile(path.join(sourceRepo, 'pi-sync.lock.json'), JSON.stringify({
+    schemaVersion: 1,
+    packages: [{ type: 'npm', name: 'widget', version: '1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' }],
+  }));
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const fakePiTools = await fakePi(t);
+  const toolBins = fakeTools.PATH.slice(0, fakeTools.PATH.indexOf(path.delimiter));
+  const piBins = fakePiTools.PATH.slice(0, fakePiTools.PATH.indexOf(path.delimiter));
+  const env = {
+    FAKE_SETUP_REPO: fakeTools.FAKE_SETUP_REPO,
+    PATH: `${toolBins}${path.delimiter}${piBins}${path.delimiter}${process.env.PATH}`,
+    FAKE_GIT_ACCESS: 'yes',
+    PI_CALL_LOG: path.join(root, 'pi-calls.log'),
+  };
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+
+  const first = run(args, env);
+  assert.equal(first.status, 1, `${first.stderr}\n${first.stdout}`);
+  const firstOutput = result(first);
+  assert.equal(firstOutput.ok, false);
+  assert.equal(firstOutput.errorCode, 'APPLY_CONFLICT');
+  assert.equal(firstOutput.apply.errorCode, 'APPROVAL_REQUIRED');
+  assert.deepEqual(await piCalls(env.PI_CALL_LOG), []);
+
+  const resumed = run([...args, '--approve'], env);
+  assert.equal(resumed.status, 0, `${resumed.stderr}\n${resumed.stdout}`);
+  const resumedOutput = result(resumed);
+  assert.equal(resumedOutput.ok, true);
+  assert.equal(resumedOutput.authenticationMethod, null, 'a resumed bootstrap does not refetch the repository');
+  assert.deepEqual(await piCalls(env.PI_CALL_LOG), ['install npm:widget@1.0.0']);
+  assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'hello', 'SKILL.md'), 'utf8'), '# Private fixture\n');
+});
+
+test('bootstrap rerun resumes from an existing valid setup repository and applies repository changes', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-resume-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+
+  const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+  const bundledSkill = new URL('../resources/skills/pi-sync/SKILL.md', import.meta.url);
+  assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'pi-sync', 'SKILL.md'), 'utf8'), await fs.readFile(bundledSkill, 'utf8'));
+
+  // The destination now holds a valid setup repository; a new resource added
+  // to it must be picked up by the resumed apply.
+  const newSkillSource = path.join(setupDir, 'resources', 'skills', 'resume-skill');
+  await fs.mkdir(newSkillSource, { recursive: true });
+  await fs.writeFile(path.join(newSkillSource, 'SKILL.md'), '# Resumed\n');
+  const manifestPath = path.join(setupDir, 'pi-sync.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.resources.push({ type: 'skill', source: 'resources/skills/resume-skill', target: 'skills/resume-skill' });
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const resumed = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(resumed.status, 0, `${resumed.stderr}\n${resumed.stdout}`);
+  const output = result(resumed);
+  assert.equal(output.ok, true);
+  assert.equal(output.authenticationMethod, null, 'a resumed bootstrap does not refetch the repository');
+  assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'resume-skill', 'SKILL.md'), 'utf8'), '# Resumed\n', 'the new repository resource is applied on resume');
+});
+
+test('bootstrap still collides when the destination exists but is not a setup repository', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-invalid-dest-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+  await fs.mkdir(setupDir, { recursive: true });
+  await fs.writeFile(path.join(setupDir, 'notes.txt'), 'not a setup repository\n');
+
+  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir], {
+    ...fakeTools, FAKE_GIT_ACCESS: 'yes',
+  });
+  assert.equal(response.status, 1, `${response.stderr}\n${response.stdout}`);
+  const output = result(response);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'REPOSITORY_PATH_COLLISION');
+  assert.match(output.error, /not a valid Pi Sync setup repository/);
+  await assert.rejects(fs.access(agentDir));
+  assert.equal(await fs.readFile(path.join(setupDir, 'notes.txt'), 'utf8'), 'not a setup repository\n');
 });
