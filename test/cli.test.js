@@ -332,6 +332,7 @@ test('public npm package allowlist includes the CLI, skill, and extension but ex
   assert.ok(files.includes('dist/cli/process.js'));
   assert.ok(files.includes('dist/cli/reconciliation.js'));
   assert.ok(files.includes('dist/cli/commands/inspect.js'));
+  assert.ok(files.includes('dist/cli/commands/pi-update.js'));
   assert.ok(files.includes('dist/cli/local-state.js'));
   assert.ok(files.includes('dist/cli/resource-operations.js'));
   assert.ok(files.includes('dist/cli/commands/apply.js'));
@@ -343,6 +344,7 @@ test('public npm package allowlist includes the CLI, skill, and extension but ex
   assert.ok(files.includes('dist/cli/commands/update.js'));
   assert.ok(files.includes('src/cli/arguments.ts'));
   assert.ok(files.includes('src/cli/commands/inspect.ts'));
+  assert.ok(files.includes('src/cli/commands/pi-update.ts'));
   assert.ok(files.includes('src/cli/local-state.ts'));
   assert.ok(files.includes('src/cli/process.ts'));
   assert.ok(files.includes('src/cli/resource-operations.ts'));
@@ -356,7 +358,7 @@ test('public npm package allowlist includes the CLI, skill, and extension but ex
   assert.ok(files.includes('resources/extensions/pi-sync/index.ts'));
   assert.ok(files.includes('resources/extensions/pi-sync/status.js'));
   assert.ok(!files.some((item) => /^(?:test(?:\/|$)|test-support(?:\/|$)|\.scratch(?:\/|$)|resources\/skills\/(?!pi-sync\/))/.test(item)));
-  assert.deepEqual(files.sort(), ['LICENSE', 'README.md', 'dist/cli.js', 'dist/cli/arguments.js', 'dist/cli/commands/apply.js', 'dist/cli/commands/bootstrap.js', 'dist/cli/commands/inspect.js', 'dist/cli/commands/prune.js', 'dist/cli/commands/push.js', 'dist/cli/commands/resources.js', 'dist/cli/commands/sync.js', 'dist/cli/commands/update.js', 'dist/cli/local-state.js', 'dist/cli/manifest.js', 'dist/cli/process.js', 'dist/cli/reconciliation.js', 'dist/cli/resource-operations.js', 'dist/packages.js', 'dist/prerequisites.js', 'package.json', 'resources/extensions/pi-sync/README.md', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/status.js', 'resources/skills/pi-sync/SKILL.md', 'src/cli.ts', 'src/cli/README.md', 'src/cli/arguments.ts', 'src/cli/commands/apply.ts', 'src/cli/commands/bootstrap.ts', 'src/cli/commands/inspect.ts', 'src/cli/commands/prune.ts', 'src/cli/commands/push.ts', 'src/cli/commands/resources.ts', 'src/cli/commands/sync.ts', 'src/cli/commands/update.ts', 'src/cli/local-state.ts', 'src/cli/manifest.ts', 'src/cli/process.ts', 'src/cli/reconciliation.ts', 'src/cli/resource-operations.ts', 'src/packages.ts', 'src/prerequisites.ts']);
+  assert.deepEqual(files.sort(), ['LICENSE', 'README.md', 'dist/cli.js', 'dist/cli/arguments.js', 'dist/cli/commands/apply.js', 'dist/cli/commands/bootstrap.js', 'dist/cli/commands/inspect.js', 'dist/cli/commands/pi-update.js', 'dist/cli/commands/prune.js', 'dist/cli/commands/push.js', 'dist/cli/commands/resources.js', 'dist/cli/commands/sync.js', 'dist/cli/commands/update.js', 'dist/cli/local-state.js', 'dist/cli/manifest.js', 'dist/cli/process.js', 'dist/cli/reconciliation.js', 'dist/cli/resource-operations.js', 'dist/packages.js', 'dist/prerequisites.js', 'package.json', 'resources/extensions/pi-sync/README.md', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/status.js', 'resources/skills/pi-sync/SKILL.md', 'src/cli.ts', 'src/cli/README.md', 'src/cli/arguments.ts', 'src/cli/commands/apply.ts', 'src/cli/commands/bootstrap.ts', 'src/cli/commands/inspect.ts', 'src/cli/commands/pi-update.ts', 'src/cli/commands/prune.ts', 'src/cli/commands/push.ts', 'src/cli/commands/resources.ts', 'src/cli/commands/sync.ts', 'src/cli/commands/update.ts', 'src/cli/local-state.ts', 'src/cli/manifest.ts', 'src/cli/process.ts', 'src/cli/reconciliation.ts', 'src/cli/resource-operations.ts', 'src/packages.ts', 'src/prerequisites.ts']);
 });
 
 test('supported agent commands share a versioned JSON response contract', async (t) => {

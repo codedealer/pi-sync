@@ -30,6 +30,7 @@ uncaught failures to the JSON error envelope and exit status.
 | `bootstrap` | `commands/bootstrap.ts` | `../prerequisites.ts`, `manifest.ts`, `reconciliation.ts`, `resource-operations.ts`, `process.ts` | `BootstrapInput`, `BootstrapOutput`, `BootstrapErrorCode` |
 | `update` | `commands/update.ts` | `../packages.ts`, `manifest.ts`, `local-state.ts`, `commands/push.ts` (command→command seam) | `UpdateInput`, `UpdateOutput`, `PackageUpdate` |
 | `push` | `commands/push.ts` | `manifest.ts`, `reconciliation.ts`, `resource-operations.ts`, `process.ts` | `PushInput`, `PushOutput`, `PushChange` |
+| `pi-update` | `commands/pi-update.ts` | `local-state.ts`, `process.ts` | `PiUpdateInput`, `PiCandidate` |
 | `--version` | `../cli.ts` (dispatched directly) | — | `VersionRequest` |
 
 Notes on the seams:
@@ -51,7 +52,7 @@ Notes on the seams:
 (`PI_SYNC_REPO_DIR`, `PI_CODING_AGENT_DIR`), validates command-specific option
 combinations, and returns the discriminated `CommandRequest` union
 (`StatusPlanRequest`, `ApplyRequest`, `PruneRequest`, `AddRequest`,
-`RemoveRequest`, `RegisterRequest`, `PushRequest`, `UpdateRequest`,
+`RemoveRequest`, `RegisterRequest`, `PushRequest`, `UpdateRequest`, `PiUpdateRequest`,
 `SyncRequest`, `BootstrapRequest`, `VersionRequest`). It never touches the
 repository or Git.
 

@@ -85,6 +85,12 @@ export interface UpdateRequest extends RequestBase {
   approve: boolean;
 }
 
+export interface PiUpdateRequest extends RequestBase {
+  command: 'pi-update';
+  repo: string;
+  apply: boolean;
+}
+
 export interface SyncRequest extends RequestBase {
   command: 'sync';
   repo: string;
@@ -106,7 +112,7 @@ export interface VersionRequest {
 
 export type CommandRequest =
   | StatusPlanRequest | ApplyRequest | PruneRequest | AddRequest | RemoveRequest | RegisterRequest
-  | PushRequest | UpdateRequest | SyncRequest | BootstrapRequest | VersionRequest;
+  | PushRequest | UpdateRequest | PiUpdateRequest | SyncRequest | BootstrapRequest | VersionRequest;
 
 // Parsed option bag, mirroring the entry point's former `options` object.
 interface Options {
@@ -172,7 +178,7 @@ function buildRequest(command: string, options: Options, argv: string[]): Comman
   if (options.list && command !== 'register') throw new Error('--list is only supported by register');
   if (options.all && command !== 'register') throw new Error('--all is only supported by register');
   if (options.approve && !['apply', 'update', 'bootstrap'].includes(command)) throw new Error('--approve is only supported by apply, update, or bootstrap');
-  if (options.applyUpdate && !['update', 'sync'].includes(command)) throw new Error('--apply is only supported by update or sync');
+  if (options.applyUpdate && !['update', 'sync', 'pi-update'].includes(command)) throw new Error('--apply is only supported by update, sync, or pi-update');
   if (options.pushUpdate && command !== 'update') throw new Error('--push is only supported by update');
   if (options.pushUpdate && !options.applyUpdate) throw new Error('update --push requires --apply so package updates are explicitly approved');
   if (options.publish && command !== 'push') throw new Error('--publish is only supported by push');
@@ -235,6 +241,8 @@ function buildRequest(command: string, options: Options, argv: string[]): Comman
       return { command, repo: options.repo, agentDir: options.agentDir, publish: options.publish };
     case 'update':
       return { command, repo: options.repo, agentDir: options.agentDir, apply: options.applyUpdate, push: options.pushUpdate, approve: options.approve };
+    case 'pi-update':
+      return { command, repo: options.repo, agentDir: options.agentDir, apply: options.applyUpdate };
     case 'sync':
       return { command, repo: options.repo, agentDir: options.agentDir, apply: options.applyUpdate };
     case 'bootstrap':
@@ -254,8 +262,8 @@ export function parseCommandRequest(argv: string[]): CommandRequest {
     if (argv.length > 1) throw new Error('--version does not accept additional arguments');
     return { command: 'version' };
   }
-  if (!['status', 'plan', 'apply', 'add', 'remove', 'register', 'prune', 'bootstrap', 'update', 'push', 'sync'].includes(command as any)) {
-    throw new Error('Usage: pi-sync --version | pi-sync <status|plan|apply|add|remove|register|prune|update|push|bootstrap|sync> [--repo PATH] [--repo-url URL --repo-dir PATH] [--agent-dir PATH] [--type skill|extension|prompt|agent|role|dependency --target VALUE | --source VALUE] [--list] [--all] [--confirm] [--approve] [--apply] [--push] [--publish] [--uninstall]');
+  if (!['status', 'plan', 'apply', 'add', 'remove', 'register', 'prune', 'bootstrap', 'update', 'push', 'pi-update', 'sync'].includes(command as any)) {
+    throw new Error('Usage: pi-sync --version | pi-sync <status|plan|apply|add|remove|register|prune|update|pi-update|push|bootstrap|sync> [--repo PATH] [--repo-url URL --repo-dir PATH] [--agent-dir PATH] [--type skill|extension|prompt|agent|role|dependency --target VALUE | --source VALUE] [--list] [--all] [--confirm] [--approve] [--apply] [--push] [--publish] [--uninstall]');
   }
-  return buildRequest(command as 'status' | 'plan' | 'apply' | 'add' | 'remove' | 'register' | 'prune' | 'bootstrap' | 'update' | 'push' | 'sync', parseOptions(argv.slice(1)), argv);
+  return buildRequest(command as 'status' | 'plan' | 'apply' | 'add' | 'remove' | 'register' | 'prune' | 'bootstrap' | 'update' | 'pi-update' | 'push' | 'sync', parseOptions(argv.slice(1)), argv);
 }

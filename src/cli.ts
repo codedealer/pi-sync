@@ -12,6 +12,7 @@ import { runPrune } from './cli/commands/prune.js';
 import { runSync } from './cli/commands/sync.js';
 import { runBootstrap } from './cli/commands/bootstrap.js';
 import { runUpdate } from './cli/commands/update.js';
+import { runPiUpdate } from './cli/commands/pi-update.js';
 import { runPush } from './cli/commands/push.js';
 
 const VALIDATION_ERROR = 2;
@@ -49,6 +50,11 @@ async function main() {
   // environment or default repository.
   const repo = path.resolve(request.repo);
   const agentDir = path.resolve(request.agentDir);
+  if (command === 'pi-update') {
+    const output = await runPiUpdate({ repo, agentDir, apply: request.apply });
+    console.log(JSON.stringify(output, null, 2));
+    return;
+  }
   if (command === 'status' || command === 'plan') {
     const declarations = await validateRepository(repo);
     // status and plan are read-only inspection: they take no lock and never
@@ -125,4 +131,4 @@ async function main() {
   }
 }
 
-main().catch((error: any) => fail(error, ['PACKAGE_INSTALL_FAILED', 'APPROVAL_REQUIRED', 'UPDATE_TRANSACTION_FAILED', 'PUSH_BLOCKED', 'SYNC_BLOCKED'].includes(error?.errorCode) || /update stopped closed|^(Another Pi Sync|A stale Pi Sync)/.test(error.message) ? OPERATION_ERROR : VALIDATION_ERROR));
+main().catch((error: any) => fail(error, ['PACKAGE_INSTALL_FAILED', 'APPROVAL_REQUIRED', 'UPDATE_TRANSACTION_FAILED', 'PUSH_BLOCKED', 'SYNC_BLOCKED', 'PI_UPDATE_FAILED'].includes(error?.errorCode) || /update (?:discovery )?stopped closed|^(Another Pi Sync|A stale Pi Sync)/.test(error.message) ? OPERATION_ERROR : VALIDATION_ERROR));

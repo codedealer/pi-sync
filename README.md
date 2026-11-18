@@ -117,6 +117,8 @@ pi-sync remove --type dependency --source github:OWNER/REPOSITORY [--repo PATH] 
 pi-sync update [--repo PATH]
 pi-sync update --apply [--repo PATH] [--agent-dir PATH] [--approve]
 pi-sync update --apply --push [--repo PATH] [--agent-dir PATH] [--approve]
+pi-sync pi-update [--repo PATH] [--agent-dir PATH]
+pi-sync pi-update --apply [--repo PATH] [--agent-dir PATH]
 pi-sync push [--repo PATH]
 pi-sync push --publish [--repo PATH]
 pi-sync sync [--repo PATH] [--agent-dir PATH]
@@ -135,6 +137,8 @@ The target defaults to `PI_CODING_AGENT_DIR`, then `~/.pi/agent`. Each command e
 `register --list` is read-only discovery: it reports every resource present directly under a type root that the manifest does not declare — each with its inferred `type`, `source`, and derived `target` — and changes nothing. `register --all` registers the same candidate set in a single atomic manifest write and is all-or-nothing: it secret-scans every candidate and collision-checks against the existing declarations and the candidate set itself, and any failure registers nothing; with zero candidates it is a no-op (`action: up-to-date`, manifest unchanged). `--type` is required for single registration and optional for `--list`/`--all`, where it narrows the roots scanned. Exactly one of the three modes may be selected — a single `--source`, `--list`, or `--all`; combining `--source` with `--list` or `--all`, or `--list` with `--all`, is a validation error (exit `2`).
 
 The repository-first flow for authoring new content is: create the content under `resources/<type-root>/` in the setup repository, review `pi-sync register --list`, declare with `pi-sync register --type T --source resources/...` (or `pi-sync register --all` for the whole set), reconcile with `pi-sync apply`, and publish only with an explicit `pi-sync push`.
+
+`pi-sync pi-update` is a separate host-runtime workflow: it previews the newest stable official Pi npm version that has passed the repository's minimum release age, and installs it only with `--apply`. Apply rechecks eligibility and is supported only when the local Pi executable and installation root verify as an official global npm or pnpm installation. It uses the exact candidate with lifecycle scripts disabled, verifies the result, and attempts to restore the previous local version if verification or installation fails. It never writes the setup manifest or lockfile, pushes, or updates declared dependencies; `pi-sync update` remains the separate dependency workflow. Unsupported installation methods stop with an actionable error.
 
 Do not use the external `pi update --extensions` command for managed packages. It is unsupported for managed packages and may move them beyond their recorded pins; Pi Sync cannot intercept or prevent it. Use `pi-sync update` (and `--apply` after reviewing the plan) to update managed packages under the repository's release-age policy.
 
