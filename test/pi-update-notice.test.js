@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const sourcePath = fileURLToPath(new URL('../resources/extensions/pi-sync/index.ts', import.meta.url));
 const statusPath = fileURLToPath(new URL('../resources/extensions/pi-sync/status.js', import.meta.url));
+const processPath = fileURLToPath(new URL('../resources/extensions/pi-sync/process.js', import.meta.url));
 const envKeys = [
   'PI_SYNC_REPO_DIR', 'PI_SYNC_BIN', 'PI_TEST_AGENT_DIR', 'PI_TEST_CLI_LOG', 'PI_TEST_UPDATE_RESULT',
   'PI_TEST_UPDATE_DELAY_MS', 'PI_TEST_UPDATE_DONE', 'PI_TEST_UPDATE_EXIT', 'PI_SKIP_VERSION_CHECK', 'PATH',
@@ -44,6 +45,7 @@ async function fixture(t, { manifest = true, result, delayMs = 0, exitFailure = 
   await fs.writeFile(path.join(moduleDir, 'package.json'), '{"type":"module","exports":"./index.js"}\n');
   await fs.writeFile(path.join(moduleDir, 'index.js'), 'export function getAgentDir() { return process.env.PI_TEST_AGENT_DIR; }\n');
   await fs.copyFile(statusPath, path.join(extensionDir, 'status.js'));
+  await fs.copyFile(processPath, path.join(extensionDir, 'process.js'));
   const transpiled = ts.transpileModule(await fs.readFile(sourcePath, 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
     reportDiagnostics: true,

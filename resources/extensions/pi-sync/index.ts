@@ -67,6 +67,7 @@
  */
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
+import { shellFor } from "./process.js";
 import { existsSync, readFileSync, statSync, watch, type FSWatcher } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -280,6 +281,7 @@ export default function (pi: ExtensionAPI) {
       const { stdout } = await execFileAsync(cliBinary(), ["pi-update", "--repo", repoDir(), "--agent-dir", agentDir()], {
         timeout: PI_UPDATE_TIMEOUT_MS,
         maxBuffer: 1024 * 1024,
+        shell: shellFor(cliBinary()),
       });
       const result = JSON.parse(stdout) as {
         apiVersion?: unknown;
@@ -341,7 +343,7 @@ export default function (pi: ExtensionAPI) {
         execFile(
           cliBinary(),
           ["status", "--repo", repoDir(), "--agent-dir", agentDir()],
-          { timeout: SYNC_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 },
+          { timeout: SYNC_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024, shell: shellFor(cliBinary()) },
           (error, out) => {
             if (error !== null && (error.killed === true || error.signal !== undefined)) {
               reject(error); // timeout or kill: no usable output
@@ -448,7 +450,7 @@ export default function (pi: ExtensionAPI) {
         execFile(
           "git",
           ["fetch", "--quiet"],
-          { cwd: repoDir(), timeout: FETCH_TIMEOUT_MS },
+          { cwd: repoDir(), timeout: FETCH_TIMEOUT_MS, shell: shellFor("git") },
           () => resolve(), // success and failure alike: the refresh below runs either way
         );
       });
@@ -469,6 +471,7 @@ export default function (pi: ExtensionAPI) {
       const { stdout } = await execFileAsync(cliBinary(), ["sync", "--apply", "--repo", repoDir(), "--agent-dir", agentDir()], {
         timeout: SYNC_TIMEOUT_MS,
         maxBuffer: 4 * 1024 * 1024,
+        shell: shellFor(cliBinary()),
       });
       const result = JSON.parse(stdout) as SyncResult;
       if (result.ok && result.synced?.length) {
