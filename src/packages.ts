@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 
 export const MINIMUM_RELEASE_AGE_DAYS = 7;
-function exactKeys(value, keys) {
+function exactKeys(value: any, keys: any) {
   return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join(',') === [...keys].sort().join(',');
 }
 
@@ -13,24 +13,24 @@ function exactKeys(value, keys) {
 // Path-qualified executables are real binaries and must be executed directly:
 // with shell enabled Node does not quote the command line, so a path with a
 // space (C:\Program Files\nodejs\node.exe) would break under cmd.
-export function shellFor(executable, platform = process.platform) {
+export function shellFor(executable: any, platform: any = process.platform) {
   if (platform !== 'win32') return false;
   return !/[\\/]/.test(executable) && !/\.[A-Za-z0-9]+$/.test(executable);
 }
 
-function run(executable, args) {
-  return new Promise((resolve) => {
+function run(executable: any, args: any) {
+  return new Promise<any>((resolve) => {
     const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: shellFor(executable) });
     let stdout = '';
     let stderr = '';
-    child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
-    child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
-    child.on('error', (error) => resolve({ status: null, stdout, stderr, error }));
-    child.on('close', (status) => resolve({ status, stdout, stderr, error: null }));
+    child.stdout.setEncoding('utf8').on('data', (chunk: any) => { stdout += chunk; });
+    child.stderr.setEncoding('utf8').on('data', (chunk: any) => { stderr += chunk; });
+    child.on('error', (error: any) => resolve({ status: null, stdout, stderr, error }));
+    child.on('close', (status: any) => resolve({ status, stdout, stderr, error: null }));
   });
 }
 
-export function validatePackageState(manifest, lock, { allowMissingPins = false } = {}) {
+export function validatePackageState(manifest: any, lock: any, { allowMissingPins = false }: any = {}) {
   if (!Array.isArray(manifest.dependencies) || !exactKeys(lock, ['schemaVersion', 'packages']) || lock.schemaVersion !== 1 || !Array.isArray(lock.packages)) {
     throw new Error('Manifest dependencies and lockfile packages must be arrays (lockfile schemaVersion must be 1)');
   }
@@ -55,20 +55,23 @@ export function validatePackageState(manifest, lock, { allowMissingPins = false 
     }
     locked.add(key);
   }
-  const missing = [...keys].filter((key) => !locked.has(key));
+  const missing = [...keys].filter((key: any) => !locked.has(key));
   if (missing.length && !allowMissingPins) throw new Error(`lockfile is missing exact pins for declared dependencies: ${missing.join(', ')}`);
   return { declared: keys, locked };
 }
 
-function validDate(value) { return typeof value === 'string' && Number.isFinite(Date.parse(value)); }
-function packageKey(item) { return item.type === 'npm' ? `npm:${item.name}` : `github:${item.repository}`; }
-function spec(item) { return item.type === 'npm' ? `npm:${item.name}@${item.version}` : `github:${item.repository}#${item.commit}`; }
-function parseJson(output, source) {
+function validDate(value: any) { return typeof value === 'string' && Number.isFinite(Date.parse(value)); }
+// The single `npm:`/`github:` identity mapping for all package operations;
+// cli/manifest re-exports it so the CLI command modules share this helper
+// instead of a duplicated implementation.
+export function packageIdentity(item: { type: string; name?: string; repository?: string }): string { return item.type === 'npm' ? `npm:${item.name}` : `github:${item.repository}`; }
+function spec(item: any) { return item.type === 'npm' ? `npm:${item.name}@${item.version}` : `github:${item.repository}#${item.commit}`; }
+function parseJson(output: any, source: any) {
   try { return JSON.parse(output); } catch { throw new Error(`${source} metadata was not valid JSON; update stopped closed`); }
 }
-function compareVersions(a, b) {
-  const left = a.split('+', 1)[0].split(/[.-]/).map((part) => /^\d+$/.test(part) ? Number(part) : part);
-  const right = b.split('+', 1)[0].split(/[.-]/).map((part) => /^\d+$/.test(part) ? Number(part) : part);
+function compareVersions(a: any, b: any) {
+  const left = a.split('+', 1)[0].split(/[.-]/).map((part: any) => /^\d+$/.test(part) ? Number(part) : part);
+  const right = b.split('+', 1)[0].split(/[.-]/).map((part: any) => /^\d+$/.test(part) ? Number(part) : part);
   for (let i = 0; i < Math.max(left.length, right.length); i++) {
     if (left[i] === undefined) return right[i] === undefined ? 0 : (typeof right[i] === 'number' ? -1 : 1);
     if (right[i] === undefined) return typeof left[i] === 'number' ? 1 : -1;
@@ -79,7 +82,7 @@ function compareVersions(a, b) {
   return 0;
 }
 
-async function npmCandidate(dep, current, eligible) {
+async function npmCandidate(dep: any, current: any, eligible: any) {
   const [versionsResult, timesResult] = await Promise.all([
     run('npm', ['view', dep.name, 'versions', '--json']), run('npm', ['view', dep.name, 'time', '--json']),
   ]);
@@ -88,61 +91,61 @@ async function npmCandidate(dep, current, eligible) {
   const times = parseJson(timesResult.stdout, `npm ${dep.name} timestamps`);
   if (typeof versions === 'string') versions = [versions];
   if (!Array.isArray(versions) || !times || typeof times !== 'object') throw new Error(`npm release metadata for ${dep.name} is incomplete; update stopped closed`);
-  if (versions.some((version) => typeof version !== 'string' || !validDate(times[version]))) throw new Error(`npm release timestamps for ${dep.name} are incomplete; update stopped closed`);
-  const candidates = versions.filter((version) => eligible(times[version])).sort(compareVersions);
+  if (versions.some((version: any) => typeof version !== 'string' || !validDate(times[version]))) throw new Error(`npm release timestamps for ${dep.name} are incomplete; update stopped closed`);
+  const candidates = versions.filter((version: any) => eligible(times[version])).sort(compareVersions);
   const selected = candidates.at(-1);
   if (!selected || (current && compareVersions(selected, current.version) <= 0)) return null;
   return { type: 'npm', name: dep.name, version: selected, releasedAt: new Date(Date.parse(times[selected])).toISOString() };
 }
 
-async function githubCandidate(dep, current, eligible) {
+async function githubCandidate(dep: any, current: any, eligible: any) {
   const releasesResult = await run('gh', ['api', `repos/${dep.repository}/releases?per_page=100`]);
   if (releasesResult.status !== 0) throw new Error(`Could not retrieve GitHub release metadata for ${dep.repository}; update stopped closed`);
   const releases = parseJson(releasesResult.stdout, `GitHub ${dep.repository} releases`);
   if (!Array.isArray(releases) || releases.length >= 100) throw new Error(`GitHub release metadata for ${dep.repository} is incomplete or possibly truncated; update stopped closed`);
-  const publishedReleases = releases.filter((release) => release && !release.draft && !release.prerelease);
-  if (publishedReleases.some((release) => typeof release.tag_name !== 'string' || release.tag_name.length === 0 || !validDate(release.published_at))) {
+  const publishedReleases = releases.filter((release: any) => release && !release.draft && !release.prerelease);
+  if (publishedReleases.some((release: any) => typeof release.tag_name !== 'string' || release.tag_name.length === 0 || !validDate(release.published_at))) {
     throw new Error(`GitHub release tags or timestamps for ${dep.repository} are incomplete; update stopped closed`);
   }
-  const candidates = publishedReleases.filter((release) => eligible(release.published_at))
-    .sort((a, b) => Date.parse(b.published_at) - Date.parse(a.published_at));
+  const candidates = publishedReleases.filter((release: any) => eligible(release.published_at))
+    .sort((a: any, b: any) => Date.parse(b.published_at) - Date.parse(a.published_at));
   const release = candidates[0];
   if (!release || (current && (release.tag_name === current.tag || (validDate(current.releasedAt) && Date.parse(release.published_at) <= Date.parse(current.releasedAt))))) return null;
   const remote = `https://github.com/${dep.repository}.git`;
   const refs = await run('git', ['ls-remote', remote, `refs/tags/${release.tag_name}`, `refs/tags/${release.tag_name}^{}`]);
   if (refs.status !== 0) throw new Error(`Could not resolve immutable GitHub tag ${release.tag_name} for ${dep.repository}; update stopped closed`);
-  const refLines = refs.stdout.trim().split(/\r?\n/).map((line) => /^([0-9a-f]{40})\s+(\S+)$/.exec(line)).filter(Boolean);
+  const refLines = refs.stdout.trim().split(/\r?\n/).map((line: any) => /^([0-9a-f]{40})\s+(\S+)$/.exec(line)).filter(Boolean);
   const peeledRef = `refs/tags/${release.tag_name}^{}`;
   const exactRef = `refs/tags/${release.tag_name}`;
-  const commit = refLines.find(([, , ref]) => ref === peeledRef)?.[1] ?? refLines.find(([, , ref]) => ref === exactRef)?.[1];
+  const commit = refLines.find(([, , ref]: any) => ref === peeledRef)?.[1] ?? refLines.find(([, , ref]: any) => ref === exactRef)?.[1];
   if (!commit) throw new Error(`GitHub tag ${release.tag_name} for ${dep.repository} has no resolvable commit SHA; update stopped closed`);
   return { type: 'github', repository: dep.repository, commit, tag: release.tag_name, releasedAt: new Date(Date.parse(release.published_at)).toISOString() };
 }
 
-export async function discoverUpdates(manifest, lock, now = Date.now()) {
+export async function discoverUpdates(manifest: any, lock: any, now: any = Date.now()) {
   const minimumReleaseAgeDays = manifest.policy?.minimumReleaseAgeDays ?? MINIMUM_RELEASE_AGE_DAYS;
   if (!Number.isInteger(minimumReleaseAgeDays) || minimumReleaseAgeDays < MINIMUM_RELEASE_AGE_DAYS) throw new Error('Repository policy minimumReleaseAgeDays must be an integer of at least seven days');
   const ageCutoffMs = minimumReleaseAgeDays * 24 * 60 * 60 * 1000;
-  const eligible = (date) => validDate(date) && now - Date.parse(date) >= ageCutoffMs;
-  const current = new Map(lock.packages.map((item) => [packageKey(item), item]));
+  const eligible = (date: any) => validDate(date) && now - Date.parse(date) >= ageCutoffMs;
+  const current = new Map<string, any>(lock.packages.map((item: any) => [packageIdentity(item), item] as [string, any]));
   const updates = [];
   for (const dep of manifest.dependencies) {
-    const old = current.get(packageKey(dep));
+    const old = current.get(packageIdentity(dep));
     const next = dep.type === 'npm' ? await npmCandidate(dep, old, eligible) : await githubCandidate(dep, old, eligible);
-    if (next && (!old || packageKey(next) === packageKey(old))) updates.push({ from: old ?? null, to: next, installSpec: spec(next) });
+    if (next && (!old || packageIdentity(next) === packageIdentity(old))) updates.push({ from: old ?? null, to: next, installSpec: spec(next) });
   }
   return updates;
 }
 
-function previousSpec(key, revision) {
+function previousSpec(key: any, revision: any) {
   if (key.startsWith('npm:')) return `npm:${key.slice(4)}@${revision}`;
   return `github:${key.slice(7)}#${revision}`;
 }
 
-export async function rollbackPinnedPackages(items, previousPins = {}) {
+export async function rollbackPinnedPackages(items: any, previousPins: any = {}) {
   const errors = [];
   for (const item of [...items].reverse()) {
-    const key = packageKey(item);
+    const key = packageIdentity(item);
     const previous = previousPins[key];
     const result = previous === undefined
       ? await run('pi', ['uninstall', spec(item)])
@@ -153,12 +156,12 @@ export async function rollbackPinnedPackages(items, previousPins = {}) {
   return errors;
 }
 
-export async function installPinnedPackages(lock, { approved = false, prompt = null, approvalRequired = () => true, previousPins = {} } = {}) {
+export async function installPinnedPackages(lock: any, { approved = false, prompt = null, approvalRequired = () => true, previousPins = {} }: any = {}) {
   const results = [];
   const installed = [];
   for (const item of lock.packages) {
-    if (approvalRequired(item) && !approved && prompt && !await prompt(item)) throw Object.assign(new Error(`First-time installation approval was not granted for ${packageKey(item)}`), { errorCode: 'APPROVAL_REQUIRED' });
-    if (approvalRequired(item) && !approved && !prompt) throw Object.assign(new Error(`First-time installation requires explicit approval for ${packageKey(item)}; rerun with --approve`), { errorCode: 'APPROVAL_REQUIRED' });
+    if (approvalRequired(item) && !approved && prompt && !await prompt(item)) throw Object.assign(new Error(`First-time installation approval was not granted for ${packageIdentity(item)}`), { errorCode: 'APPROVAL_REQUIRED' });
+    if (approvalRequired(item) && !approved && !prompt) throw Object.assign(new Error(`First-time installation requires explicit approval for ${packageIdentity(item)}; rerun with --approve`), { errorCode: 'APPROVAL_REQUIRED' });
     const result = await run('pi', ['install', spec(item)]);
     if (result.status !== 0) {
       // Only packages installed in this run can be rolled back; when Pi could
@@ -166,19 +169,19 @@ export async function installPinnedPackages(lock, { approved = false, prompt = n
       const rollbackErrors = await rollbackPinnedPackages(installed, previousPins);
       const failure = result.error ? `Pi could not be started (${result.error.message})` : result.stderr.trim() ? `Pi reported: ${result.stderr.trim()}` : `Pi exited ${result.status}`;
       const rollbackNote = rollbackErrors.length ? '; package rollback was incomplete' : installed.length ? '; previously installed package pins were restored' : '';
-      const error = Object.assign(new Error(`Pi package installation failed for ${packageKey(item)} at recorded pin ${spec(item)}: ${failure}${rollbackNote}`), {
+      const error: any = Object.assign(new Error(`Pi package installation failed for ${packageIdentity(item)} at recorded pin ${spec(item)}: ${failure}${rollbackNote}`), {
         errorCode: 'PACKAGE_INSTALL_FAILED',
       });
       if (rollbackErrors.length) error.details = { message: error.message, rollbackErrors };
       throw error;
     }
     installed.push(item);
-    results.push({ package: packageKey(item), pin: spec(item), action: 'installed' });
+    results.push({ package: packageIdentity(item), pin: spec(item), action: 'installed' });
   }
   return results;
 }
 
-export async function writeLockfile(repo, lock) {
+export async function writeLockfile(repo: any, lock: any) {
   const file = path.join(repo, 'pi-sync.lock.json');
   const temporary = `${file}.${process.pid}.${crypto.randomBytes(5).toString('hex')}.tmp`;
   try {
@@ -190,13 +193,46 @@ export async function writeLockfile(repo, lock) {
   }
 }
 
-export function lockWithUpdates(lock, updates) {
+export function lockWithUpdates(lock: any, updates: any) {
   const next = structuredClone(lock);
   for (const update of updates) {
-    const key = packageKey(update.to);
-    const index = next.packages.findIndex((item) => packageKey(item) === key);
+    const key = packageIdentity(update.to);
+    const index = next.packages.findIndex((item: any) => packageIdentity(item) === key);
     if (index < 0) next.packages.push(update.to); else next.packages[index] = update.to;
   }
-  next.packages.sort((a, b) => packageKey(a).localeCompare(packageKey(b)));
+  next.packages.sort((a: any, b: any) => packageIdentity(a).localeCompare(packageIdentity(b)));
   return next;
+}
+// First-time installation approval: a locked package with no local pin
+// bookkeeping entry is new for this agent directory and requires explicit
+// approval (--approve) or an interactive prompt before it is installed.
+// Shared by the apply and update workflows.
+export async function obtainFirstInstallApproval(lock: any, pins: any, explicitlyApproved: any) {
+  for (const item of lock.packages) {
+    if (Object.hasOwn(pins.packages, packageIdentity(item))) continue;
+    if (explicitlyApproved) continue;
+    const prompt = approvalPrompt(item);
+    if (!prompt) {
+      const error: any = new Error(`First-time installation requires explicit approval for ${packageIdentity(item)}; rerun with --approve`);
+      error.errorCode = 'APPROVAL_REQUIRED';
+      throw error;
+    }
+    if (!await prompt) {
+      const error: any = new Error(`First-time installation approval was not granted for ${packageIdentity(item)}`);
+      error.errorCode = 'APPROVAL_REQUIRED';
+      throw error;
+    }
+  }
+}
+
+function approvalPrompt(item: any) {
+  if (!process.stdin.isTTY) return null;
+  return new Promise<any>((resolve) => {
+    process.stdout.write(`Install pinned Pi package ${spec(item)}? [y/N] `);
+    process.stdin.resume();
+    process.stdin.once('data', (data: any) => {
+      process.stdin.pause();
+      resolve(/^y(?:es)?\s*$/i.test(String(data).trim()));
+    });
+  });
 }

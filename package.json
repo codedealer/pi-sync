@@ -4,23 +4,29 @@
   "description": "A manifest-driven CLI for applying explicitly managed Pi resources.",
   "type": "module",
   "bin": {
-    "pi-sync": "src/cli.js"
+    "pi-sync": "dist/cli.js"
   },
   "files": [
     "README.md",
-    "src/cli.js",
-    "src/packages.js",
-    "src/prerequisites.js",
+    "dist",
+    "src",
     "resources/skills/pi-sync/SKILL.md",
     "resources/extensions/pi-sync/index.ts",
     "resources/extensions/pi-sync/status.js",
     "resources/extensions/pi-sync/README.md"
   ],
   "scripts": {
-    "test": "node --test"
+    "build": "tsc --project tsconfig.json",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "prepack": "npm run build",
+    "test": "npm run build && node --test"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
+  }
 }

@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { deflateRawSync } from 'node:zlib';
-import { createPrerequisiteInspector, githubCliReleaseAsset } from '../src/prerequisites.js';
+import { createPrerequisiteInspector, githubCliReleaseAsset } from '../dist/prerequisites.js';
 
 function zipFixture(filePath, contents) {
   const name = Buffer.from(filePath);

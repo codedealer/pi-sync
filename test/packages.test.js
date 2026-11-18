@@ -5,9 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { shellFor } from '../src/packages.js';
+import { shellFor } from '../dist/packages.js';
 
-const cli = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+const cli = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
 const sha = '0123456789abcdef0123456789abcdef01234567';
 
 test('shellFor uses a shell only for bare Windows command names', () => {

@@ -9,7 +9,7 @@ const GH_VERSION = '2.74.2';
 const MAX_ARCHIVE_BYTES = 100 * 1024 * 1024;
 const INSTALL_CATALOG = Object.freeze({ gh: 'github-cli' });
 
-export function validateRequiredTools(requiredTools = []) {
+export function validateRequiredTools(requiredTools: any = []) {
   if (!Array.isArray(requiredTools)) throw new Error('Manifest requiredTools must be an array');
   const seen = new Set();
   for (const [index, name] of requiredTools.entries()) {
@@ -22,7 +22,7 @@ export function validateRequiredTools(requiredTools = []) {
   return [...requiredTools];
 }
 
-const RELEASE_SHA256 = Object.freeze({
+const RELEASE_SHA256: Record<string, string> = Object.freeze({
   'gh_2.74.2_linux_amd64.tar.gz': 'c421091ae5800390e6aef1f50bfda59cc1d4f2ef2200bcd4e1a662c05c28c444',
   'gh_2.74.2_linux_arm64.tar.gz': 'f0b07f0aeaf00f137df1bd33a76e717b1945f4b83bd6a3296b365414d3eb413f',
   'gh_2.74.2_macOS_amd64.zip': 'c716ecdd9d5e381e521d772caa4dea29d647d465b94b1c67df9154e71f33451e',
@@ -30,7 +30,7 @@ const RELEASE_SHA256 = Object.freeze({
   'gh_2.74.2_windows_amd64.zip': '3ac27af5ee8dd13b1b0002e4e4764163683889cea7f21231c9951e300c95eb29',
 });
 
-export function githubCliReleaseAsset(platform, architecture) {
+export function githubCliReleaseAsset(platform: any, architecture: any) {
   const arch = architecture === 'x64' ? 'amd64' : architecture === 'arm64' ? 'arm64' : null;
   if (!arch) return null;
   let file;
@@ -45,14 +45,14 @@ export function githubCliReleaseAsset(platform, architecture) {
   return { file, binary, format, sha256 };
 }
 
-function runVersion(executable, env) {
-  return new Promise((resolve) => {
+function runVersion(executable: any, env: any) {
+  return new Promise<any>((resolve) => {
     const child = spawn(executable, ['--version'], { env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let output = '';
-    child.stdout.setEncoding('utf8').on('data', (chunk) => { if (output.length < 4096) output += chunk; });
+    child.stdout.setEncoding('utf8').on('data', (chunk: any) => { if (output.length < 4096) output += chunk; });
     child.stderr.on('data', () => {});
     child.on('error', () => resolve(null));
-    child.on('close', (status) => {
+    child.on('close', (status: any) => {
       if (status !== 0) return resolve(null);
       const match = /\bversion\s+v?(\d+\.\d+\.\d+(?:[-+][\w.-]+)?)/i.exec(output);
       resolve(match?.[1] ?? null);
@@ -60,17 +60,17 @@ function runVersion(executable, env) {
   });
 }
 
-function isSafeArchivePath(name) {
+function isSafeArchivePath(name: any) {
   return typeof name === 'string' && !name.startsWith('/') && !name.includes('\\') &&
-    !name.split('/').some((part) => part === '..' || part === '.');
+    !name.split('/').some((part: any) => part === '..' || part === '.');
 }
 
-function fromTarGzip(archive, expectedBinary) {
+function fromTarGzip(archive: any, expectedBinary: any) {
   const tar = zlib.gunzipSync(archive, { maxOutputLength: MAX_ARCHIVE_BYTES * 4 });
   for (let offset = 0; offset + 512 <= tar.length;) {
     const header = tar.subarray(offset, offset + 512);
-    if (header.every((byte) => byte === 0)) break;
-    const readString = (start, length) => header.subarray(start, start + length).toString('utf8').replace(/\0.*$/s, '');
+    if (header.every((byte: any) => byte === 0)) break;
+    const readString = (start: any, length: any) => header.subarray(start, start + length).toString('utf8').replace(/\0.*$/s, '');
     const name = readString(0, 100);
     const prefix = readString(345, 155);
     const fullName = prefix ? `${prefix}/${name}` : name;
@@ -87,7 +87,7 @@ function fromTarGzip(archive, expectedBinary) {
   throw new Error(`Downloaded GitHub CLI archive did not contain bin/${expectedBinary}`);
 }
 
-function fromZip(archive, expectedBinary) {
+function fromZip(archive: any, expectedBinary: any) {
   const searchStart = Math.max(0, archive.length - 65_557);
   let endOffset = -1;
   for (let cursor = archive.length - 22; cursor >= searchStart; cursor--) {
@@ -129,12 +129,12 @@ function fromZip(archive, expectedBinary) {
   throw new Error(`Downloaded GitHub CLI archive did not contain bin/${expectedBinary}`);
 }
 
-export function extractGitHubCliBinary(archive, asset) {
+export function extractGitHubCliBinary(archive: any, asset: any) {
   if (!asset || !Buffer.isBuffer(archive)) throw new Error('A supported release asset and archive buffer are required');
   return asset.format === 'tar.gz' ? fromTarGzip(archive, asset.binary) : fromZip(archive, asset.binary);
 }
 
-async function downloadGitHubCli(asset, expectedSha256, fetchArtifact) {
+async function downloadGitHubCli(asset: any, expectedSha256: any, fetchArtifact: any) {
   if (typeof expectedSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(expectedSha256)) {
     throw new Error(`No trusted SHA-256 pin is available for official GitHub CLI artifact ${asset.file}`);
   }
@@ -151,12 +151,12 @@ async function downloadGitHubCli(asset, expectedSha256, fetchArtifact) {
   return extractGitHubCliBinary(bytes, asset);
 }
 
-async function installGitHubCli(binDir, platform, architecture, expectedSha256, fetchArtifact) {
+async function installGitHubCli(binDir: any, platform: any, architecture: any, expectedSha256: any, fetchArtifact: any) {
   const asset = githubCliReleaseAsset(platform, architecture);
   if (!asset) return { ok: false, reason: `No supported official GitHub CLI installer for ${platform}/${architecture}`, action: 'Install GitHub CLI from https://cli.github.com/ using a user-writable method without sudo, then rerun Pi Sync.' };
   const executable = path.join(binDir, asset.binary);
   try {
-    const existing = await fs.lstat(executable).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
+    const existing = await fs.lstat(executable).catch((error: any) => error.code === 'ENOENT' ? null : Promise.reject(error));
     if (existing) return { ok: false, reason: `Refusing to overwrite existing path: ${executable}`, action: `Review ${executable}; move it only if it is not user data, then rerun Pi Sync.` };
     const contents = await downloadGitHubCli(asset, expectedSha256, fetchArtifact);
     await fs.mkdir(binDir, { recursive: true });
@@ -178,21 +178,39 @@ async function installGitHubCli(binDir, platform, architecture, expectedSha256, 
   }
 }
 
+// The inspector's result contract, typed at the seam so CLI workflows can
+// consume it without unvalidated `as` assertions.
+export interface PrerequisiteTool {
+  name: string;
+  required: boolean;
+  status: 'available' | 'missing' | 'installed' | 'failed';
+  version: string | null;
+  installPath?: string;
+  reason?: string;
+  action?: string;
+}
+
+export interface PrerequisitesResult {
+  tools: PrerequisiteTool[];
+  ok: boolean;
+  binDir: string;
+}
+
 export function createPrerequisiteInspector({
-  expectedArtifactSha256 = (asset) => asset.sha256,
-  fetchArtifact = (...args) => globalThis.fetch(...args),
-} = {}) {
-  return async function inspectRequiredTools(names, { binDir = path.join(os.homedir(), '.local', 'bin'), env = process.env,
-    platform = process.platform, architecture = process.arch, install = true } = {}) {
+  expectedArtifactSha256 = (asset: any) => asset.sha256,
+  fetchArtifact = (...args: any[]) => globalThis.fetch(...(args as [any, any?])),
+}: any = {}) {
+  return async function inspectRequiredTools(names: any, { binDir = path.join(os.homedir(), '.local', 'bin'), env = process.env,
+    platform = process.platform, architecture = process.arch, install = true }: any = {}): Promise<PrerequisitesResult> {
     const tools = validateRequiredTools(names);
     const bin = path.resolve(binDir);
     const toolEnv = { ...env, PATH: `${bin}${path.delimiter}${env.PATH ?? ''}` };
     const command = platform === 'win32' ? 'gh.exe' : 'gh';
-    const results = [];
+    const results: PrerequisiteTool[] = [];
     for (const name of tools) {
       const localExecutable = path.join(bin, platform === 'win32' ? `${name}.exe` : name);
-      const localExists = await fs.lstat(localExecutable).then((info) => info.isFile() && !info.isSymbolicLink())
-        .catch((error) => ['ENOENT', 'ENOTDIR'].includes(error.code) ? false : Promise.reject(error));
+      const localExists = await fs.lstat(localExecutable).then((info: any) => info.isFile() && !info.isSymbolicLink())
+        .catch((error: any) => ['ENOENT', 'ENOTDIR'].includes(error.code) ? false : Promise.reject(error));
       const version = await runVersion(localExists ? localExecutable : command, toolEnv);
       if (version) {
         results.push({ name, required: true, status: 'available', version, ...(localExists ? { installPath: localExecutable } : {}) });
@@ -217,7 +235,7 @@ export function createPrerequisiteInspector({
       }
       results.push({ name, required: true, status: 'installed', version: installedVersion, installPath: result.executable });
     }
-    return { tools: results, ok: results.every((tool) => ['available', 'installed'].includes(tool.status)), binDir: bin };
+    return { tools: results, ok: results.every((tool: any) => ['available', 'installed'].includes(tool.status)), binDir: bin };
   };
 }
 

@@ -4,7 +4,7 @@ A small Node.js CLI for applying explicitly declared Pi user-level resources fro
 
 ## Requirements
 
-- Node.js 18 or newer
+- Node.js 22 or newer
 
 ## Public installation and private-repository bootstrap
 
