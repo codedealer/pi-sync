@@ -75,6 +75,16 @@ by editing the setup repository and running `pi-sync apply`. It points at
 the `pi-sync` skill for the full workflow. It is a user-facing info
 notification only: it never enters the transcript or the LLM context.
 
+At extension initialization, a valid Pi Sync setup also takes ownership of Pi’s
+built-in latest-version notice by setting the documented
+`PI_SKIP_VERSION_CHECK` flag only when the user has not already supplied it.
+On process startup, the extension asynchronously runs the read-only
+`pi-sync pi-update` eligibility check. If a release has passed the repository’s
+configured cooldown, a separate warning notification names the version and
+directs the user to `pi-sync pi-update --apply`. The check never delays startup
+or installs anything; no notice is shown when the candidate is absent or the
+check fails.
+
 ## Command and environment
 
 - Command: `/pi-sync` runs a manual sync and reports the result.
@@ -95,6 +105,4 @@ persisting.
 
 ## Non-managed setups
 
-The extension stays completely silent on setups that are not managed by
-pi-sync (no settings targets declared in the setup manifest): no footer, no
-orientation message, no status entry, and no network activity.
+The extension stays completely silent when there is no valid Pi Sync setup manifest. In a valid managed setup with no settings targets, it can still suppress Pi’s built-in version notice and run the age-gated Pi update check; settings synchronization, footer status, and repository watchers remain inactive.

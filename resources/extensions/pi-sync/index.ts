@@ -54,6 +54,13 @@
  * section — so it stays out of the transcript and the LLM context, and it
  * is absent on setups that are not managed by Pi Sync.
  *
+ * A valid managed setup also takes ownership of Pi's built-in latest-version
+ * notice by setting PI_SKIP_VERSION_CHECK during extension initialization,
+ * unless the user already supplied that variable. At process startup only,
+ * it asynchronously runs `pi-sync pi-update`; an eligible version gets a
+ * separate warning notification with the explicit `pi-sync pi-update --apply`
+ * command. The read-only check never delays startup or applies an update.
+ *
  * Environment overrides:
  *   PI_SYNC_REPO_DIR  setup repository path (default ~/.pi-sync/setup)
  *   PI_SYNC_BIN       pi-sync executable (default `pi-sync` on PATH)
@@ -83,6 +90,7 @@ const STATUS_ID = "pi-sync";
 const DEBOUNCE_MS = 400;
 const INITIAL_SYNC_DELAY_MS = 1500;
 const SYNC_TIMEOUT_MS = 20_000;
+const PI_UPDATE_TIMEOUT_MS = 20_000;
 const TICK_MS = 60_000;
 const FETCH_TIMEOUT_MS = 15_000;
 
@@ -165,7 +173,29 @@ export default function (pi: ExtensionAPI) {
   const agentDir = () => getAgentDir();
   const cliBinary = () => process.env.PI_SYNC_BIN ?? "pi-sync";
 
-  /** File names the setup manifest declares as settings targets, or [] when this is not a pi-sync-managed setup. */
+  function isManagedSetup(): boolean {
+    try {
+      const manifest = JSON.parse(readFileSync(path.join(repoDir(), "pi-sync.json"), "utf8")) as {
+        schemaVersion?: unknown;
+        resources?: unknown;
+        dependencies?: unknown;
+        settings?: unknown;
+      };
+      return manifest.schemaVersion === 1 && Array.isArray(manifest.resources) && Array.isArray(manifest.dependencies) &&
+        (manifest.settings === undefined || Array.isArray(manifest.settings)) && existsSync(agentDir());
+    } catch {
+      return false;
+    }
+  }
+
+  const managedSetupAtInitialization = isManagedSetup();
+  // Pi performs its own version check after extension initialization. Take over
+  // that check only for managed setups, and never overwrite user configuration.
+  if (managedSetupAtInitialization && process.env.PI_SKIP_VERSION_CHECK === undefined) {
+    process.env.PI_SKIP_VERSION_CHECK = "1";
+  }
+  let piUpdateNoticeStarted = false;
+  /** File names the setup manifest declares as settings targets, or [] when no settings targets are declared. */
   function managedTargets(): string[] {
     try {
       const manifest = JSON.parse(readFileSync(path.join(repoDir(), "pi-sync.json"), "utf8")) as {
@@ -240,6 +270,32 @@ export default function (pi: ExtensionAPI) {
       }
     } catch {
       // UI state can be torn down while a debounced sync is in flight; never let that break the session.
+    }
+  }
+
+  /** A best-effort, read-only eligibility check; never block or fail session startup. */
+  async function checkPiUpdate(ctx: ExtensionContext) {
+    if (!ctx.hasUI) return;
+    try {
+      const { stdout } = await execFileAsync(cliBinary(), ["pi-update", "--repo", repoDir(), "--agent-dir", agentDir()], {
+        timeout: PI_UPDATE_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024,
+      });
+      const result = JSON.parse(stdout) as {
+        apiVersion?: unknown;
+        command?: unknown;
+        ok?: unknown;
+        mode?: unknown;
+        candidate?: { version?: unknown } | null;
+      };
+      if (result.apiVersion !== 1 || result.command !== "pi-update" || result.ok !== true || result.mode !== "preview" ||
+          typeof result.candidate?.version !== "string" || !result.candidate.version) return;
+      ctx.ui.notify(
+        `Pi Sync Update Available: Pi ${result.candidate.version} has passed your release-age policy. Run \`pi-sync pi-update --apply\` to update.`,
+        "warning",
+      );
+    } catch {
+      // Discovery is advisory; unavailable CLI, registry, or UI must not affect startup.
     }
   }
 
@@ -464,14 +520,18 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", (event, ctx) => {
-    const targets = currentTargets();
     const dir = agentDir();
-    if (!targets.length || !existsSync(dir)) return; // not a pi-sync-managed setup: stay silent
+    if (!managedSetupAtInitialization || !existsSync(dir)) return; // not a managed setup: stay silent
+    const targets = currentTargets();
     // One-line startup orientation for managed setups: process startup only
     // (reason "startup" — not resume/fork/new/reload, whose users are
     // already oriented), a user-facing info notification only (never a
     // transcript entry or LLM context), and local and free (no freshness
     // gate). The managed gate above keeps unmanaged setups silent.
+    if (event.reason === "startup" && !piUpdateNoticeStarted) {
+      piUpdateNoticeStarted = true;
+      void checkPiUpdate(ctx);
+    }
     if (event.reason === "startup" && ctx.hasUI) {
       try {
         ctx.ui.notify(
@@ -482,6 +542,7 @@ export default function (pi: ExtensionAPI) {
         // UI state can be unavailable while the session boots; orientation is best-effort.
       }
     }
+    if (!targets.length) return; // Pi update notices also apply to managed setups without settings targets.
     watcher = watch(dir, (_eventType, filename) => {
       const name = filename?.toString();
       if (name && targets.includes(name)) schedule(ctx);
