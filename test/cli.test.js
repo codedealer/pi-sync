@@ -111,12 +111,16 @@ async function pushFixture(t) {
   return { root, repo, bare };
 }
 
-function run(args, env = {}, options = {}) {
-  return spawnSync(process.execPath, [cli, ...args], {
+function runWith(entry, args, env = {}, options = {}) {
+  return spawnSync(process.execPath, [entry, ...args], {
     encoding: 'utf8',
     env: { ...process.env, ...env },
     ...options,
   });
+}
+
+function run(args, env = {}, options = {}) {
+  return runWith(cli, args, env, options);
 }
 
 // Environment for the --repo default-resolution tests: the inherited
@@ -168,6 +172,23 @@ async function bootstrapRepo(t, root) {
   return repo;
 }
 
+// A temporary copy of the built package (CLI plus the bundled resources and
+// package.json) so a test can execute a different bundle version as if that
+// package were installed. Only the fixture's own bundled content and version
+// differ from the built CLI under test.
+async function packageFixture(t, root, { version, mutate, name = 'package-fixture' } = {}) {
+  const projectRoot = path.dirname(fileURLToPath(new URL('../package.json', import.meta.url)));
+  const fixture = path.join(root, name);
+  await fs.cp(path.join(projectRoot, 'dist'), path.join(fixture, 'dist'), { recursive: true });
+  await fs.cp(path.join(projectRoot, 'resources', 'skills', 'pi-sync'), path.join(fixture, 'resources', 'skills', 'pi-sync'), { recursive: true });
+  await fs.cp(path.join(projectRoot, 'resources', 'extensions', 'pi-sync'), path.join(fixture, 'resources', 'extensions', 'pi-sync'), { recursive: true });
+  const pkg = JSON.parse(await fs.readFile(path.join(projectRoot, 'package.json'), 'utf8'));
+  if (version) pkg.version = version;
+  await fs.writeFile(path.join(fixture, 'package.json'), JSON.stringify(pkg, null, 2));
+  if (mutate) await mutate(fixture);
+  return { cli: path.join(fixture, 'dist', 'cli.js'), fixture };
+}
+
 function result(processResult) {
   assert.equal(processResult.error, undefined, processResult.error?.message || 'subprocess should launch');
   return JSON.parse(processResult.stdout);
@@ -215,9 +236,10 @@ test('bootstrap fetches a private setup fixture, declares the bundled skill and 
   const output = result(bootstrapped);
   assert.equal(output.ok, true);
   assert.equal(output.authenticationMethod, 'git');
+  assert.equal(output.packageVersion, JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8')).version);
   assert.deepEqual(output.bundledResources, [
-    { type: 'skill', source: 'resources/skills/pi-sync', target: 'skills/pi-sync', action: 'declared-and-applied' },
-    { type: 'extension', source: 'resources/extensions/pi-sync', target: 'extensions/pi-sync', action: 'declared-and-applied' },
+    { type: 'skill', source: 'resources/skills/pi-sync', target: 'skills/pi-sync', action: 'declared' },
+    { type: 'extension', source: 'resources/extensions/pi-sync', target: 'extensions/pi-sync', action: 'declared' },
   ]);
   const manifest = JSON.parse(await fs.readFile(path.join(setupDir, 'pi-sync.json'), 'utf8'));
   assert.ok(manifest.resources.some((item) => item.type === 'skill' && item.source === 'resources/skills/pi-sync' && item.target === 'skills/pi-sync'));
@@ -316,7 +338,7 @@ test('bootstrap detects manifest-owned skill target collisions without editing t
 
 test('public npm package allowlist includes the CLI, skill, and extension but excludes tests and scratch data', async () => {
   const packageJson = JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8'));
-  assert.deepEqual(packageJson.files, ['README.md', 'dist', 'src', 'resources/skills/pi-sync/SKILL.md', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/status.js', 'resources/extensions/pi-sync/process.js', 'resources/extensions/pi-sync/README.md']);
+  assert.deepEqual(packageJson.files, ['README.md', 'dist', 'src', 'resources/skills/pi-sync/SKILL.md', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/status.js', 'resources/extensions/pi-sync/process.js', 'resources/extensions/pi-sync/README.md', 'scripts/install-notice.js']);
   const packed = spawnSync('npm', ['pack', '--dry-run', '--json'], { encoding: 'utf8', cwd: path.dirname(fileURLToPath(new URL('../package.json', import.meta.url))) });
   assert.equal(packed.status, 0, packed.stderr);
   const files = JSON.parse(packed.stdout)[0].files.map((item) => item.path);
@@ -358,8 +380,9 @@ test('public npm package allowlist includes the CLI, skill, and extension but ex
   assert.ok(files.includes('resources/extensions/pi-sync/index.ts'));
   assert.ok(files.includes('resources/extensions/pi-sync/status.js'));
   assert.ok(files.includes('resources/extensions/pi-sync/process.js'));
+  assert.ok(files.includes('scripts/install-notice.js'));
   assert.ok(!files.some((item) => /^(?:test(?:\/|$)|test-support(?:\/|$)|\.scratch(?:\/|$)|resources\/skills\/(?!pi-sync\/))/.test(item)));
-  assert.deepEqual(files.sort(), ['LICENSE', 'README.md', 'dist/cli.js', 'dist/cli/arguments.js', 'dist/cli/commands/apply.js', 'dist/cli/commands/bootstrap.js', 'dist/cli/commands/inspect.js', 'dist/cli/commands/pi-update.js', 'dist/cli/commands/prune.js', 'dist/cli/commands/push.js', 'dist/cli/commands/resources.js', 'dist/cli/commands/sync.js', 'dist/cli/commands/update.js', 'dist/cli/local-state.js', 'dist/cli/manifest.js', 'dist/cli/process.js', 'dist/cli/reconciliation.js', 'dist/cli/resource-operations.js', 'dist/packages.js', 'dist/prerequisites.js', 'package.json', 'resources/extensions/pi-sync/README.md', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/process.js', 'resources/extensions/pi-sync/status.js', 'resources/skills/pi-sync/SKILL.md', 'src/cli.ts', 'src/cli/README.md', 'src/cli/arguments.ts', 'src/cli/commands/apply.ts', 'src/cli/commands/bootstrap.ts', 'src/cli/commands/inspect.ts', 'src/cli/commands/pi-update.ts', 'src/cli/commands/prune.ts', 'src/cli/commands/push.ts', 'src/cli/commands/resources.ts', 'src/cli/commands/sync.ts', 'src/cli/commands/update.ts', 'src/cli/local-state.ts', 'src/cli/manifest.ts', 'src/cli/process.ts', 'src/cli/reconciliation.ts', 'src/cli/resource-operations.ts', 'src/packages.ts', 'src/prerequisites.ts']);
+  assert.deepEqual(files.sort(), ['LICENSE', 'README.md', 'dist/cli.js', 'dist/cli/arguments.js', 'dist/cli/commands/apply.js', 'dist/cli/commands/bootstrap.js', 'dist/cli/commands/inspect.js', 'dist/cli/commands/pi-update.js', 'dist/cli/commands/prune.js', 'dist/cli/commands/push.js', 'dist/cli/commands/resources.js', 'dist/cli/commands/sync.js', 'dist/cli/commands/update.js', 'dist/cli/local-state.js', 'dist/cli/manifest.js', 'dist/cli/process.js', 'dist/cli/reconciliation.js', 'dist/cli/resource-operations.js', 'dist/packages.js', 'dist/prerequisites.js', 'package.json', 'resources/extensions/pi-sync/README.md', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/process.js', 'resources/extensions/pi-sync/status.js', 'resources/skills/pi-sync/SKILL.md', 'scripts/install-notice.js', 'src/cli.ts', 'src/cli/README.md', 'src/cli/arguments.ts', 'src/cli/commands/apply.ts', 'src/cli/commands/bootstrap.ts', 'src/cli/commands/inspect.ts', 'src/cli/commands/pi-update.ts', 'src/cli/commands/prune.ts', 'src/cli/commands/push.ts', 'src/cli/commands/resources.ts', 'src/cli/commands/sync.ts', 'src/cli/commands/update.ts', 'src/cli/local-state.ts', 'src/cli/manifest.ts', 'src/cli/process.ts', 'src/cli/reconciliation.ts', 'src/cli/resource-operations.ts', 'src/packages.ts', 'src/prerequisites.ts']);
 });
 
 test('supported agent commands share a versioned JSON response contract', async (t) => {
@@ -4063,4 +4086,307 @@ test('bootstrap still collides when the destination exists but is not a setup re
   assert.match(output.error, /not a valid Pi Sync setup repository/);
   await assert.rejects(fs.access(agentDir));
   assert.equal(await fs.readFile(path.join(setupDir, 'notes.txt'), 'utf8'), 'not a setup repository\n');
+});
+
+test('bootstrap rerun with the same package is idempotent and reports the bundled resources already-current', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-idempotent-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+
+  const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+
+  const manifestPath = path.join(setupDir, 'pi-sync.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  const lockBefore = await fs.readFile(path.join(setupDir, 'pi-sync.lock.json'), 'utf8');
+  const bundledSkillBefore = await fs.readFile(path.join(setupDir, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8');
+  const helloBefore = await fs.readFile(path.join(setupDir, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8');
+  const localSkillBefore = await fs.readFile(path.join(agentDir, 'skills', 'pi-sync', 'SKILL.md'), 'utf8');
+
+  const resumed = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(resumed.status, 0, `${resumed.stderr}\n${resumed.stdout}`);
+  const output = result(resumed);
+  assert.equal(output.ok, true);
+  assert.equal(output.packageVersion, JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8')).version);
+  assert.deepEqual(output.bundledResources, [
+    { type: 'skill', source: 'resources/skills/pi-sync', target: 'skills/pi-sync', action: 'already-current' },
+    { type: 'extension', source: 'resources/extensions/pi-sync', target: 'extensions/pi-sync', action: 'already-current' },
+  ]);
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore, 'an already-current refresh does not rewrite the manifest');
+  assert.equal(await fs.readFile(path.join(setupDir, 'pi-sync.lock.json'), 'utf8'), lockBefore);
+  assert.equal(await fs.readFile(path.join(setupDir, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8'), bundledSkillBefore);
+  assert.equal(await fs.readFile(path.join(setupDir, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8'), helloBefore);
+  assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'pi-sync', 'SKILL.md'), 'utf8'), localSkillBefore);
+});
+
+test('bootstrap rerun refreshes changed bundled resources from the executing package and preserves unrelated state', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-refresh-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const unrelated = path.join(agentDir, 'skills', 'local-only', 'SKILL.md');
+  await fs.mkdir(path.dirname(unrelated), { recursive: true });
+  await fs.writeFile(unrelated, '# Keep local\n');
+  const setupDir = path.join(root, 'private-checkout');
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+
+  const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+
+  const { cli: fixtureCli, fixture } = await packageFixture(t, root, {
+    version: '9.9.9',
+    mutate: async (dir) => {
+      await fs.appendFile(path.join(dir, 'resources', 'skills', 'pi-sync', 'SKILL.md'), '\n# Refreshed bundle marker\n');
+      await fs.appendFile(path.join(dir, 'resources', 'extensions', 'pi-sync', 'status.js'), '\n// refreshed\n');
+    },
+  });
+  const lockBefore = await fs.readFile(path.join(setupDir, 'pi-sync.lock.json'), 'utf8');
+
+  const resumed = runWith(fixtureCli, args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(resumed.status, 0, `${resumed.stderr}\n${resumed.stdout}`);
+  const output = result(resumed);
+  assert.equal(output.ok, true);
+  assert.equal(output.packageVersion, '9.9.9');
+  assert.deepEqual(output.bundledResources, [
+    { type: 'skill', source: 'resources/skills/pi-sync', target: 'skills/pi-sync', action: 'refreshed' },
+    { type: 'extension', source: 'resources/extensions/pi-sync', target: 'extensions/pi-sync', action: 'refreshed' },
+  ]);
+  assert.equal(await fs.readFile(path.join(setupDir, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8'),
+    await fs.readFile(path.join(fixture, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8'));
+  assert.equal(await fs.readFile(path.join(setupDir, 'resources', 'extensions', 'pi-sync', 'status.js'), 'utf8'),
+    await fs.readFile(path.join(fixture, 'resources', 'extensions', 'pi-sync', 'status.js'), 'utf8'));
+  assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'pi-sync', 'SKILL.md'), 'utf8'),
+    await fs.readFile(path.join(fixture, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8'));
+  assert.equal(await fs.readFile(path.join(agentDir, 'extensions', 'pi-sync', 'status.js'), 'utf8'),
+    await fs.readFile(path.join(fixture, 'resources', 'extensions', 'pi-sync', 'status.js'), 'utf8'));
+  assert.equal(await fs.readFile(path.join(setupDir, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8'), '# Private fixture\n');
+  const manifest = JSON.parse(await fs.readFile(path.join(setupDir, 'pi-sync.json'), 'utf8'));
+  assert.ok(manifest.resources.some((item) => item.source === 'resources/skills/hello' && item.target === 'skills/hello'));
+  assert.equal(await fs.readFile(path.join(setupDir, 'pi-sync.lock.json'), 'utf8'), lockBefore);
+  assert.equal(await fs.readFile(unrelated, 'utf8'), '# Keep local\n');
+});
+
+test('bootstrap rerun with an older package downgrades the bundled resources to that package contents', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-downgrade-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+  const originalSkill = await fs.readFile(new URL('../resources/skills/pi-sync/SKILL.md', import.meta.url), 'utf8');
+
+  const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+
+  const newer = await packageFixture(t, root, {
+    version: '2.0.0',
+    name: 'package-fixture-newer',
+    mutate: async (dir) => {
+      await fs.appendFile(path.join(dir, 'resources', 'skills', 'pi-sync', 'SKILL.md'), '\n# Newer bundle\n');
+    },
+  });
+  const upgraded = runWith(newer.cli, args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(upgraded.status, 0, `${upgraded.stderr}\n${upgraded.stdout}`);
+  const upgradedOutput = result(upgraded);
+  assert.equal(upgradedOutput.packageVersion, '2.0.0');
+  assert.equal(upgradedOutput.bundledResources[0].action, 'refreshed');
+  assert.equal(await fs.readFile(path.join(setupDir, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8'),
+    await fs.readFile(path.join(newer.fixture, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8'));
+
+  const older = await packageFixture(t, root, { version: '1.9.0', name: 'package-fixture-older' });
+  const downgraded = runWith(older.cli, args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(downgraded.status, 0, `${downgraded.stderr}\n${downgraded.stdout}`);
+  const downgradedOutput = result(downgraded);
+  assert.equal(downgradedOutput.packageVersion, '1.9.0');
+  assert.equal(downgradedOutput.bundledResources[0].action, 'refreshed');
+  assert.equal(await fs.readFile(path.join(setupDir, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8'), originalSkill,
+    'an older executing package downgrades the setup repository bundle to its own contents');
+  assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'pi-sync', 'SKILL.md'), 'utf8'), originalSkill);
+});
+
+test('bootstrap rerun removes bundled files the executing package no longer ships', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-removed-files-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+  const extraFile = 'extra-notes.md';
+
+  const firstPkg = await packageFixture(t, root, {
+    version: '9.8.0',
+    name: 'package-fixture-with-extra',
+    mutate: async (dir) => {
+      await fs.writeFile(path.join(dir, 'resources', 'skills', 'pi-sync', extraFile), 'temporary note\n');
+    },
+  });
+  const first = runWith(firstPkg.cli, args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+  const firstOutput = result(first);
+  assert.equal(firstOutput.packageVersion, '9.8.0');
+  assert.equal(firstOutput.bundledResources[0].action, 'declared');
+  assert.equal(await fs.readFile(path.join(setupDir, 'resources', 'skills', 'pi-sync', extraFile), 'utf8'), 'temporary note\n');
+  assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'pi-sync', extraFile), 'utf8'), 'temporary note\n');
+
+  const secondPkg = await packageFixture(t, root, { version: '9.7.0', name: 'package-fixture-no-extra' });
+  const second = runWith(secondPkg.cli, args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(second.status, 0, `${second.stderr}\n${second.stdout}`);
+  const secondOutput = result(second);
+  assert.equal(secondOutput.packageVersion, '9.7.0');
+  assert.equal(secondOutput.bundledResources[0].action, 'refreshed');
+  await assert.rejects(fs.access(path.join(setupDir, 'resources', 'skills', 'pi-sync', extraFile)),
+    'obsolete bundled files are removed from the setup repository source');
+  await assert.rejects(fs.access(path.join(agentDir, 'skills', 'pi-sync', extraFile)),
+    'ordinary apply removes the file from the local installation');
+  assert.equal(await fs.readFile(path.join(setupDir, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8'),
+    await fs.readFile(path.join(secondPkg.fixture, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8'));
+});
+
+test('bootstrap rerun collision preflights the bundled set and leaves every bundled source unchanged', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-collision-atomic-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+
+  const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+
+  // The extension bundle source still exists on disk but is no longer declared:
+  // an undeclared pre-existing source path is a collision.
+  const manifestPath = path.join(setupDir, 'pi-sync.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.resources = manifest.resources.filter((item) => item.source !== 'resources/extensions/pi-sync');
+  const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
+  await fs.writeFile(manifestPath, manifestText);
+  const skillBefore = await fs.readFile(path.join(setupDir, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8');
+
+  const response = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(response.status, 1, `${response.stderr}\n${response.stdout}`);
+  const output = result(response);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'RESOURCE_COLLISION');
+  assert.equal(output.collision.bundled.type, 'extension');
+  assert.match(output.collision.reason, /not declared/);
+  assert.equal(await fs.readFile(path.join(setupDir, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8'), skillBefore,
+    'the exact-declared skill bundle is not partially refreshed after a collision');
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestText);
+});
+
+test('bootstrap rerun reports an overlapping bundled declaration as a collision without refreshing', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-overlap-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+
+  const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+
+  // A single-file extension declaration nested inside the bundled extension
+  // target overlaps the Pi Sync-owned bundle.
+  const manifestPath = path.join(setupDir, 'pi-sync.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.resources = manifest.resources
+    .filter((item) => item.source !== 'resources/extensions/pi-sync')
+    .concat({ type: 'extension', source: 'resources/extensions/pi-sync/index.ts', target: 'extensions/pi-sync/index.ts' });
+  const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
+  await fs.writeFile(manifestPath, manifestText);
+  const skillBefore = await fs.readFile(path.join(setupDir, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8');
+
+  const response = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(response.status, 1, `${response.stderr}\n${response.stdout}`);
+  const output = result(response);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'RESOURCE_COLLISION');
+  assert.equal(output.collision.target, 'extensions/pi-sync/index.ts');
+  assert.equal(output.collision.bundled.type, 'extension');
+  assert.equal(await fs.readFile(path.join(setupDir, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8'), skillBefore,
+    'the exact-declared skill bundle is not refreshed after a collision');
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestText);
+});
+
+test('bootstrap rerun does not fetch or pull the existing setup repository', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-nofetch-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+
+  const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+
+  // A logging git that fails every call: any fetch/pull/clone/ls-remote by
+  // the rerun is observable and would also break a fetch attempt.
+  const logFile = path.join(root, 'git-calls.log');
+  const bin = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-nofetch-bin-'));
+  t.after(() => fs.rm(bin, { recursive: true, force: true }));
+  await fs.writeFile(path.join(bin, 'git'),
+    `#!${process.execPath}\nrequire('node:fs').appendFileSync(process.env.GIT_CALL_LOG, process.argv.slice(2).join(' ') + '\\n');\nprocess.exit(2);\n`,
+    { mode: 0o755 });
+
+  const resumed = run(args, { PATH: `${bin}${path.delimiter}${process.env.PATH}`, GIT_CALL_LOG: logFile });
+  assert.equal(resumed.status, 0, `${resumed.stderr}\n${resumed.stdout}`);
+  const output = result(resumed);
+  assert.equal(output.ok, true);
+  assert.equal(output.authenticationMethod, null, 'a resumed bootstrap does not refetch the repository');
+  let calls = '';
+  try { calls = await fs.readFile(logFile, 'utf8'); } catch { calls = ''; }
+  const remoteCalls = calls.trim().split('\n').filter((line) =>
+    /\b(?:fetch|pull|clone|ls-remote)\b/.test(line));
+  assert.equal(remoteCalls.join(' | '), '', 'a rerun never fetches or pulls the setup repository remote');
+});
+
+test('bootstrap reports a local conflict while still reporting the refreshed setup repository bundle', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-local-conflict-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+
+  const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+
+  const localSkill = path.join(agentDir, 'skills', 'pi-sync', 'SKILL.md');
+  await fs.writeFile(localSkill, '# Local edit\n');
+
+  const { cli: fixtureCli, fixture } = await packageFixture(t, root, {
+    version: '9.9.0',
+    mutate: async (dir) => {
+      await fs.appendFile(path.join(dir, 'resources', 'skills', 'pi-sync', 'SKILL.md'), '\n# Refreshed bundle marker\n');
+    },
+  });
+
+  const response = runWith(fixtureCli, args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(response.status, 1, `${response.stderr}\n${response.stdout}`);
+  const output = result(response);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'APPLY_CONFLICT');
+  assert.match(output.error, /setup repository was already refreshed/);
+  assert.equal(output.packageVersion, '9.9.0');
+  assert.equal(output.plan.ok, false);
+  assert.equal(output.plan.conflicts[0].target, 'skills/pi-sync');
+  assert.equal(await fs.readFile(localSkill, 'utf8'), '# Local edit\n', 'the local conflict is left untouched');
+  assert.equal(await fs.readFile(path.join(setupDir, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8'),
+    await fs.readFile(path.join(fixture, 'resources', 'skills', 'pi-sync', 'SKILL.md'), 'utf8'),
+    'the setup repository bundle was refreshed before planning');
+  assert.deepEqual(output.bundledResources, [
+    { type: 'skill', source: 'resources/skills/pi-sync', target: 'skills/pi-sync', action: 'refreshed' },
+    { type: 'extension', source: 'resources/extensions/pi-sync', target: 'extensions/pi-sync', action: 'already-current' },
+  ]);
 });

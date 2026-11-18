@@ -1,6 +1,6 @@
 {
   "name": "@codedealer/pi-sync",
-  "version": "1.10.1",
+  "version": "1.11.0",
   "description": "A manifest-driven CLI for applying explicitly managed Pi resources.",
   "type": "module",
   "bin": {
@@ -14,9 +14,11 @@
     "resources/extensions/pi-sync/index.ts",
     "resources/extensions/pi-sync/status.js",
     "resources/extensions/pi-sync/process.js",
-    "resources/extensions/pi-sync/README.md"
+    "resources/extensions/pi-sync/README.md",
+    "scripts/install-notice.js"
   ],
   "scripts": {
+    "postinstall": "node scripts/install-notice.js",
     "build": "tsc --project tsconfig.json",
     "typecheck": "tsc --project tsconfig.json --noEmit && tsc --project tsconfig.extension.json",
     "prepack": "npm run build",

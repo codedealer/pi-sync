@@ -23,7 +23,7 @@ Publishes go through npm's staged publishing flow, never a direct `npm publish`.
    npm stage publish . --dry-run
    ```
 
-   The tarball must contain only the `package.json` `files` allowlist (`README.md`, `dist` (the built `dist/cli.js`, `dist/packages.js`, `dist/prerequisites.js`), `src` (the TypeScript sources), `resources/skills/pi-sync/SKILL.md`, `resources/extensions/pi-sync/index.ts`, `resources/extensions/pi-sync/status.js`, `resources/extensions/pi-sync/README.md`); the allowlist test in `test/cli.test.js` pins the exact tarball file list. If the release adds or moves a shipped file, update the `files` allowlist in the same commit and re-check the dry-run.
+   The tarball must contain only the `package.json` `files` allowlist (`README.md`, `dist` (the built `dist/cli.js`, `dist/packages.js`, `dist/prerequisites.js`), `src` (the TypeScript sources), `resources/skills/pi-sync/SKILL.md`, `resources/extensions/pi-sync/index.ts`, `resources/extensions/pi-sync/status.js`, `resources/extensions/pi-sync/README.md`, `scripts/install-notice.js` (the notice-only post-install reminder)); the allowlist test in `test/cli.test.js` pins the exact tarball file list. If the release adds or moves a shipped file, update the `files` allowlist in the same commit and re-check the dry-run.
 4. Commit the version bump with the release subject convention used by this repo (for example `Add feature X (v1.4.0)`), push to the default branch, then stage:
 
    ```sh

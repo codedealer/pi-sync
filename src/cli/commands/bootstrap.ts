@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { inspectRequiredTools, type PrerequisitesResult, type PrerequisiteTool } from '../../prerequisites.js';
-import { MANIFEST_FILE, pathsOverlap, validateRepository, type RepositoryDeclarations } from '../manifest.js';
+import { MANIFEST_FILE, pathsOverlap, readJson, validateRepository, type RepositoryDeclarations } from '../manifest.js';
 import { runCommand } from '../process.js';
 import { ensureRealDirectory } from '../resource-operations.js';
 
@@ -27,9 +27,20 @@ interface BundledCollision {
   reason?: string;
 }
 
-type BundledDeclarationResult =
-  | { ok: false; collision: BundledCollision }
-  | { ok: true; added: boolean; addedResources: { type: string; source: string; target: string }[] };
+type BundledAction = 'declared' | 'refreshed' | 'already-current';
+
+interface BundledActionReport {
+  type: string;
+  source: string;
+  target: string;
+  action: BundledAction;
+}
+
+interface BundledRefreshResult {
+  ok: boolean;
+  collision?: BundledCollision;
+  actions: BundledActionReport[];
+}
 
 interface PiSyncSubprocessResult {
   status: number;
@@ -60,6 +71,7 @@ export interface BootstrapOutput {
   error: string | undefined;
   exitCode: number;
   repository: string;
+  packageVersion: string;
   prerequisites?: PrerequisiteTool[];
   missingPrerequisites?: PrerequisiteTool[];
   authentication?: {
@@ -72,7 +84,7 @@ export interface BootstrapOutput {
   resumeArgs?: string[];
   collision?: BundledCollision;
   plan?: unknown;
-  bundledResources?: { type: string; source: string; target: string; action?: 'declared-and-applied' | 'applied' }[];
+  bundledResources?: { type: string; source: string; target: string; action: BundledAction }[];
   authenticationMethod?: 'git' | 'github-cli' | null;
   apply?: unknown;
 }
@@ -93,11 +105,57 @@ function validateBootstrapUrl(value: string) {
   return { value, githubSlug: slug };
 }
 
-function bootstrapResponse(ok: boolean, errorCode: BootstrapErrorCode | undefined, error: string | undefined, extra: { repository: string } & Partial<Omit<BootstrapOutput, 'apiVersion' | 'command' | 'ok' | 'errorCode' | 'error' | 'exitCode' | 'repository'>>): BootstrapOutput {
+function bootstrapResponse(ok: boolean, errorCode: BootstrapErrorCode | undefined, error: string | undefined, extra: { repository: string; packageVersion: string } & Partial<Omit<BootstrapOutput, 'apiVersion' | 'command' | 'ok' | 'errorCode' | 'error' | 'exitCode' | 'repository' | 'packageVersion'>>): BootstrapOutput {
   return { apiVersion: 1 as const, command: 'bootstrap', ok, errorCode, error, exitCode: ok ? 0 : OPERATION_ERROR, ...extra };
 }
 
-async function installBundledResources(repo: string): Promise<BundledDeclarationResult> {
+// The version of the package currently executing bootstrap: the bundle it
+// ships is authoritative for the first-party resources it refreshes.
+async function readPackageVersion(): Promise<string> {
+  const meta = await readJson(fileURLToPath(new URL('../../../package.json', import.meta.url)), 'package metadata');
+  const version = (meta as { version?: unknown }).version;
+  if (typeof version !== 'string' || version.length === 0) throw new Error('The executing Pi Sync package has no readable version');
+  return version;
+}
+
+async function requireBundledRoot(item: BundledResource): Promise<void> {
+  const info = await fs.lstat(item.root).catch((error) => { throw new Error(`Bundled pi-sync ${item.type} is unavailable: ${error.message}`); });
+  if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`Bundled pi-sync ${item.type} is not a real directory`);
+}
+
+// Relative file paths and content digests of one bundle directory, used to
+// decide whether a declared bundle already matches the executing package.
+async function bundledInventory(root: string, label: string): Promise<Map<string, string>> {
+  const files = new Map<string, string>();
+  async function visit(directory: string, prefix: string): Promise<void> {
+    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isSymbolicLink()) throw new Error(`Symbolic links are not supported in bundled pi-sync ${label} content: ${relative}`);
+      if (entry.isDirectory()) await visit(entryPath, relative);
+      else if (entry.isFile()) files.set(relative, crypto.createHash('sha256').update(await fs.readFile(entryPath)).digest('hex'));
+      else throw new Error(`Unsupported file type in bundled pi-sync ${label} content: ${relative}`);
+    }
+  }
+  await visit(root, '');
+  return files;
+}
+
+function inventoriesEqual(left: Map<string, string>, right: Map<string, string>): boolean {
+  if (left.size !== right.size) return false;
+  for (const [file, digest] of left) if (right.get(file) !== digest) return false;
+  return true;
+}
+
+// Seeds or refreshes the Pi Sync-owned bundled resources in the setup
+// repository. A freshly needed declaration is seeded from the executing
+// package and appended to the manifest; an exact existing declaration is
+// mirrored from the executing package's bundle, including removing files the
+// package no longer ships. The complete bundled set is prefetched before any
+// source path changes so one collision cannot leave a partial refresh:
+// overlapping or non-exact declarations and undeclared pre-existing source
+// paths fail without touching any bundled content.
+async function refreshBundledResources(repo: string): Promise<BundledRefreshResult> {
   const manifestPath = path.join(repo, MANIFEST_FILE);
   const manifestText = await fs.readFile(manifestPath, 'utf8');
   const manifest = JSON.parse(manifestText);
@@ -106,49 +164,84 @@ async function installBundledResources(repo: string): Promise<BundledDeclaration
     { type: 'skill', source: 'resources/skills/pi-sync', target: 'skills/pi-sync', root: BUNDLED_SKILL },
     { type: 'extension', source: 'resources/extensions/pi-sync', target: 'extensions/pi-sync', root: BUNDLED_EXTENSION },
   ];
-  // Fail before materializing anything: a collision on any bundled resource
-  // must not leave partially declared repository content behind.
-  const toAdd: BundledResource[] = [];
+
+  type Plan = { item: BundledResource; mode: 'seed' | 'mirror' };
+  const plans: Plan[] = [];
   for (const item of bundled) {
-    if (declarations.resources.some((resource) => resource.source === item.source && resource.target === item.target)) continue;
-    const collision = declarations.resources.find((resource) => pathsOverlap(resource.target, item.target) || pathsOverlap(resource.source, item.source));
-    if (collision) return { ok: false, collision: { source: collision.source, target: collision.target, bundled: { type: item.type, source: item.source, target: item.target } } };
+    await requireBundledRoot(item);
     const sourcePath = path.join(repo, ...item.source.split('/'));
-    const existingSource = await fs.lstat(sourcePath).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
-    if (existingSource) return { ok: false, collision: { source: item.source, target: item.target, bundled: { type: item.type, source: item.source, target: item.target }, reason: 'setup repository source path already exists and is not declared as this resource' } };
-    const info = await fs.lstat(item.root).catch((error) => { throw new Error(`Bundled pi-sync ${item.type} is unavailable: ${error.message}`); });
-    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`Bundled pi-sync ${item.type} is not a real directory`);
-    toAdd.push(item);
+    const bundledRef = { type: item.type, source: item.source, target: item.target };
+    if (declarations.resources.some((resource) => resource.source === item.source && resource.target === item.target)) {
+      const existing = await fs.lstat(sourcePath).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
+      if (!existing || existing.isSymbolicLink() || !existing.isDirectory()) {
+        return { ok: false, collision: { source: item.source, target: item.target, bundled: bundledRef, reason: 'the declared pi-sync bundle source must be a real directory so it can be mirrored from the executing package' }, actions: [] };
+      }
+      plans.push({ item, mode: 'mirror' });
+      continue;
+    }
+    const collision = declarations.resources.find((resource) => pathsOverlap(resource.target, item.target) || pathsOverlap(resource.source, item.source));
+    if (collision) return { ok: false, collision: { source: collision.source, target: collision.target, bundled: bundledRef }, actions: [] };
+    const preexisting = await fs.lstat(sourcePath).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
+    if (preexisting) return { ok: false, collision: { source: item.source, target: item.target, bundled: bundledRef, reason: 'setup repository source path already exists and is not declared as this resource' }, actions: [] };
+    plans.push({ item, mode: 'seed' });
   }
-  if (!toAdd.length) return { ok: true, added: false, addedResources: [] };
-  const created: string[] = [];
-  try {
-    for (const item of toAdd) {
-      const sourcePath = path.join(repo, ...item.source.split('/'));
-      await ensureRealDirectory(repo, path.posix.dirname(item.source), true);
-      await fs.mkdir(sourcePath);
-      created.push(sourcePath);
-      for (const entry of await fs.readdir(item.root)) {
-        await fs.cp(path.join(item.root, entry), path.join(sourcePath, entry), { recursive: true, errorOnExist: true, force: false });
+
+  const actions: BundledActionReport[] = [];
+  const toMirror: Plan[] = [];
+  const toSeed: Plan[] = [];
+  for (const plan of plans) {
+    const report: BundledActionReport = { type: plan.item.type, source: plan.item.source, target: plan.item.target, action: 'already-current' };
+    if (plan.mode === 'seed') {
+      report.action = 'declared';
+      toSeed.push(plan);
+    } else {
+      const sourcePath = path.join(repo, ...plan.item.source.split('/'));
+      const shipped = await bundledInventory(plan.item.root, plan.item.type);
+      const installed = await bundledInventory(sourcePath, plan.item.type);
+      if (!inventoriesEqual(shipped, installed)) {
+        report.action = 'refreshed';
+        toMirror.push(plan);
       }
     }
-    const nextManifest = { ...manifest, resources: [...manifest.resources, ...toAdd.map(({ type, source, target }) => ({ type, source, target }))] };
-    const temporary = `${manifestPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-    try {
-      const info = await fs.stat(manifestPath);
-      await fs.writeFile(temporary, `${JSON.stringify(nextManifest, null, 2)}\n`, { flag: 'wx', mode: info.mode & 0o777 });
-      if (await fs.readFile(manifestPath, 'utf8') !== manifestText) throw new Error('Setup manifest changed during bootstrap; refusing to overwrite concurrent changes');
-      await fs.rename(temporary, manifestPath);
-    } catch (error) {
-      await fs.rm(temporary, { force: true }).catch(() => {});
-      throw error;
+    actions.push(report);
+  }
+  if (!toSeed.length && !toMirror.length) return { ok: true, actions };
+
+  const created: string[] = [];
+  try {
+    for (const plan of toMirror) {
+      const sourcePath = path.join(repo, ...plan.item.source.split('/'));
+      await fs.rm(sourcePath, { recursive: true, force: true });
+      await fs.cp(plan.item.root, sourcePath, { recursive: true });
+    }
+    for (const plan of toSeed) {
+      const sourcePath = path.join(repo, ...plan.item.source.split('/'));
+      await ensureRealDirectory(repo, path.posix.dirname(plan.item.source), true);
+      await fs.mkdir(sourcePath);
+      created.push(sourcePath);
+      for (const entry of await fs.readdir(plan.item.root)) {
+        await fs.cp(path.join(plan.item.root, entry), path.join(sourcePath, entry), { recursive: true, errorOnExist: true, force: false });
+      }
+    }
+    if (toSeed.length) {
+      const nextManifest = { ...manifest, resources: [...manifest.resources, ...toSeed.map(({ item }) => ({ type: item.type, source: item.source, target: item.target }))] };
+      const temporary = `${manifestPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+      try {
+        const info = await fs.stat(manifestPath);
+        await fs.writeFile(temporary, `${JSON.stringify(nextManifest, null, 2)}\n`, { flag: 'wx', mode: info.mode & 0o777 });
+        if (await fs.readFile(manifestPath, 'utf8') !== manifestText) throw new Error('Setup manifest changed during bootstrap; refusing to overwrite concurrent changes');
+        await fs.rename(temporary, manifestPath);
+      } catch (error) {
+        await fs.rm(temporary, { force: true }).catch(() => {});
+        throw error;
+      }
     }
   } catch (error) {
     for (const directory of created) await fs.rm(directory, { recursive: true, force: true }).catch(() => {});
     throw error;
   }
   await validateRepository(repo);
-  return { ok: true, added: true, addedResources: toAdd.map(({ type, source, target }) => ({ type, source, target })) };
+  return { ok: true, actions };
 }
 
 // Runs a sibling pi-sync command (plan/apply) as a subprocess of this CLI
@@ -169,13 +262,15 @@ async function runPiSync(command: 'plan' | 'apply', repo: string, agentDir: stri
 // The bootstrap workflow: fetches the setup repository (git directly, or the
 // GitHub CLI when the authentication handoff has been completed), pauses with
 // structured handoffs for authentication or prerequisite installation,
-// declares and materializes the bundled pi-sync skill and extension, then
+// ensures the bundled pi-sync skill and extension match the executing
+// package's bundle (seeding new declarations, mirroring exact ones), then
 // reaches the repository's desired local installation state through the
 // ordinary plan/apply commands. A rerun with the same command resumes from an
 // existing valid setup repository instead of requiring an empty path. Pi Sync
 // never requests, prints, or stores credentials.
 export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve = false }: BootstrapInput): Promise<BootstrapOutput> {
   const remote = validateBootstrapUrl(repoUrl);
+  const packageVersion = await readPackageVersion();
   const destination = path.resolve(repoDir);
   // `binDir` always arrives resolved: the parser applies the `~/.local/bin`
   // default (BootstrapInput.binDir is non-optional), so there is no fallback
@@ -188,14 +283,14 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
   let authenticationMethod: 'git' | 'github-cli' | null = 'git';
   if (existing) {
     if (!existing.isDirectory()) {
-      return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination exists and is not a directory; choose an empty path', { repository: destination });
+      return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination exists and is not a directory; choose an empty path', { repository: destination, packageVersion });
     }
     // A previous bootstrap (or the user) may already have placed the setup
     // repository at the destination. Resume from it instead of requiring an
     // empty path so a failed first run is rerun with the same command.
     setup = await validateRepository(destination).catch(() => null);
     if (!setup) {
-      return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination already exists but is not a valid Pi Sync setup repository; choose an empty path', { repository: destination });
+      return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination already exists but is not a valid Pi Sync setup repository; choose an empty path', { repository: destination, packageVersion });
     }
     checkout = destination;
     authenticationMethod = null;
@@ -210,7 +305,7 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
         ghAvailable = prerequisiteResult.ok;
         if (!ghAvailable) return bootstrapResponse(false, 'PREREQUISITE_INSTALL_REQUIRED',
           'GitHub CLI is required for this authentication handoff but could not be installed automatically.', {
-            repository: destination, prerequisites: prerequisiteResult.tools,
+            repository: destination, packageVersion, prerequisites: prerequisiteResult.tools,
             missingPrerequisites: prerequisiteResult.tools.filter((tool) => tool.status === 'failed'),
           });
         const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` };
@@ -224,6 +319,7 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
         const authArgs = [ghExecutable, 'auth', 'login', '--hostname', 'github.com'];
         return bootstrapResponse(false, 'AUTH_REQUIRED', 'Private setup repository access is unavailable. Complete the GitHub authentication handoff, then resume bootstrap.', {
           repository: destination,
+          packageVersion,
           prerequisites: prerequisiteResult?.tools ?? [],
           authentication: {
             required: true,
@@ -251,7 +347,7 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
     if (clone.status !== 0) {
       return bootstrapResponse(false, 'FETCH_FAILED',
         authenticationMethod === 'git' ? 'GitHub access was detected but cloning the setup repository failed' : 'GitHub CLI authentication was detected but it could not fetch the setup repository',
-        { repository: destination });
+        { repository: destination, packageVersion });
     }
     setup = await validateRepository(checkout);
   }
@@ -259,40 +355,38 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
     const prerequisites = await inspectRequiredTools(setup.requiredTools, { binDir: bin });
     if (!prerequisites.ok) return bootstrapResponse(false, 'PREREQUISITE_INSTALL_REQUIRED',
       'One or more required setup tools are unavailable. Resolve the listed handoff before applying the setup.', {
-        repository: destination, prerequisites: prerequisites.tools,
+        repository: destination, packageVersion, prerequisites: prerequisites.tools,
         missingPrerequisites: prerequisites.tools.filter((tool) => tool.status === 'failed'),
       });
 
-    const declaration = await installBundledResources(checkout);
-    if (!declaration.ok) return bootstrapResponse(false, 'RESOURCE_COLLISION', 'A bundled pi-sync resource conflicts with existing setup repository content; no installation was performed', {
-      repository: destination, collision: declaration.collision,
+    const declaration = await refreshBundledResources(checkout);
+    if (!declaration.ok) return bootstrapResponse(false, 'RESOURCE_COLLISION', 'A bundled pi-sync resource conflicts with existing setup repository content; no bundled resource was changed', {
+      repository: destination, packageVersion, collision: declaration.collision,
     });
 
     await validateRepository(checkout);
     const plan = await runPiSync('plan', checkout, path.resolve(agentDir));
     if (plan.status !== 0 || !plan.output.ok) {
-      return bootstrapResponse(false, 'APPLY_CONFLICT', 'Bootstrap plan found a collision or conflict; existing local content was left untouched', {
-        repository: destination,
-        bundledResources: [
-          { type: 'skill', source: 'resources/skills/pi-sync', target: 'skills/pi-sync' },
-          { type: 'extension', source: 'resources/extensions/pi-sync', target: 'extensions/pi-sync' },
-        ], plan: plan.output,
+      const refreshed = declaration.actions.some((action) => action.action !== 'already-current');
+      return bootstrapResponse(false, 'APPLY_CONFLICT',
+        `Bootstrap plan found a collision or conflict; existing local content was left untouched${refreshed ? ' The setup repository was already refreshed to the executing package\'s bundled resources; resolve the conflict and rerun bootstrap.' : ''}`, {
+        repository: destination, packageVersion,
+        bundledResources: declaration.actions, plan: plan.output,
       });
     }
     if (checkout !== destination) {
       if (await fs.lstat(destination).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error))) {
-        return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination appeared during bootstrap; no content was replaced', { repository: destination });
+        return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination appeared during bootstrap; no content was replaced', { repository: destination, packageVersion });
       }
       await fs.rename(checkout, destination);
     }
     const applied = await runPiSync('apply', destination, path.resolve(agentDir), approve);
-    return bootstrapResponse(applied.status === 0 && applied.output.ok, applied.status === 0 && applied.output.ok ? undefined : 'APPLY_CONFLICT',
-      applied.status === 0 && applied.output.ok ? undefined : 'Bootstrap apply did not complete cleanly; inspect the structured apply result and resume after resolving it', {
+    const succeeded = applied.status === 0 && applied.output.ok;
+    return bootstrapResponse(succeeded, succeeded ? undefined : 'APPLY_CONFLICT',
+      succeeded ? undefined : 'Bootstrap apply did not complete cleanly; inspect the structured apply result and resume after resolving it', {
         repository: destination, authenticationMethod, prerequisites: prerequisites.tools,
-        bundledResources: [
-          { type: 'skill', source: 'resources/skills/pi-sync', target: 'skills/pi-sync' },
-          { type: 'extension', source: 'resources/extensions/pi-sync', target: 'extensions/pi-sync' },
-        ].map((item) => ({ ...item, action: declaration.addedResources.some((added) => added.source === item.source) ? 'declared-and-applied' : 'applied' })),
+        packageVersion,
+        bundledResources: declaration.actions,
         apply: applied.output,
       });
   } finally {
