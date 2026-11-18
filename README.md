@@ -8,12 +8,11 @@ A small Node.js CLI for applying explicitly declared Pi user-level resources fro
 
 ## Public installation and private-repository bootstrap
 
-The npm package publishes the CLI and its first-party `pi-sync` skill and extension. Its `files` allowlist excludes setup repositories, credentials, scratch planning files, and test fixtures. A notice-only post-install hook prints a reminder to rerun bootstrap after an install or update. A package manager may require approval for or suppress lifecycle scripts, so the manual rerun below is the reliable step.
+The npm package publishes the CLI and its first-party `pi-sync` skill and extension. Its `files` allowlist excludes setup repositories, credentials, scratch planning files, and test fixtures. The package runs no install hooks, so installation works identically under npm and pnpm without script approval; after installing or updating the package, rerun your usual bootstrap command to refresh the bundled resources in your setup repository.
 
 Install globally at user level where your npm/pnpm prefix is writable, or use a one-shot runner. Configure a user-writable npm prefix if needed; do not use sudo.
 
 ```sh
-# post-install script is a notice to run bootstrap and can be safely ignored
 npm install --global @codedealer/pi-sync
 # or: pnpm add --global @codedealer/pi-sync
 # fallback without a global install:
