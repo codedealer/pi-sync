@@ -86,6 +86,7 @@ export function renderFooter(input, style = (color, text) => text) {
 }
 
 /**
+ * @param {{ repoDir: string, agentDir: string, settingsTargets?: string[] }} options
  * Derive the exact flat list of paths whose file metadata can change the
  * status summary: the git metadata (any fetch rewrites FETCH_HEAD; local
  * commits and checkouts move HEAD; dirt moves index; ref repacking moves

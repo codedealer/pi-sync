@@ -15,7 +15,7 @@ Publishes go through npm's staged publishing flow, never a direct `npm publish`.
 
 ## Release workflow
 
-1. Confirm the release changes are in place and `npm test` (`node --test`) passes.
+1. Confirm the release changes are in place and `npm test` (build + typecheck of the CLI and the shipped extension + full `node --test` suite) passes.
 2. Bump `version` in `package.json` (patch for fixes, minor for additive features, major for breaking changes). The version must be new: staged and published versions share the same semver uniqueness index, and a version that already exists cannot be staged or published again.
 3. Review the exact tarball contents:
 

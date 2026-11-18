@@ -1,0 +1,22 @@
+{
+  // Type-checks the shipped first-party Pi extension against the pinned Pi
+  // version in devDependencies. status.js/process.js are inferred (not
+  // checked); only the TypeScript that ships in index.ts is type-checked.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "useUnknownInCatchVariables": false,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["resources/extensions/pi-sync/**/*.ts"]
+}
