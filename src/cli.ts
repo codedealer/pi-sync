@@ -14,6 +14,7 @@ import { runBootstrap } from './cli/commands/bootstrap.js';
 import { runUpdate } from './cli/commands/update.js';
 import { runPiUpdate } from './cli/commands/pi-update.js';
 import { runPush } from './cli/commands/push.js';
+import { runPull } from './cli/commands/pull.js';
 
 const VALIDATION_ERROR = 2;
 const OPERATION_ERROR = 1;
@@ -62,7 +63,16 @@ async function main() {
     // directory, matching the repository commands' check.
     const agentInfo = await fs.lstat(agentDir).catch((error: any) => error.code === 'ENOENT' ? null : Promise.reject(error));
     if (agentInfo?.isSymbolicLink() || (agentInfo && !agentInfo.isDirectory())) throw new Error(`Pi agent directory must be a real directory: ${agentDir}`);
-    const output = await inspectRepository({ command, repo, agentDir, declarations, state: await loadState(agentDir) });
+    const output = await inspectRepository({ command, repo, agentDir, declarations, state: await loadState(agentDir), fetchUpstream: !request.noFetch });
+    console.log(JSON.stringify(output, null, 2));
+    if (!output.ok) process.exitCode = output.exitCode;
+    return;
+  }
+  if (command === 'pull') {
+    // Pull only updates the setup-repository checkout: it dispatches before
+    // repository manifest validation and the agent-directory check, and it
+    // neither requires nor uses --agent-dir.
+    const output = await runPull({ repo, apply: request.apply });
     console.log(JSON.stringify(output, null, 2));
     if (!output.ok) process.exitCode = output.exitCode;
     return;
@@ -73,7 +83,7 @@ async function main() {
   // keeps its own strict repository validation for resource removals.
   const declarations = await validateRepository(repo, { allowMissingPins: command === 'update' || command === 'remove' });
   if (command === 'push') {
-    const output = await runPush({ repo, declarations, publish: request.publish, previewWriter: (preview) => process.stderr.write(preview) });
+    const output = await runPush({ repo, declarations, publish: request.publish, message: request.message, previewWriter: (preview) => process.stderr.write(preview) });
     console.log(JSON.stringify(output, null, 2));
     return;
   }
@@ -107,7 +117,7 @@ async function main() {
     return;
   }
   if (command === 'update') {
-    const output = await runUpdate({ repo, agentDir, declarations, apply: request.apply, approve: request.approve, push: request.push, previewWriter: (preview) => process.stderr.write(preview) });
+    const output = await runUpdate({ repo, agentDir, declarations, apply: request.apply, approve: request.approve, push: request.push, message: request.message, previewWriter: (preview) => process.stderr.write(preview) });
     console.log(JSON.stringify(output, null, 2));
     return;
   }
@@ -131,4 +141,4 @@ async function main() {
   }
 }
 
-main().catch((error: any) => fail(error, ['PACKAGE_INSTALL_FAILED', 'APPROVAL_REQUIRED', 'UPDATE_TRANSACTION_FAILED', 'PUSH_BLOCKED', 'SYNC_BLOCKED', 'PI_UPDATE_FAILED'].includes(error?.errorCode) || /update (?:discovery )?stopped closed|^(Another Pi Sync|A stale Pi Sync)/.test(error.message) ? OPERATION_ERROR : VALIDATION_ERROR));
+main().catch((error: any) => fail(error, ['PACKAGE_INSTALL_FAILED', 'APPROVAL_REQUIRED', 'UPDATE_TRANSACTION_FAILED', 'PUSH_BLOCKED', 'SYNC_BLOCKED', 'PULL_BLOCKED', 'PULL_CONFLICT', 'PI_UPDATE_FAILED'].includes(error?.errorCode) || /update (?:discovery )?stopped closed|^(Another Pi Sync|A stale Pi Sync)/.test(error.message) ? OPERATION_ERROR : VALIDATION_ERROR));

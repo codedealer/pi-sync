@@ -33,15 +33,17 @@
  * completely silent.
  *
  * At session start the extension also makes remote commits visible without
- * pulling, merging, or applying them: a fetch-only `git fetch --quiet`,
- * skipped when FETCH_HEAD is younger than five minutes, single-flight,
- * bounded by a 15-second timeout, and triggered only at session start — the
- * tick never touches the network. The fetch's completion (success or
- * failure) runs the normal refresh path, so the ref and FETCH_HEAD changes
- * are picked up by the fingerprint like any other change. A fetch failure
- * is silent: network or authentication trouble is not a sync-state failure,
- * so it never shows the failure state, never announces itself, and the
- * footer keeps its last known state until the next session retries.
+ * pulling, merging, or applying them: the session-start refresh runs a
+ * fresh `pi-sync status`, which owns the upstream fetch (a bounded,
+ * fetch-only update of the Git metadata) and bypasses the shared status
+ * cache, so a new session is never satisfied by a cached remote summary.
+ * The session-start refresh is single-flight, so overlapping starts never
+ * duplicate the fetch. Every other refresh (the 60-second tick, watcher
+ * events, sync completion) runs the offline `pi-sync status --no-fetch`, so
+ * the tick never touches the network and the shared cache keeps
+ * deduplicating steady-state refreshes. A failed refresh shows the failure
+ * state without erasing the last successful summary, and the next session
+ * start retries the upstream refresh.
  *
  * At Pi process startup (session_start with reason "startup" — not on
  * resume, fork, new-session, or reload starts) a managed setup also
@@ -75,10 +77,8 @@ import { promisify } from "node:util";
 import {
   computeFingerprint,
   extractSummary,
-  fetchHeadPath,
   fingerprintPaths,
   fingerprintsEqual,
-  isFetchFresh,
   readStatusCache,
   renderFooter,
   statusCachePath,
@@ -91,9 +91,14 @@ const STATUS_ID = "pi-sync";
 const DEBOUNCE_MS = 400;
 const INITIAL_SYNC_DELAY_MS = 1500;
 const SYNC_TIMEOUT_MS = 20_000;
+// Timeout for the CLI `status` spawn. The CLI's own upstream fetch is
+// bounded at 15 s, so this must keep enough margin above it for the fetch
+// plus the validation/plan/state work to finish before the extension
+// kills the child; a tighter bound would turn a slow-but-fine fetch into
+// a spurious failed footer.
+const CLI_STATUS_TIMEOUT_MS = 30_000;
 const PI_UPDATE_TIMEOUT_MS = 20_000;
 const TICK_MS = 60_000;
-const FETCH_TIMEOUT_MS = 15_000;
 
 interface SyncedField {
   target: string;
@@ -155,18 +160,19 @@ export default function (pi: ExtensionAPI) {
   let footerShown = false;
   let statusWarned = false;
   let refreshGeneration = 0;
-  // Single-flight flag for the session-start fetch: while a fetch is in
-  // flight, further session starts skip their own fetch (the in-flight one's
-  // completion already triggers the refresh). The execFile timeout bounds
-  // the in-flight window, so the flag always clears within ~15 s. It is
+  // Single-flight flag for the session-start refresh: while one is in
+  // flight, further session starts skip their own refresh (the in-flight one
+  // runs the fresh CLI status, which owns the upstream fetch, and its
+  // completion renders and publishes the result). The CLI status timeout
+  // bounds the in-flight window, so the flag always clears. It is
   // deliberately not reset on shutdown: the in-flight child finishes on its
   // own and its completion refresh still runs, while resetting would allow
-  // two overlapping fetches in the same process.
-  let fetchInFlight = false;
+  // two overlapping upstream fetches in the same process.
+  let sessionStartRefreshInFlight = false;
   // The fingerprint the footer currently reflects — advanced only by a
   // successful refresh (or a cache hit), never by a failed one, so the next
   // trigger retries a failed check. Reset at session start so the first
-  // refresh of each session always at least consults the shared cache.
+  // refresh of each session always runs the fresh CLI status.
   let lastFingerprint: Fingerprint | undefined;
   let targetsMemo: { mtime: number | null; targets: string[] } | undefined;
 
@@ -301,7 +307,7 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  /**
+/**
    * The single refresh path for the persistent footer.
    *
    * Computes the flat metadata fingerprint (git refs, manifest, lockfile,
@@ -309,10 +315,18 @@ export default function (pi: ExtensionAPI) {
    *   1. fingerprint equals the in-memory last fingerprint → do nothing
    *      (the footer already reflects this state; steady-state cost is the
    *      fingerprint's stat calls only);
-   *   2. the shared status cache carries this fingerprint → render the
-   *      cached summary (another session already recomputed; no spawn);
+   *   2. (unless bypassCache) the shared status cache carries this
+   *      fingerprint → render the cached summary (another session already
+   *      recomputed; no spawn);
    *   3. otherwise run `pi-sync status`, render the summary, and publish
    *      { fingerprint, summary } to the shared cache.
+   *
+   * Two flavors: the session-start refresh (bypassCache) always runs the
+   * CLI status, which owns the bounded upstream fetch — a new session is
+   * never satisfied by a cached remote summary. Every other refresh passes
+   * offline, so the CLI status runs --no-fetch: it reads last-known
+   * tracking refs, touches no network, and the fingerprint (which includes
+   * FETCH_HEAD) invalidates the result once a fetch moves the upstream.
    *
    * Never awaited by the session-start path. A non-zero exit is not itself
    * a failure: the CLI emits its full JSON result on stdout even when
@@ -323,27 +337,32 @@ export default function (pi: ExtensionAPI) {
    * summary and never advances the in-memory fingerprint, so the next
    * trigger retries.
    */
-  async function refresh(ctx: ExtensionContext) {
+  async function refresh(ctx: ExtensionContext, options: { bypassCache?: boolean; offline?: boolean } = {}) {
     const generation = ++refreshGeneration;
     const fingerprint = computeFingerprint(
       fingerprintPaths({ repoDir: repoDir(), agentDir: agentDir(), settingsTargets: currentTargets() }),
     ) as Fingerprint;
     if (fingerprintsEqual(fingerprint, lastFingerprint)) return; // footer already correct
-    const cached = readStatusCache(statusCachePath(agentDir()));
-    if (cached !== null && fingerprintsEqual(cached.fingerprint, fingerprint)) {
-      lastSummary = cached.summary;
-      phase = "summary";
-      lastFingerprint = fingerprint;
-      setFooter(ctx);
-      return;
+    // The session-start refresh bypasses the shared cache: a new session
+    // must see a freshly fetched upstream state, not another session's
+    // cached remote summary.
+    if (!options.bypassCache) {
+      const cached = readStatusCache(statusCachePath(agentDir()));
+      if (cached !== null && fingerprintsEqual(cached.fingerprint, fingerprint)) {
+        lastSummary = cached.summary;
+        phase = "summary";
+        lastFingerprint = fingerprint;
+        setFooter(ctx);
+        return;
+      }
     }
     let stdout: string;
     try {
       stdout = await new Promise<string>((resolve, reject) => {
         execFile(
           cliBinary(),
-          ["status", "--repo", repoDir(), "--agent-dir", agentDir()],
-          { timeout: SYNC_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024, shell: shellFor(cliBinary()) },
+          ["status", ...(options.offline ? ["--no-fetch"] : []), "--repo", repoDir(), "--agent-dir", agentDir()],
+          { timeout: CLI_STATUS_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024, shell: shellFor(cliBinary()) },
           (error, out) => {
             if (error !== null && (error.killed === true || error.signal !== undefined)) {
               reject(error); // timeout or kill: no usable output
@@ -412,52 +431,28 @@ export default function (pi: ExtensionAPI) {
     setFooter(ctx);
   }
 
-  /**
-   * The session-start remote check: a fetch-only `git fetch --quiet`
-   * against the upstream that makes remote commits visible in the footer
-   * without ever pulling, merging, or applying them (applying remote
-   * changes remains the explicit human flow: pull, then `pi-sync apply`).
+/**
+   * The session-start remote awareness: the fresh refresh flavor, which
+   * runs the CLI status without the shared cache so the CLI's bounded
+   * upstream fetch makes remote commits visible in the footer without ever
+   * pulling, merging, or applying them (applying remote changes remains the
+   * explicit human flow: pull, then `pi-sync apply`). The extension no
+   * longer invokes git itself; the CLI owns the fetch, and a matching
+   * shared cache entry cannot suppress this refresh.
    *
-   * Skipped when the repository's FETCH_HEAD (rewritten by every fetch) is
-   * younger than five minutes — this covers back-to-back sessions and a
-   * fetch the user just ran. Otherwise a single-flight (never overlapping)
-   * child process runs the fetch with a 15-second timeout. The extension
-   * invokes git directly for this one read-only network operation; no CLI
-   * subcommand is introduced, and nothing else in the extension touches the
-   * network (the 60-second tick stays offline).
-   *
-   * On completion — success or failure — the normal refresh path is
-   * triggered, so the ref and FETCH_HEAD mtime changes are picked up by the
-   * fingerprint like any other change; when the fetch changed nothing (or
-   * failed), the refresh dedupes in memory and costs stat calls only.
-   * Failure is silent by design: network or authentication trouble is not a
-   * sync-state failure, so it never shows the failed state, never warns, and
-   * never touches the footer — which keeps its last known state — and the
-   * next session retries. Never awaited by the session-start path.
+   * Single-flight (never overlapping): while one is in flight, further
+   * session starts skip their own refresh, so the upstream fetch never
+   * duplicates within this process. Never awaited by the session-start
+   * path: startup stays asynchronous and unblocked.
    */
-  async function checkRemote(ctx: ExtensionContext) {
-    if (fetchInFlight) return; // single-flight: never overlapping
-    let fetchHeadMtimeMs: number | null = null;
+  async function sessionStartRefresh(ctx: ExtensionContext) {
+    if (sessionStartRefreshInFlight) return; // single-flight: never overlapping
+    sessionStartRefreshInFlight = true;
     try {
-      fetchHeadMtimeMs = statSync(fetchHeadPath(repoDir())).mtimeMs;
-    } catch {
-      // Absent or unreadable FETCH_HEAD: never fetched (or a non-git setup) — run the fetch.
-    }
-    if (isFetchFresh(fetchHeadMtimeMs, Date.now())) return; // a recent fetch already moved the upstream comparison
-    fetchInFlight = true;
-    try {
-      await new Promise<void>((resolve) => {
-        execFile(
-          "git",
-          ["fetch", "--quiet"],
-          { cwd: repoDir(), timeout: FETCH_TIMEOUT_MS, shell: shellFor("git") },
-          () => resolve(), // success and failure alike: the refresh below runs either way
-        );
-      });
+      await refresh(ctx, { bypassCache: true });
     } finally {
-      fetchInFlight = false;
+      sessionStartRefreshInFlight = false;
     }
-    void refresh(ctx);
   }
 
   async function runSync(ctx: ExtensionContext, manual: boolean) {
@@ -499,7 +494,7 @@ export default function (pi: ExtensionAPI) {
       // After every sync completion (watcher-triggered or manual), re-check
       // so the footer matches the sync's result; the fingerprint dedupes if
       // nothing the sync wrote is fingerprinted.
-      void refresh(ctx);
+      void refresh(ctx, { offline: true });
     }
   }
 
@@ -517,7 +512,7 @@ export default function (pi: ExtensionAPI) {
     if (refreshTimer) clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => {
       refreshTimer = undefined;
-      void refresh(ctx);
+      void refresh(ctx, { offline: true });
     }, DEBOUNCE_MS);
     refreshTimer.unref?.();
   }
@@ -571,22 +566,21 @@ export default function (pi: ExtensionAPI) {
     // never touches the network. unref'ed so it never keeps the process
     // alive.
     tick = setInterval(() => {
-      void refresh(ctx);
+      void refresh(ctx, { offline: true });
     }, TICK_MS);
     tick.unref?.();
     // Persistent footer: show the checking state immediately and run the
-    // first refresh asynchronously; nothing on the session-start path
-    // awaits the CLI. lastFingerprint is reset so the first refresh of this
-    // session always at least consults the shared cache.
+    // session-start refresh asynchronously; nothing on the session-start
+    // path awaits the CLI. The refresh bypasses the shared status cache and
+    // runs the CLI status, which owns the bounded upstream fetch, so a new
+    // session is never satisfied by a cached remote summary and the fetch
+    // never duplicates (single-flight). lastFingerprint is reset so the
+    // first refresh of this session always runs the fresh status.
     phase = "checking";
     lastSummary = undefined;
     lastFingerprint = undefined;
     setFooter(ctx);
-    void refresh(ctx);
-    // Session-start remote awareness: fetch-only, freshness-gated,
-    // single-flight, bounded; never awaited, and its completion triggers
-    // the normal refresh path.
-    void checkRemote(ctx);
+    void sessionStartRefresh(ctx);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {

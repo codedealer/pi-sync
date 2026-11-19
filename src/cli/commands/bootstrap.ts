@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { inspectRequiredTools, type PrerequisitesResult, type PrerequisiteTool } from '../../prerequisites.js';
 import { MANIFEST_FILE, pathsOverlap, readJson, validateRepository, type RepositoryDeclarations } from '../manifest.js';
-import { runCommand } from '../process.js';
+import { gitExecutable, runCommand } from '../process.js';
 import { ensureRealDirectory } from '../resource-operations.js';
 
 // Matches the entry point's operation-error exit status: bootstrap reports it
@@ -295,7 +295,7 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
     checkout = destination;
     authenticationMethod = null;
   } else {
-    const access = await runCommand('git', ['ls-remote', remote.value]);
+    const access = await runCommand(await gitExecutable(), ['ls-remote', remote.value]);
     if (access.status !== 0) {
       let ghAuthenticated = false;
       let ghAvailable = false;
@@ -342,7 +342,7 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
     // present (gh authentication is only probed for GitHub slugs), so the
     // slug is defined whenever the github-cli method is selected.
     const clone = authenticationMethod === 'git'
-      ? await runCommand('git', ['clone', '--quiet', '--', remote.value, checkout], cloneEnv)
+      ? await runCommand(await gitExecutable(), ['clone', '--quiet', '--', remote.value, checkout], cloneEnv)
       : await runCommand('gh', ['repo', 'clone', remote.githubSlug as string, checkout], cloneEnv);
     if (clone.status !== 0) {
       return bootstrapResponse(false, 'FETCH_FAILED',

@@ -18,6 +18,7 @@ export interface RequestBase {
 export interface StatusPlanRequest extends RequestBase {
   command: 'status' | 'plan';
   repo: string;
+  noFetch: boolean;
 }
 
 export interface ApplyRequest extends RequestBase {
@@ -71,10 +72,20 @@ export interface RegisterRequest extends RequestBase {
   mode: RegisterMode;
 }
 
+export interface PullRequest extends RequestBase {
+  command: 'pull';
+  repo: string;
+  apply: boolean;
+}
+
 export interface PushRequest extends RequestBase {
   command: 'push';
   repo: string;
   publish: boolean;
+  // Optional subject for the new managed-only commit this run creates. It
+  // never rewrites existing commits and has no effect when no commit is
+  // created.
+  message?: string;
 }
 
 export interface UpdateRequest extends RequestBase {
@@ -83,6 +94,8 @@ export interface UpdateRequest extends RequestBase {
   apply: boolean;
   push: boolean;
   approve: boolean;
+  // Forwarded to the shared push workflow only for `update --apply --push`.
+  message?: string;
 }
 
 export interface PiUpdateRequest extends RequestBase {
@@ -112,7 +125,7 @@ export interface VersionRequest {
 
 export type CommandRequest =
   | StatusPlanRequest | ApplyRequest | PruneRequest | AddRequest | RemoveRequest | RegisterRequest
-  | PushRequest | UpdateRequest | PiUpdateRequest | SyncRequest | BootstrapRequest | VersionRequest;
+  | PullRequest | PushRequest | UpdateRequest | PiUpdateRequest | SyncRequest | BootstrapRequest | VersionRequest;
 
 // Parsed option bag, mirroring the entry point's former `options` object.
 interface Options {
@@ -129,9 +142,11 @@ interface Options {
   applyUpdate: boolean;
   pushUpdate: boolean;
   publish: boolean;
+  message?: string;
   uninstall: boolean;
   list: boolean;
   all: boolean;
+  noFetch: boolean;
 }
 
 function parseOptions(argv: string[]): Options {
@@ -141,11 +156,11 @@ function parseOptions(argv: string[]): Options {
     agentDir: process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent'),
     binDir: path.join(os.homedir(), '.local', 'bin'),
     confirm: false, approve: false, applyUpdate: false, pushUpdate: false,
-    publish: false, uninstall: false, list: false, all: false,
+    publish: false, uninstall: false, list: false, all: false, noFetch: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (['--repo', '--repo-url', '--repo-dir', '--agent-dir', '--bin-dir', '--type', '--source', '--target'].includes(arg)) {
+    if (['--repo', '--repo-url', '--repo-dir', '--agent-dir', '--bin-dir', '--type', '--source', '--target', '--message'].includes(arg)) {
       const value = argv[++i];
       if (!value || value.startsWith('--')) throw new Error(`${arg} requires a value`);
       if (arg === '--repo') options.repo = value;
@@ -155,6 +170,7 @@ function parseOptions(argv: string[]): Options {
       else if (arg === '--bin-dir') options.binDir = value;
       else if (arg === '--type') options.type = value;
       else if (arg === '--target') options.target = value;
+      else if (arg === '--message') options.message = value;
       else options.source = value;
     } else if (arg === '--confirm') options.confirm = true;
     else if (arg === '--approve') options.approve = true;
@@ -164,6 +180,7 @@ function parseOptions(argv: string[]): Options {
     else if (arg === '--uninstall') options.uninstall = true;
     else if (arg === '--list') options.list = true;
     else if (arg === '--all') options.all = true;
+    else if (arg === '--no-fetch') options.noFetch = true;
     else throw new Error(`Unknown option: ${arg}`);
   }
   return options;
@@ -178,10 +195,14 @@ function buildRequest(command: string, options: Options, argv: string[]): Comman
   if (options.list && command !== 'register') throw new Error('--list is only supported by register');
   if (options.all && command !== 'register') throw new Error('--all is only supported by register');
   if (options.approve && !['apply', 'update', 'bootstrap'].includes(command)) throw new Error('--approve is only supported by apply, update, or bootstrap');
-  if (options.applyUpdate && !['update', 'sync', 'pi-update'].includes(command)) throw new Error('--apply is only supported by update, sync, or pi-update');
+  if (options.applyUpdate && !['update', 'sync', 'pi-update', 'pull'].includes(command)) throw new Error('--apply is only supported by update, sync, pi-update, or pull');
   if (options.pushUpdate && command !== 'update') throw new Error('--push is only supported by update');
   if (options.pushUpdate && !options.applyUpdate) throw new Error('update --push requires --apply so package updates are explicitly approved');
   if (options.publish && command !== 'push') throw new Error('--publish is only supported by push');
+  if (options.noFetch && !['status', 'plan'].includes(command)) throw new Error('--no-fetch is only supported by status and plan');
+  if (options.message !== undefined && !['push', 'update'].includes(command)) throw new Error('--message is only supported by push and update --apply --push');
+  if (options.message !== undefined && command === 'update' && !(options.applyUpdate && options.pushUpdate)) throw new Error('update --message requires --apply --push');
+  if (options.message !== undefined && !options.message.trim()) throw new Error('--message must not be empty');
   if (command === 'add' && (!options.type || !options.source)) throw new Error('add requires explicit --type and --source options');
   if (command === 'add' && !REMOVABLE_TYPES.includes(options.type as any)) throw new Error(`Unsupported resource type: ${options.type}`);
   // Exactly one of the three register modes is selected: a single
@@ -215,7 +236,7 @@ function buildRequest(command: string, options: Options, argv: string[]): Comman
   switch (command) {
     case 'status':
     case 'plan':
-      return { command, repo: options.repo, agentDir: options.agentDir };
+      return { command, repo: options.repo, agentDir: options.agentDir, noFetch: options.noFetch };
     case 'apply':
       return { command, repo: options.repo, agentDir: options.agentDir, approve: options.approve };
     case 'prune':
@@ -237,10 +258,15 @@ function buildRequest(command: string, options: Options, argv: string[]): Comman
           : options.list
             ? { list: true, ...(options.type !== undefined ? { type: options.type } : {}) }
             : { all: true, ...(options.type !== undefined ? { type: options.type } : {}) } };
+    case 'pull':
+      // Pull updates the setup-repository checkout only; it never touches the
+      // local installation, so the resolved agent directory is carried for
+      // union uniformity but is neither required nor used by the workflow.
+      return { command, repo: options.repo, agentDir: options.agentDir, apply: options.applyUpdate };
     case 'push':
-      return { command, repo: options.repo, agentDir: options.agentDir, publish: options.publish };
+      return { command, repo: options.repo, agentDir: options.agentDir, publish: options.publish, message: options.message };
     case 'update':
-      return { command, repo: options.repo, agentDir: options.agentDir, apply: options.applyUpdate, push: options.pushUpdate, approve: options.approve };
+      return { command, repo: options.repo, agentDir: options.agentDir, apply: options.applyUpdate, push: options.pushUpdate, approve: options.approve, message: options.message };
     case 'pi-update':
       return { command, repo: options.repo, agentDir: options.agentDir, apply: options.applyUpdate };
     case 'sync':
@@ -262,8 +288,8 @@ export function parseCommandRequest(argv: string[]): CommandRequest {
     if (argv.length > 1) throw new Error('--version does not accept additional arguments');
     return { command: 'version' };
   }
-  if (!['status', 'plan', 'apply', 'add', 'remove', 'register', 'prune', 'bootstrap', 'update', 'push', 'pi-update', 'sync'].includes(command as any)) {
-    throw new Error('Usage: pi-sync --version | pi-sync <status|plan|apply|add|remove|register|prune|update|pi-update|push|bootstrap|sync> [--repo PATH] [--repo-url URL --repo-dir PATH] [--agent-dir PATH] [--type skill|extension|prompt|agent|role|dependency --target VALUE | --source VALUE] [--list] [--all] [--confirm] [--approve] [--apply] [--push] [--publish] [--uninstall]');
+  if (!['status', 'plan', 'pull', 'apply', 'add', 'remove', 'register', 'prune', 'bootstrap', 'update', 'push', 'pi-update', 'sync'].includes(command as any)) {
+    throw new Error('Usage: pi-sync --version | pi-sync <status|plan|pull|apply|add|remove|register|prune|update|pi-update|push|bootstrap|sync> [--repo PATH] [--repo-url URL --repo-dir PATH] [--agent-dir PATH] [--no-fetch] [--type skill|extension|prompt|agent|role|dependency --target VALUE | --source VALUE] [--list] [--all] [--confirm] [--approve] [--apply] [--push] [--publish] [--uninstall] [--message TEXT]');
   }
-  return buildRequest(command as 'status' | 'plan' | 'apply' | 'add' | 'remove' | 'register' | 'prune' | 'bootstrap' | 'update' | 'pi-update' | 'push' | 'sync', parseOptions(argv.slice(1)), argv);
+  return buildRequest(command as 'status' | 'plan' | 'pull' | 'apply' | 'add' | 'remove' | 'register' | 'prune' | 'bootstrap' | 'update' | 'pi-update' | 'push' | 'sync', parseOptions(argv.slice(1)), argv);
 }

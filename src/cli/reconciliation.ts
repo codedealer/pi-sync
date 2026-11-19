@@ -474,19 +474,45 @@ export interface PublishState {
   dirty: boolean;
   ahead: number | null;
   behind: number | null;
+  upstream?: 'unavailable';
 }
 
-// Read-only publish state of the setup repository relative to its upstream,
-// computed with the same git primitives the managed push uses: working-tree
-// dirt from `git status --porcelain --untracked-files=no` (untracked files do
-// not count: managed-only push never stages them, so they are not
-// publishable changes) and ahead/behind from
+// Default bound for the status/plan upstream fetch; the same 15 seconds the
+// extension applied to its former session-start fetch.
+export const UPSTREAM_FETCH_TIMEOUT_MS = 15_000;
+
+export interface PublishStateOptions {
+  // Refresh the configured upstream (bounded `git fetch` of the upstream
+  // branch) before deriving ahead/behind. Metadata-only: the working tree
+  // and local installation are never touched. Off for consumers that accept
+  // last-known tracking refs (the extension's cached, offline refreshes).
+  fetch?: boolean;
+  fetchTimeoutMs?: number;
+}
+
+// Publish state of the setup repository relative to its upstream, computed
+// with the same git primitives the managed push uses: working-tree dirt from
+// `git status --porcelain --untracked-files=no` (untracked files do not
+// count: managed-only push never stages them, so they are not publishable
+// changes) and ahead/behind from
 // `git rev-list --left-right --count HEAD...@{upstream}`. Returns null when
 // the setup directory is not the root of a git working tree (status still
 // works in that case for manifest validation), and null ahead/behind when no
-// upstream can be resolved (no remote, no upstream configured, detached HEAD,
-// or an upstream ref that cannot be compared, such as an unfetched one).
-export async function repositoryPublishState(repo: string): Promise<PublishState | null> {
+// upstream can be resolved (no remote, no upstream configured, detached
+// HEAD, or an upstream ref that cannot be compared, such as an unfetched
+// one).
+//
+// By default this refreshes upstream state first: a bounded `git fetch` of
+// the configured upstream branch, so ahead/behind and the derived
+// remote-pending values are current. The fetch is metadata-only — it moves
+// remote-tracking refs and FETCH_HEAD and never touches the working tree or
+// the local installation. When the fetch fails (unreachable remote,
+// authentication, timeout) the stale tracking-ref counts are not presented
+// as current: the state reports `upstream: 'unavailable'` with null
+// ahead/behind while retaining the local dirt, so callers keep the local
+// inspection information without claiming a clean remote state.
+export async function repositoryPublishState(repo: string, options: PublishStateOptions = {}): Promise<PublishState | null> {
+  const { fetch = true, fetchTimeoutMs = UPSTREAM_FETCH_TIMEOUT_MS } = options;
   const top = await gitResult(repo, ['rev-parse', '--show-toplevel']);
   if (top.status !== 0) return null;
   if (path.resolve(top.output) !== path.resolve(repo)) return null;
@@ -496,10 +522,25 @@ export async function repositoryPublishState(repo: string): Promise<PublishState
   let behind: number | null = null;
   const upstream = await gitResult(repo, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']);
   if (upstream.status === 0) {
-    const counts = await gitResult(repo, ['rev-list', '--left-right', '--count', `HEAD...${upstream.output}`]);
-    if (counts.status === 0) {
-      const [left, right] = counts.output.split(/\s+/).map(Number);
-      if (Number.isInteger(left) && Number.isInteger(right)) { ahead = left; behind = right; }
+    // `@{upstream}` resolves to `<remote>/<branch>`; the remote name never
+    // contains a slash, so the first slash splits the pair.
+    const separator = upstream.output.indexOf('/');
+    const remote = separator === -1 ? null : upstream.output.slice(0, separator);
+    const branch = separator === -1 ? null : upstream.output.slice(separator + 1);
+    if (remote !== null && branch !== null && fetch) {
+      const result = await gitResult(repo, ['fetch', '--quiet', remote, branch], {}, fetchTimeoutMs);
+      if (result.status !== 0) {
+        // The tracking refs are stale: report the remote state as
+        // unavailable rather than presenting pre-fetch counts as current.
+        return { dirty: dirty.output.length > 0, ahead: null, behind: null, upstream: 'unavailable' };
+      }
+    }
+    if (remote !== null && branch !== null) {
+      const counts = await gitResult(repo, ['rev-list', '--left-right', '--count', `HEAD...${upstream.output}`]);
+      if (counts.status === 0) {
+        const [left, right] = counts.output.split(/\s+/).map(Number);
+        if (Number.isInteger(left) && Number.isInteger(right)) { ahead = left; behind = right; }
+      }
     }
   }
   return { dirty: dirty.output.length > 0, ahead, behind };
@@ -517,13 +558,18 @@ export interface StatusSummary {
 // exactly one stage): syncable fields, working-tree dirt, and ahead commits
 // are local-pending; behind commits and unapplied install/update actions are
 // remote-pending; conflict/collision actions, rejected and locally removed
-// fields, and locally diverged resources need review. syncable counts fields
+// fields, and locally diverged resources need review. clean is the conjunction
+// of zero counts and a verified (non-unavailable) upstream, so an unavailable
+// upstream never reads as a clean remote state. syncable counts fields
 // (the sync unit); review counts manifest items (actions).
 export function deriveStatusSummary(publishState: PublishState | null, sync: SyncClassification, conflicts: PlanOutputAction[], actions: PlanOutputAction[]): StatusSummary {
   const localPending = sync.syncable.length + (publishState ? (publishState.dirty ? 1 : 0) + (publishState.ahead ?? 0) : 0);
   const remotePending = (publishState?.behind ?? 0) + actions.filter((item) => item.action === 'install' || item.action === 'update').length;
   const needsReview = conflicts.length + sync.rejected.length + sync.review.length +
     actions.filter((item) => item.type !== 'setting' && item.action === 'local-divergence').length;
-  const clean = localPending === 0 && remotePending === 0 && needsReview === 0;
+  // A zero-count summary is only "clean" when the remote state was actually
+  // verified: an unavailable upstream means the remote is unknown, not clean,
+  // so summary consumers never see a verified-clean remote state.
+  const clean = localPending === 0 && remotePending === 0 && needsReview === 0 && publishState?.upstream !== 'unavailable';
   return { localPending, remotePending, needsReview, clean };
 }

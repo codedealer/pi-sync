@@ -58,7 +58,7 @@ to it once the next check succeeds.
 At session start the extension also makes remote commits visible without
 manual action: an async, fetch-only `git fetch` against the upstream that
 never pulls, merges, or applies anything (applying remote changes remains the
-explicit human flow: pull, then `pi-sync apply`). The fetch is
+explicit human flow: `pi-sync pull`, then `pi-sync apply`). The fetch is
 freshness-gated (skipped when the repository's `FETCH_HEAD` is younger than
 five minutes), single-flight, and bounded by a 15-second timeout, so network
 access happens at most once per session and the periodic tick never touches

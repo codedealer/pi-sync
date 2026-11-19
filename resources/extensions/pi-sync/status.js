@@ -7,9 +7,10 @@
  * of `pi-sync status`, and all glyph, ordering, and color decisions for the
  * persistent footer live here.
  *
- * The session-start fetch's freshness gate also lives here: a fetch is
- * skipped when the repository's FETCH_HEAD (rewritten by every fetch) is
- * younger than five minutes.
+ * Upstream freshness is owned by the CLI: `pi-sync status` performs the
+ * bounded upstream fetch, and the shared cache's fingerprint (which
+ * includes the repository's FETCH_HEAD) invalidates cached summaries once
+ * any fetch moves the upstream state.
  *
  * Footer state table (colors are applied by the style callback):
  *   pi-sync ✓   clean: no local drift, not behind upstream, nothing needs review
@@ -148,31 +149,6 @@ export function fingerprintsEqual(a, b) {
   return true;
 }
 
-/**
- * The setup repository's FETCH_HEAD, which git rewrites on every fetch and
- * whose mtime gates the session-start fetch.
- */
-export function fetchHeadPath(repoDir) {
-  return path.join(repoDir, ".git", "FETCH_HEAD");
-}
-
-/** Maximum FETCH_HEAD age (in milliseconds) for which the session-start fetch is skipped. */
-export const FETCH_MAX_AGE_MS = 5 * 60 * 1000;
-
-/**
- * The session-start fetch's freshness gate: true when FETCH_HEAD's mtime is
- * younger than maxAgeMs relative to nowMs — a recent fetch already moved the
- * upstream comparison, so fetching again is skipped. A missing FETCH_HEAD
- * (null mtime) is never fresh: the fetch runs. Non-numeric input is never
- * fresh, so a bad read can only cost a redundant fetch, never a stale skip.
- */
-export function isFetchFresh(fetchHeadMtimeMs, nowMs, maxAgeMs = FETCH_MAX_AGE_MS) {
-  return (
-    typeof fetchHeadMtimeMs === "number" &&
-    Number.isFinite(fetchHeadMtimeMs) &&
-    nowMs - fetchHeadMtimeMs < maxAgeMs
-  );
-}
 
 /**
  * Shared status cache location: the agent directory's local bookkeeping

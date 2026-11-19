@@ -362,6 +362,7 @@ test('public npm package allowlist includes the CLI, skill, and extension but ex
   assert.ok(files.includes('dist/cli/commands/bootstrap.js'));
   assert.ok(files.includes('dist/cli/commands/prune.js'));
   assert.ok(files.includes('dist/cli/commands/push.js'));
+  assert.ok(files.includes('dist/cli/commands/pull.js'));
   assert.ok(files.includes('dist/cli/commands/resources.js'));
   assert.ok(files.includes('dist/cli/commands/update.js'));
   assert.ok(files.includes('src/cli/arguments.ts'));
@@ -381,7 +382,7 @@ test('public npm package allowlist includes the CLI, skill, and extension but ex
   assert.ok(files.includes('resources/extensions/pi-sync/status.js'));
   assert.ok(files.includes('resources/extensions/pi-sync/process.js'));
   assert.ok(!files.some((item) => /^(?:test(?:\/|$)|test-support(?:\/|$)|\.scratch(?:\/|$)|resources\/skills\/(?!pi-sync\/))/.test(item)));
-  assert.deepEqual(files.sort(), ['LICENSE', 'README.md', 'dist/cli.js', 'dist/cli/arguments.js', 'dist/cli/commands/apply.js', 'dist/cli/commands/bootstrap.js', 'dist/cli/commands/inspect.js', 'dist/cli/commands/pi-update.js', 'dist/cli/commands/prune.js', 'dist/cli/commands/push.js', 'dist/cli/commands/resources.js', 'dist/cli/commands/sync.js', 'dist/cli/commands/update.js', 'dist/cli/local-state.js', 'dist/cli/manifest.js', 'dist/cli/process.js', 'dist/cli/reconciliation.js', 'dist/cli/resource-operations.js', 'dist/packages.js', 'dist/prerequisites.js', 'package.json', 'resources/extensions/pi-sync/README.md', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/process.js', 'resources/extensions/pi-sync/status.js', 'resources/skills/pi-sync/SKILL.md', 'src/cli.ts', 'src/cli/README.md', 'src/cli/arguments.ts', 'src/cli/commands/apply.ts', 'src/cli/commands/bootstrap.ts', 'src/cli/commands/inspect.ts', 'src/cli/commands/pi-update.ts', 'src/cli/commands/prune.ts', 'src/cli/commands/push.ts', 'src/cli/commands/resources.ts', 'src/cli/commands/sync.ts', 'src/cli/commands/update.ts', 'src/cli/local-state.ts', 'src/cli/manifest.ts', 'src/cli/process.ts', 'src/cli/reconciliation.ts', 'src/cli/resource-operations.ts', 'src/packages.ts', 'src/prerequisites.ts']);
+  assert.deepEqual(files.sort(), ['LICENSE', 'README.md', 'dist/cli.js', 'dist/cli/arguments.js', 'dist/cli/commands/apply.js', 'dist/cli/commands/bootstrap.js', 'dist/cli/commands/inspect.js', 'dist/cli/commands/pi-update.js', 'dist/cli/commands/prune.js', 'dist/cli/commands/pull.js', 'dist/cli/commands/push.js', 'dist/cli/commands/resources.js', 'dist/cli/commands/sync.js', 'dist/cli/commands/update.js', 'dist/cli/local-state.js', 'dist/cli/manifest.js', 'dist/cli/process.js', 'dist/cli/reconciliation.js', 'dist/cli/resource-operations.js', 'dist/packages.js', 'dist/prerequisites.js', 'package.json', 'resources/extensions/pi-sync/README.md', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/process.js', 'resources/extensions/pi-sync/status.js', 'resources/skills/pi-sync/SKILL.md', 'src/cli.ts', 'src/cli/README.md', 'src/cli/arguments.ts', 'src/cli/commands/apply.ts', 'src/cli/commands/bootstrap.ts', 'src/cli/commands/inspect.ts', 'src/cli/commands/pi-update.ts', 'src/cli/commands/prune.ts', 'src/cli/commands/pull.ts', 'src/cli/commands/push.ts', 'src/cli/commands/resources.ts', 'src/cli/commands/sync.ts', 'src/cli/commands/update.ts', 'src/cli/local-state.ts', 'src/cli/manifest.ts', 'src/cli/process.ts', 'src/cli/reconciliation.ts', 'src/cli/resource-operations.ts', 'src/packages.ts', 'src/prerequisites.ts']);
 });
 
 test('supported agent commands share a versioned JSON response contract', async (t) => {
@@ -1142,6 +1143,638 @@ test('status and plan report the repository publish state for git setups', async
   assert.deepEqual(nonGit.summary, { localPending: 0, remotePending: 1, needsReview: 0, clean: false });
 });
 
+test('status and plan fetch the upstream before reporting, touching only git metadata', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  const agentDir = path.join(root, 'agent');
+  await fs.mkdir(agentDir);
+  const args = ['--repo', repo, '--agent-dir', agentDir];
+  const statusOutput = (processResult) => {
+    assert.equal(processResult.status, 0, processResult.stderr);
+    return result(processResult);
+  };
+
+  // Remote advancement committed in a clone of the bare origin — with no
+  // prior manual fetch in the checkout, so the tracking ref cannot know.
+  const clone = path.join(root, 'second-clone');
+  gitAt(root, ['clone', bare, clone]);
+  gitAt(clone, ['config', 'user.name', 'Pi Sync Test']);
+  gitAt(clone, ['config', 'user.email', 'pi-sync-test@example.invalid']);
+  await fs.appendFile(path.join(clone, 'resources', 'skills', 'hello', 'SKILL.md'), '# Remote update\n');
+  gitAt(clone, ['commit', '-am', 'remote change']);
+  gitAt(clone, ['push', 'origin', 'main']);
+  const remoteHead = gitAt(clone, ['rev-parse', 'HEAD']);
+  assert.notEqual(gitAt(repo, ['rev-parse', 'origin/main']), remoteHead, 'the checkout has not fetched yet');
+
+  const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
+  const indexBefore = gitAt(repo, ['ls-files', '--stage']);
+
+  // status and plan each report the fresh behind count with no manual fetch.
+  for (const command of ['status', 'plan']) {
+    const output = statusOutput(run([command, ...args]));
+    assert.deepEqual(output.repository, { dirty: false, ahead: 0, behind: 1 }, command);
+    assert.equal(gitAt(repo, ['rev-parse', 'origin/main']), remoteHead, `${command} moved the tracking ref`);
+  }
+
+  // The fetch updates Git metadata only: HEAD, the index, and the working
+  // tree are all unchanged.
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), headBefore, 'HEAD unchanged');
+  assert.equal(gitAt(repo, ['ls-files', '--stage']), indexBefore, 'index unchanged');
+  assert.equal(gitAt(repo, ['status', '--porcelain']), '', 'working tree unchanged');
+});
+
+test('status and plan report an unavailable upstream instead of stale counts when the fetch fails', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  const agentDir = path.join(root, 'agent');
+  await fs.mkdir(agentDir);
+  const args = ['--repo', repo, '--agent-dir', agentDir];
+
+  // Advance the remote and let the tracking ref learn about it, so a failed
+  // fetch would otherwise tempt a stale behind count (1).
+  const clone = path.join(root, 'second-clone');
+  gitAt(root, ['clone', bare, clone]);
+  gitAt(clone, ['config', 'user.name', 'Pi Sync Test']);
+  gitAt(clone, ['config', 'user.email', 'pi-sync-test@example.invalid']);
+  await fs.appendFile(path.join(clone, 'resources', 'skills', 'hello', 'SKILL.md'), '# Remote update\n');
+  gitAt(clone, ['commit', '-am', 'remote change']);
+  gitAt(clone, ['push', 'origin', 'main']);
+  gitAt(repo, ['fetch', '--quiet']);
+
+  // The remote becomes unreachable, so every fetch from here on fails.
+  gitAt(repo, ['remote', 'set-url', 'origin', path.join(root, 'gone.git')]);
+
+  for (const command of ['status', 'plan']) {
+    const processResult = run([command, ...args]);
+    assert.equal(processResult.status, 0, processResult.stderr);
+    const output = result(processResult);
+    assert.equal(output.exitCode, 0);
+    // The stale tracking-ref counts are not presented as current, and no
+    // clean remote state is claimed: the upstream is explicitly unavailable.
+    assert.deepEqual(output.repository, { dirty: false, ahead: null, behind: null, upstream: 'unavailable' }, command);
+    // Local inspection information is retained: the unapplied install action
+    // still counts, but the stale behind commit does not.
+    assert.deepEqual(output.summary, { localPending: 0, remotePending: 1, needsReview: 0, clean: false }, command);
+    assert.ok(output.actions.some((item) => item.action === 'install'), `local actions retained (${command})`);
+  }
+
+  // A failed fetch does not mask working-tree dirt: local state stays visible.
+  await fs.appendFile(path.join(repo, 'pi-sync.json'), '\n');
+  const dirty = result(run(['status', ...args]));
+  assert.deepEqual(dirty.repository, { dirty: true, ahead: null, behind: null, upstream: 'unavailable' });
+});
+test('an unavailable upstream never reads as a verified-clean summary', async (t) => {
+  const { root, repo } = await pushFixture(t);
+  const agentDir = path.join(root, 'agent');
+  await fs.mkdir(agentDir);
+  const args = ['--repo', repo, '--agent-dir', agentDir];
+  assert.equal(run(['apply', ...args]).status, 0);
+
+  // The remote becomes unreachable only after the local state is fully
+  // applied, so every summary count is zero and the only unknown is the
+  // remote: the summary must not claim a verified-clean remote state.
+  gitAt(repo, ['remote', 'set-url', 'origin', path.join(root, 'gone.git')]);
+
+  for (const command of ['status', 'plan']) {
+    const output = result(run([command, ...args]));
+    assert.deepEqual(output.repository, { dirty: false, ahead: null, behind: null, upstream: 'unavailable' }, command);
+    assert.deepEqual(output.summary, { localPending: 0, remotePending: 0, needsReview: 0, clean: false }, command);
+  }
+});
+
+test('status --no-fetch accepts last-known tracking refs without fetching', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  const agentDir = path.join(root, 'agent');
+  await fs.mkdir(agentDir);
+  const args = ['--repo', repo, '--agent-dir', agentDir];
+
+  const clone = path.join(root, 'second-clone');
+  gitAt(root, ['clone', bare, clone]);
+  gitAt(clone, ['config', 'user.name', 'Pi Sync Test']);
+  gitAt(clone, ['config', 'user.email', 'pi-sync-test@example.invalid']);
+  await fs.appendFile(path.join(clone, 'resources', 'skills', 'hello', 'SKILL.md'), '# Remote update\n');
+  gitAt(clone, ['commit', '-am', 'remote change']);
+  gitAt(clone, ['push', 'origin', 'main']);
+  const remoteHead = gitAt(clone, ['rev-parse', 'HEAD']);
+  const trackingBefore = gitAt(repo, ['rev-parse', 'origin/main']);
+  assert.notEqual(trackingBefore, remoteHead);
+
+  const processResult = run(['status', '--no-fetch', ...args]);
+  assert.equal(processResult.status, 0, processResult.stderr);
+  const output = result(processResult);
+  assert.deepEqual(output.repository, { dirty: false, ahead: 0, behind: 0 }, 'last-known refs, no fresh fetch');
+  assert.equal(gitAt(repo, ['rev-parse', 'origin/main']), trackingBefore, 'the tracking ref was not updated');
+
+  // --no-fetch is only meaningful for the inspect commands.
+  const rejected = run(['prune', '--no-fetch', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(rejected.status, 2);
+  assert.match(JSON.parse(rejected.stdout).error, /--no-fetch is only supported by status and plan/);
+});
+async function advanceUpstream(t, root, bare, marker) {
+  const clone = path.join(root, `second-clone-${marker}`);
+  gitAt(root, ['clone', bare, clone]);
+  gitAt(clone, ['config', 'user.name', 'Pi Sync Test']);
+  gitAt(clone, ['config', 'user.email', 'pi-sync-test@example.invalid']);
+  await fs.appendFile(path.join(clone, 'resources', 'skills', 'hello', 'SKILL.md'), `# Remote update ${marker}\n`);
+  gitAt(clone, ['commit', '-am', `remote change ${marker}`]);
+  gitAt(clone, ['push', 'origin', 'main']);
+  return gitAt(clone, ['rev-parse', 'HEAD']);
+}
+
+test('pull previews upstream changes without modifying the checkout', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  const remoteHead = await advanceUpstream(t, root, bare, 'one');
+
+  const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
+  const trackingBefore = gitAt(repo, ['rev-parse', 'origin/main']);
+  assert.notEqual(trackingBefore, remoteHead, 'the checkout has not fetched yet');
+  const worktreeBefore = await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8');
+
+  // pull resolves --repo like the other repository commands and does not
+  // require --agent-dir.
+  const processResult = run(['pull', '--repo', repo]);
+  assert.equal(processResult.status, 0, processResult.stderr);
+  const output = result(processResult);
+  assert.equal(output.command, 'pull');
+  assert.equal(output.ok, true);
+  assert.equal(output.exitCode, 0);
+  assert.equal(output.mode, 'preview');
+  assert.equal(output.branch, 'main');
+  assert.equal(output.upstream, 'origin/main');
+  assert.equal(output.ahead, 0);
+  assert.equal(output.behind, 1);
+  assert.equal(output.upToDate, false);
+  assert.equal(output.diverged, false);
+  assert.equal(output.dirty, false);
+  assert.deepEqual(output.dirtyPaths, []);
+  assert.deepEqual(output.changedPaths, ['resources/skills/hello/SKILL.md']);
+  assert.deepEqual(output.nextSteps, ['pi-sync plan', 'pi-sync apply']);
+
+  // Preview is read-only apart from Git metadata: HEAD, the index, and the
+  // working-tree contents are untouched, while the tracking ref learned the
+  // fresh tip.
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), headBefore, 'preview does not move HEAD');
+  assert.equal(gitAt(repo, ['rev-parse', 'origin/main']), remoteHead, 'preview fetched upstream metadata');
+  assert.equal(gitAt(repo, ['status', '--porcelain']), '', 'preview leaves the index and worktree untouched');
+  assert.equal(await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8'), worktreeBefore);
+});
+
+test('pull --apply fast-forwards a clean branch without merging or rewriting history', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  const remoteHead = await advanceUpstream(t, root, bare, 'one');
+  const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
+
+  const processResult = run(['pull', '--apply', '--repo', repo]);
+  assert.equal(processResult.status, 0, processResult.stderr);
+  const output = result(processResult);
+  assert.equal(output.mode, 'applied');
+  assert.equal(output.upToDate, true);
+  assert.equal(output.ahead, 0);
+  assert.equal(output.behind, 0);
+  assert.equal(output.fromCommit, headBefore);
+  assert.equal(output.toCommit, remoteHead);
+  assert.deepEqual(output.changedPaths, ['resources/skills/hello/SKILL.md']);
+  assert.deepEqual(output.nextSteps, ['pi-sync plan', 'pi-sync apply']);
+
+  // The branch advanced by fast-forward only: it is at the fetched tip with
+  // linear history (no merge commits, first-parent history intact).
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), remoteHead);
+  assert.equal(gitAt(repo, ['rev-list', '--left-right', '--count', 'HEAD...origin/main']), '0\t0');
+  assert.equal(gitAt(repo, ['rev-list', '--merges', 'HEAD']), '', 'no merge commits were created');
+  assert.equal(gitAt(repo, ['rev-list', '--count', '--first-parent', 'HEAD']), gitAt(repo, ['rev-list', '--count', 'HEAD']), 'history stayed linear');
+  assert.equal(gitAt(repo, ['status', '--porcelain']), '');
+
+  // A repeat apply is an idempotent no-op that still guides the workflow.
+  const again = result(run(['pull', '--apply', '--repo', repo]));
+  assert.equal(again.mode, 'applied');
+  assert.equal(again.upToDate, true);
+  assert.deepEqual(again.changedPaths, []);
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), remoteHead);
+});
+
+test('pull --apply rechecks upstream before mutating instead of applying a stale preview', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  await advanceUpstream(t, root, bare, 'one');
+  const preview = result(run(['pull', '--repo', repo]));
+  assert.equal(preview.behind, 1);
+
+  // The upstream advances a second time after the preview was taken.
+  const remoteHead = await advanceUpstream(t, root, bare, 'two');
+  const output = result(run(['pull', '--apply', '--repo', repo]));
+  assert.equal(output.mode, 'applied');
+  assert.equal(output.toCommit, remoteHead, 'the fresh tip, not the previewed one, was applied');
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), remoteHead);
+});
+
+test('pull treats a local-ahead branch without upstream advancement as up to date', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  await fs.appendFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Local update\n');
+  gitAt(repo, ['commit', '-am', 'local change']);
+  const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
+
+  const preview = result(run(['pull', '--repo', repo]));
+  assert.equal(preview.mode, 'preview');
+  assert.equal(preview.ahead, 1);
+  assert.equal(preview.behind, 0);
+  assert.equal(preview.upToDate, true);
+  assert.equal(preview.diverged, false);
+  assert.match(preview.note, /pi-sync push/);
+
+  const output = result(run(['pull', '--apply', '--repo', repo]));
+  assert.equal(output.mode, 'applied');
+  assert.equal(output.upToDate, true);
+  assert.equal(output.ahead, 1);
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), headBefore, 'local-only commits remain pushable');
+});
+
+test('pull refuses a diverged branch without losing local commits or edits', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  await fs.appendFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Local update\n');
+  gitAt(repo, ['commit', '-am', 'local change']);
+  const localHead = gitAt(repo, ['rev-parse', 'HEAD']);
+  await advanceUpstream(t, root, bare, 'one');
+
+  // The preview reports the divergence read-only.
+  const preview = result(run(['pull', '--repo', repo]));
+  assert.equal(preview.mode, 'preview');
+  assert.equal(preview.ahead, 1);
+  assert.equal(preview.behind, 1);
+  assert.equal(preview.diverged, true);
+  assert.match(preview.note, /Reconcile/);
+
+  // The apply refuses and leaves history and worktree intact.
+  const rejected = run(['pull', '--apply', '--repo', repo]);
+  assert.equal(rejected.status, 1);
+  const output = JSON.parse(rejected.stdout);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'PULL_BLOCKED');
+  assert.match(output.error, /diverged/);
+  assert.equal(output.details.ahead, 1);
+  assert.equal(output.details.behind, 1);
+  assert.deepEqual(output.details.nextSteps, ['pi-sync plan', 'pi-sync apply']);
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), localHead, 'HEAD was not moved');
+  assert.equal(gitAt(repo, ['status', '--porcelain']), '', 'the local commit and worktree were preserved');
+});
+
+// A git shim placed first on PATH that fails the named step ('merge',
+// 'stash-apply', 'stash-verify', or 'stash-drop') and delegates everything
+// so a test can exercise a pull failure at a specific step.
+async function failingGit(t, fail) {
+  const bin = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-failing-git-'));
+  t.after(() => fs.rm(bin, { recursive: true, force: true }));
+  const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+  await fs.writeFile(path.join(bin, 'git'),
+    `#!${process.execPath}\n` +
+    `const { spawnSync } = require('node:child_process');\n` +
+    `const args = process.argv.slice(2);\n` +
+    `let i = 0; while (args[i] === '-C' || args[i] === '-c') i += 2;\n` +
+    `const fail = process.env.FAKE_GIT_FAIL || '';\n` +
+    `const isMerge = args[i] === 'merge';\n` +
+    `const isStashApply = args[i] === 'stash' && args[i + 1] === 'apply';\n` +
+    `const isStashVerify = args[i] === 'log' && args[i + 3] === 'refs/stash';\n` +
+    `const isStashDrop = args[i] === 'stash' && args[i + 1] === 'drop';\n` +
+    `if ((fail === 'merge' && isMerge) || (fail === 'stash-apply' && isStashApply) || (fail === 'stash-verify' && isStashVerify) || (fail === 'stash-drop' && isStashDrop)) { process.stderr.write('simulated ' + fail + ' failure\\n'); process.exit(1); }\n` +
+    `const real = spawnSync(process.env.REAL_GIT, args, { stdio: 'inherit' });\n` +
+    `process.exit(real.status === null ? 1 : real.status);\n`,
+    { mode: 0o755 });
+  return { PATH: `${bin}${path.delimiter}${process.env.PATH}`, REAL_GIT: realGit, FAKE_GIT_FAIL: fail };
+}
+
+test('pull --apply restores staged, unstaged, and untracked local edits after a clean fast-forward', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  const remoteHead = await advanceUpstream(t, root, bare, 'one');
+  const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
+
+  // A staged change, an unstaged change, and a non-ignored untracked file.
+  const manifest = await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8');
+  await fs.writeFile(path.join(repo, 'pi-sync.json'), `${manifest}\n`);
+  gitAt(repo, ['add', 'pi-sync.json']);
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Local heading\n# Hello\n');
+  await fs.writeFile(path.join(repo, 'scratch.txt'), 'untracked\n');
+  const statusBefore = gitAt(repo, ['status', '--porcelain']);
+
+  // The preview reports the dirt read-only while still previewing upstream.
+  const preview = result(run(['pull', '--repo', repo]));
+  assert.equal(preview.mode, 'preview');
+  assert.equal(preview.dirty, true);
+  assert.deepEqual([...preview.dirtyPaths].sort(), ['pi-sync.json', 'resources/skills/hello/SKILL.md', 'scratch.txt']);
+  assert.equal(preview.behind, 1);
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), headBefore, 'preview does not move HEAD');
+  assert.equal(gitAt(repo, ['status', '--porcelain']), statusBefore, 'preview leaves index and worktree untouched');
+
+  const processResult = run(['pull', '--apply', '--repo', repo]);
+  assert.equal(processResult.status, 0, processResult.stderr);
+  const output = result(processResult);
+  assert.equal(output.mode, 'applied');
+  assert.equal(output.upToDate, true);
+  assert.equal(output.ahead, 0);
+  assert.equal(output.behind, 0);
+  assert.equal(output.fromCommit, headBefore);
+  assert.equal(output.toCommit, remoteHead);
+  assert.equal(output.dirty, true);
+  assert.deepEqual([...output.dirtyPaths].sort(), ['pi-sync.json', 'resources/skills/hello/SKILL.md', 'scratch.txt']);
+  assert.match(output.snapshotDiscarded, /^[0-9a-f]{40}$/, 'the pre-pull snapshot was created and discarded');
+
+  // The branch advanced by fast-forward only, and every local edit survived
+  // the snapshot/restore with its staging state intact.
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), remoteHead);
+  assert.equal(gitAt(repo, ['rev-list', '--merges', 'HEAD']), '', 'no merge commits were created');
+  assert.equal(gitAt(repo, ['rev-list', '--left-right', '--count', 'HEAD...origin/main']), '0\t0');
+  const status = gitAt(repo, ['status', '--porcelain']).split('\n');
+  assert.equal(status.length, 3);
+  assert.ok(status.includes('M  pi-sync.json'), 'the staged change is restored as staged');
+  assert.ok(status.includes(' M resources/skills/hello/SKILL.md'), 'the unstaged change is restored');
+  assert.ok(status.includes('?? scratch.txt'), 'the untracked file is restored');
+  const skill = await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8');
+  assert.equal(skill, '# Local heading\n# Hello\n# Remote update one\n', 'local and upstream edits were combined by Git');
+  assert.equal(await fs.readFile(path.join(repo, 'scratch.txt'), 'utf8'), 'untracked\n');
+  // Only this pull's snapshot was discarded; no recovery snapshot remains.
+  assert.equal(gitAt(repo, ['stash', 'list']), '');
+});
+
+test('pull --apply combines disjoint local and upstream edits with Git three-way behavior', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  // Grow the base to two committed lines so the local edit (line 1) and the
+  // upstream edit (an appended line) land on disjoint lines.
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Hello\n# Body\n');
+  gitAt(repo, ['commit', '-am', 'second line']);
+  gitAt(repo, ['push', 'origin', 'main']);
+  const remoteHead = await advanceUpstream(t, root, bare, 'one');
+
+  // The local edit modifies line 1; the upstream appended after line 2.
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Local heading\n# Body\n');
+
+  const processResult = run(['pull', '--apply', '--repo', repo]);
+  assert.equal(processResult.status, 0, processResult.stderr);
+  const output = result(processResult);
+  assert.equal(output.mode, 'applied');
+  assert.equal(output.toCommit, remoteHead);
+  const skill = await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8');
+  // Pi Sync does not merge content itself: Git combined both sides.
+  assert.equal(skill, '# Local heading\n# Body\n# Remote update one\n');
+});
+
+test('pull --apply reports overlapping edits as conflicts and retains the recovery snapshot', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  const clone = path.join(root, 'second-clone');
+  gitAt(root, ['clone', bare, clone]);
+  gitAt(clone, ['config', 'user.name', 'Pi Sync Test']);
+  gitAt(clone, ['config', 'user.email', 'pi-sync-test@example.invalid']);
+  await fs.writeFile(path.join(clone, 'resources', 'skills', 'hello', 'SKILL.md'), '# Remote heading\n');
+  gitAt(clone, ['commit', '-am', 'remote change']);
+  gitAt(clone, ['push', 'origin', 'main']);
+  const remoteHead = gitAt(clone, ['rev-parse', 'HEAD']);
+
+  // The local edit touches the same line as the upstream change.
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Local heading\n');
+
+  const rejected = run(['pull', '--apply', '--repo', repo]);
+  assert.equal(rejected.status, 1);
+  const output = JSON.parse(rejected.stdout);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'PULL_CONFLICT');
+  assert.match(output.error, /conflicts/i);
+  assert.equal(output.details.toCommit, remoteHead, 'the branch was advanced');
+  assert.deepEqual(output.details.conflictedPaths, ['resources/skills/hello/SKILL.md']);
+  assert.equal(output.details.snapshot.ref, 'stash@{0}');
+  assert.match(output.details.snapshot.message, /^pi-sync: pull snapshot /);
+  assert.ok(Array.isArray(output.details.recovery) && output.details.recovery.length > 0);
+  assert.deepEqual(output.details.nextSteps, ['pi-sync plan', 'pi-sync apply']);
+
+  // Git's unresolved conflict state is left for the user, and the recovery
+  // snapshot is retained (never silently discarded).
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), remoteHead);
+  const skill = await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8');
+  assert.match(skill, /<<<<<<</, 'conflict markers remain in the working tree');
+  assert.equal(gitAt(repo, ['status', '--porcelain']), 'UU resources/skills/hello/SKILL.md');
+  const stashList = gitAt(repo, ['stash', 'list']);
+  assert.match(stashList, /^stash@\{0\}: On main: pi-sync: pull snapshot /m);
+  assert.equal(gitAt(repo, ['rev-parse', 'refs/stash']), output.details.snapshot.sha, 'the reported identifier resolves');
+});
+
+test('pull --apply never overwrites a local untracked file that the upstream adds', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  const clone = path.join(root, 'second-clone');
+  gitAt(root, ['clone', bare, clone]);
+  gitAt(clone, ['config', 'user.name', 'Pi Sync Test']);
+  gitAt(clone, ['config', 'user.email', 'pi-sync-test@example.invalid']);
+  await fs.writeFile(path.join(clone, 'scratch.txt'), 'theirs\n');
+  gitAt(clone, ['add', 'scratch.txt']);
+  gitAt(clone, ['commit', '-m', 'add scratch']);
+  gitAt(clone, ['push', 'origin', 'main']);
+  const remoteHead = gitAt(clone, ['rev-parse', 'HEAD']);
+
+  // A local untracked file at the path the upstream newly tracks.
+  await fs.writeFile(path.join(repo, 'scratch.txt'), 'mine\n');
+
+  const rejected = run(['pull', '--apply', '--repo', repo]);
+  assert.equal(rejected.status, 1);
+  const output = JSON.parse(rejected.stdout);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'PULL_CONFLICT');
+  assert.match(output.error, /untracked/i);
+  assert.equal(output.details.toCommit, remoteHead);
+  assert.deepEqual(output.details.conflictedPaths, ['scratch.txt']);
+
+  // The branch carries the upstream file, and the local content is not lost:
+  // Git refused to clobber it, and it is recoverable from the retained
+  // recovery snapshot.
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), remoteHead);
+  assert.equal(await fs.readFile(path.join(repo, 'scratch.txt'), 'utf8'), 'theirs\n');
+  const sha = output.details.snapshot.sha;
+  assert.equal(gitAt(repo, ['show', `${sha}^3:scratch.txt`]), 'mine', 'the local content is recoverable from the snapshot (gitAt trims output)');
+  assert.match(gitAt(repo, ['stash', 'list']), /pi-sync: pull snapshot/);
+});
+
+test('pull --apply restores the original working state when the fast-forward fails', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  await advanceUpstream(t, root, bare, 'one');
+  const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
+  const manifest = await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8');
+  await fs.writeFile(path.join(repo, 'pi-sync.json'), `${manifest}\n`);
+  gitAt(repo, ['add', 'pi-sync.json']);
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Hello Local\n');
+  await fs.writeFile(path.join(repo, 'scratch.txt'), 'untracked\n');
+  const statusBefore = gitAt(repo, ['status', '--porcelain']);
+  const skillBefore = await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8');
+
+  const rejected = run(['pull', '--apply', '--repo', repo], await failingGit(t, 'merge'));
+  assert.equal(rejected.status, 1);
+  const output = JSON.parse(rejected.stdout);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'PULL_BLOCKED');
+  assert.match(output.error, /fast-forward could not be applied/);
+  assert.equal(output.details.restored, true, 'the original working state was restored');
+
+  // Nothing was changed: HEAD, the index/worktree state, and contents are all
+  // back exactly as found, and the snapshot was discarded.
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), headBefore, 'HEAD was not moved');
+  assert.equal(gitAt(repo, ['status', '--porcelain']), statusBefore, 'index and worktree state are restored');
+  assert.equal(await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8'), skillBefore);
+  assert.equal(await fs.readFile(path.join(repo, 'scratch.txt'), 'utf8'), 'untracked\n');
+  assert.equal(gitAt(repo, ['stash', 'list']), '', 'the snapshot was discarded after a clean restore');
+});
+
+test('pull --apply retains the recovery snapshot when the restoration fails', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  const remoteHead = await advanceUpstream(t, root, bare, 'one');
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Hello Local\n');
+  await fs.writeFile(path.join(repo, 'scratch.txt'), 'untracked\n');
+
+  const rejected = run(['pull', '--apply', '--repo', repo], await failingGit(t, 'stash-apply'));
+  assert.equal(rejected.status, 1);
+  const output = JSON.parse(rejected.stdout);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'PULL_CONFLICT');
+  assert.equal(output.details.toCommit, remoteHead, 'the branch was advanced');
+
+  // The failed restoration retains the snapshot and reports its recovery
+  // identifier, so no user data is lost.
+  const sha = output.details.snapshot.sha;
+  assert.match(output.details.snapshot.message, /^pi-sync: pull snapshot /);
+  assert.equal(gitAt(repo, ['rev-parse', 'refs/stash']), sha, 'the reported identifier resolves');
+  assert.match(gitAt(repo, ['stash', 'list']), /pi-sync: pull snapshot/);
+  assert.equal(gitAt(repo, ['show', `${sha}^3:scratch.txt`]), 'untracked', 'the local untracked content is recoverable (gitAt trims output)');
+});
+test('pull --apply reports the stashed changes and recovery identity when snapshot verification fails', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
+  await advanceUpstream(t, root, bare, 'one');
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Hello Local\n# Hello\n');
+  await fs.writeFile(path.join(repo, 'scratch.txt'), 'untracked\n');
+
+  const rejected = run(['pull', '--apply', '--repo', repo], await failingGit(t, 'stash-verify'));
+  assert.equal(rejected.status, 1);
+  const output = JSON.parse(rejected.stdout);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'PULL_BLOCKED');
+  // Accurate state, not "nothing changed": the push succeeded, so the local
+  // changes now sit in the stash and the branch was not advanced.
+  assert.match(output.error, /could not be verified/);
+  assert.match(output.error, /in the stash/);
+
+  // The recovery identity is reported: a findable message, the stash ref,
+  // and a resolvable sha, plus concrete recovery guidance.
+  const snapshot = output.details.snapshot;
+  assert.match(snapshot.message, /^pi-sync: pull snapshot /);
+  assert.equal(snapshot.ref, 'stash@{0}');
+  assert.equal(snapshot.sha, gitAt(repo, ['rev-parse', 'refs/stash']), 'the reported identifier resolves');
+  assert.ok(Array.isArray(output.details.recovery) && output.details.recovery.length > 0);
+  assert.match(output.details.recovery.join('\n'), /git stash list/);
+
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), headBefore, 'the branch was not changed');
+  assert.equal(gitAt(repo, ['status', '--porcelain']), '', 'the local changes now sit in the stash');
+  assert.ok(gitAt(repo, ['stash', 'list']).includes(snapshot.message), 'the snapshot is findable in git stash list');
+  assert.equal(gitAt(repo, ['show', `${snapshot.sha}^3:scratch.txt`]), 'untracked', 'the local content is recoverable from the stash (gitAt trims output)');
+});
+
+test('pull --apply retains and reports the recovery snapshot when the drop fails', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  const remoteHead = await advanceUpstream(t, root, bare, 'one');
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Hello Local\n# Hello\n');
+  await fs.writeFile(path.join(repo, 'scratch.txt'), 'untracked\n');
+
+  const processResult = run(['pull', '--apply', '--repo', repo], await failingGit(t, 'stash-drop'));
+  assert.equal(processResult.status, 0, processResult.stderr);
+  const output = result(processResult);
+  assert.equal(output.ok, true);
+  assert.equal(output.mode, 'applied');
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), remoteHead, 'the branch was advanced');
+  assert.equal(output.dirty, true, 'the local changes were restored to the worktree');
+  assert.equal(Object.hasOwn(output, 'snapshotDiscarded'), false);
+
+  // The snapshot could not be safely discarded, so its identifier is reported
+  // in the JSON and in the human-readable note.
+  assert.match(output.snapshot.message, /^pi-sync: pull snapshot /);
+  assert.equal(output.snapshot.ref, 'stash@{0}');
+  assert.equal(output.snapshot.sha, gitAt(repo, ['rev-parse', 'refs/stash']), 'the retained snapshot is still the newest stash');
+  assert.ok(output.note.includes(output.snapshot.message), 'the retained identifier is in the human-readable output');
+  assert.match(output.note, /retained/);
+  assert.match(gitAt(repo, ['stash', 'list']), /pi-sync: pull snapshot/);
+});
+
+test('pull --apply is a no-op on an up-to-date branch even when the working tree is dirty', async (t) => {
+  const { root, repo } = await pushFixture(t);
+  const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Hello Local\n');
+  await fs.writeFile(path.join(repo, 'scratch.txt'), 'untracked\n');
+  const statusBefore = gitAt(repo, ['status', '--porcelain']);
+
+  const processResult = run(['pull', '--apply', '--repo', repo]);
+  assert.equal(processResult.status, 0, processResult.stderr);
+  const output = result(processResult);
+  assert.equal(output.mode, 'applied');
+  assert.equal(output.upToDate, true);
+  assert.equal(output.dirty, true);
+  assert.deepEqual([...output.dirtyPaths].sort(), ['resources/skills/hello/SKILL.md', 'scratch.txt']);
+
+  // Nothing to advance means nothing to snapshot: the working tree is left
+  // exactly as found.
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), headBefore);
+  assert.equal(gitAt(repo, ['status', '--porcelain']), statusBefore);
+  assert.equal(gitAt(repo, ['stash', 'list']), '');
+});
+
+test('pull refuses missing upstream, detached HEAD, and unsafe repository states', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+
+  gitAt(repo, ['checkout', '--detach']);
+  let rejected = run(['pull', '--repo', repo]);
+  assert.equal(rejected.status, 1);
+  let output = JSON.parse(rejected.stdout);
+  assert.equal(output.errorCode, 'PULL_BLOCKED');
+  assert.match(output.error, /checked-out branch/);
+  gitAt(repo, ['checkout', 'main']);
+
+  gitAt(repo, ['branch', '--unset-upstream']);
+  rejected = run(['pull', '--repo', repo]);
+  assert.equal(rejected.status, 1);
+  output = JSON.parse(rejected.stdout);
+  assert.equal(output.errorCode, 'PULL_BLOCKED');
+  assert.match(output.error, /configured upstream/);
+  gitAt(repo, ['branch', '--set-upstream-to=origin/main']);
+
+  const plain = path.join(root, 'plain');
+  await fs.mkdir(plain);
+  rejected = run(['pull', '--repo', plain]);
+  assert.equal(rejected.status, 1);
+  output = JSON.parse(rejected.stdout);
+  assert.equal(output.errorCode, 'PULL_BLOCKED');
+  assert.match(output.error, /Git working tree/);
+
+  rejected = run(['pull', '--repo', path.join(repo, 'resources')]);
+  assert.equal(rejected.status, 1);
+  output = JSON.parse(rejected.stdout);
+  assert.equal(output.errorCode, 'PULL_BLOCKED');
+  assert.match(output.error, /root of its Git working tree/);
+});
+
+test('pull refuses when the upstream fetch fails', async (t) => {
+  const { root, repo } = await pushFixture(t);
+  const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
+  gitAt(repo, ['remote', 'set-url', 'origin', path.join(root, 'does-not-exist.git')]);
+
+  const rejected = run(['pull', '--repo', repo]);
+  assert.equal(rejected.status, 1);
+  const output = JSON.parse(rejected.stdout);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'PULL_BLOCKED');
+  assert.match(output.error, /Could not fetch the upstream/);
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), headBefore, 'nothing was changed');
+  assert.equal(gitAt(repo, ['status', '--porcelain']), '');
+});
+
+test('pull rejects unsupported flag combinations', async (t) => {
+  const { repo } = await pushFixture(t);
+  let rejected = run(['pull', '--repo', repo, '--no-fetch']);
+  assert.equal(rejected.status, 2);
+  assert.match(JSON.parse(rejected.stdout).error, /--no-fetch is only supported by status and plan/);
+  rejected = run(['pull', '--repo', repo, '--publish']);
+  assert.equal(rejected.status, 2);
+  assert.match(JSON.parse(rejected.stdout).error, /--publish is only supported by push/);
+  rejected = run(['pull', '--repo', repo, '--approve']);
+  assert.equal(rejected.status, 2);
+  assert.match(JSON.parse(rejected.stdout).error, /--approve is only supported by/);
+});
+
 test('status and plan carry the sync preview classification without writing or locking', async (t) => {
   const { repo, agentDir, manifestPath, localPath } = await settingsFixture(t, [
     { path: '/theme', value: 'dark' },
@@ -1748,6 +2381,113 @@ test('publish with no managed changes reports an empty result without patch or d
   assert.equal(Object.hasOwn(output, 'patchBytes'), false);
   assert.equal(published.stderr, '');
 });
+test('push --message reports the effective subject in preview and creates the commit with it', async (t) => {
+  const { repo } = await pushFixture(t);
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Edited skill\n');
+  const message = 'Refresh the hello skill for the deploy guide';
+
+  const preview = run(['push', '--message', message, '--repo', repo]);
+  assert.equal(preview.status, 0, `${preview.stderr}\n${preview.stdout}`);
+  const plan = result(preview);
+  assert.equal(plan.mode, 'preview');
+  assert.equal(plan.commitRequired, true);
+  assert.equal(plan.commitMessage, message, 'preview JSON carries the intended subject');
+  // The preview authorizes nothing: no commit exists and nothing was published.
+  assert.equal(gitAt(repo, ['rev-list', '--count', '@{upstream}..HEAD']), '0');
+
+  const published = run(['push', '--publish', '--message', message, '--repo', repo]);
+  assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
+  const output = result(published);
+  assert.equal(output.mode, 'published');
+  assert.equal(output.commitMessage, message);
+  assert.equal(gitAt(repo, ['log', '-1', '--format=%s']), message, 'the custom subject is the new commit subject');
+});
+
+test('push without --message keeps the default subject and reports it as the effective message', async (t) => {
+  const { repo } = await pushFixture(t);
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Edited skill\n');
+  const defaultSubject = 'pi-sync: publish managed setup';
+
+  const preview = run(['push', '--repo', repo]);
+  assert.equal(preview.status, 0, `${preview.stderr}\n${preview.stdout}`);
+  const plan = result(preview);
+  assert.equal(plan.commitRequired, true);
+  assert.equal(plan.commitMessage, defaultSubject, 'the default subject remains the effective message');
+
+  const published = run(['push', '--publish', '--repo', repo]);
+  assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
+  const output = result(published);
+  assert.equal(output.commitMessage, defaultSubject);
+  assert.equal(gitAt(repo, ['log', '-1', '--format=%s']), defaultSubject, 'the default subject is unchanged');
+});
+
+test('push --message has no effect when no new managed-only commit is created', async (t) => {
+  const { repo } = await pushFixture(t);
+  // Publishing with nothing to commit: no commit is created and the message
+  // must not appear in the output at all.
+  const idle = run(['push', '--publish', '--message', 'Should not appear', '--repo', repo]);
+  assert.equal(idle.status, 0, `${idle.stderr}\n${idle.stdout}`);
+  const idleOutput = result(idle);
+  assert.equal(idleOutput.commit, null);
+  assert.equal(Object.hasOwn(idleOutput, 'commitMessage'), false);
+  const idlePreview = run(['push', '--message', 'Should not appear', '--repo', repo]);
+  assert.equal(idlePreview.status, 0, `${idlePreview.stderr}\n${idlePreview.stdout}`);
+  assert.equal(result(idlePreview).commitRequired, false);
+  assert.equal(Object.hasOwn(result(idlePreview), 'commitMessage'), false);
+
+  // Publishing an already-committed ahead commit: the existing commit is
+  // published untouched and never rewritten with the new message.
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Committed edit\n');
+  gitAt(repo, ['add', '--', 'resources/skills/hello']);
+  gitAt(repo, ['commit', '-m', 'an existing local commit']);
+  const published = run(['push', '--publish', '--message', 'Should not appear', '--repo', repo]);
+  assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
+  const output = result(published);
+  assert.equal(output.mode, 'published');
+  assert.equal(output.commit, gitAt(repo, ['rev-parse', 'HEAD']));
+  assert.equal(Object.hasOwn(output, 'commitMessage'), false, 'no new commit was created, so the message has no effect');
+  assert.equal(gitAt(repo, ['log', '-1', '--format=%s']), 'an existing local commit', 'the existing commit subject is never rewritten');
+});
+
+test('push --message passes the subject as a process argument, not shell-interpolated text', async (t) => {
+  const { repo } = await pushFixture(t);
+  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Edited skill\n');
+  const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-message-test-'));
+  t.after(() => fs.rm(markerDir, { recursive: true, force: true }));
+  const marker = path.join(markerDir, 'executed');
+  const message = `subject with "quotes", $(touch ${marker}), and ; semicolons`;
+  const published = run(['push', '--publish', '--message', message, '--repo', repo]);
+  assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
+  assert.equal(gitAt(repo, ['log', '-1', '--format=%s']), message, 'shell metacharacters are not interpreted');
+  assert.equal(result(published).commitMessage, message);
+  await assert.rejects(fs.access(marker), 'the $(...) payload was not executed');
+});
+
+test('push --message rejects empty and whitespace-only subjects and unsupported flag combinations', async (t) => {
+  const { repo, root } = await pushFixture(t);
+  const agentDir = path.join(root, 'agent');
+  await fs.mkdir(agentDir, { recursive: true });
+
+  const empty = run(['push', '--message', '', '--repo', repo]);
+  assert.equal(empty.status, 2, empty.stderr);
+  assert.equal(result(empty).errorCode, 'VALIDATION_ERROR');
+  assert.match(result(empty).error, /--message requires a value/);
+
+  const blank = run(['push', '--message', '   ', '--repo', repo]);
+  assert.equal(blank.status, 2, blank.stderr);
+  assert.match(result(blank).error, /--message must not be empty/);
+
+  const unrelated = run(['status', '--message', 'a subject', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(unrelated.status, 2, unrelated.stderr);
+  assert.match(result(unrelated).error, /--message is only supported by push and update --apply --push/);
+
+  const updateNoPush = run(['update', '--apply', '--message', 'a subject', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(updateNoPush.status, 2, updateNoPush.stderr);
+  assert.match(result(updateNoPush).error, /update --message requires --apply --push/);
+
+  // No repository state changed by any rejected run.
+  assert.equal(gitAt(repo, ['status', '--porcelain']), '');
+});
 
 test('push stops for suspected credential content in a managed resource', async (t) => {
   const { repo } = await pushFixture(t);
@@ -1885,6 +2625,38 @@ test('update --apply --push publishes the approved exact pin change through mana
   const lock = JSON.parse(spawnSync('git', ['--git-dir', bare, 'show', 'main:pi-sync.lock.json'], { encoding: 'utf8' }).stdout);
   assert.equal(lock.packages[0].version, '1.1.0');
   assert.deepEqual(gitAt(repo, ['show', '--format=', '--name-only', 'HEAD']).split(/\r?\n/).filter(Boolean), ['pi-sync.lock.json']);
+});
+test('update --apply --push --message forwards the subject to the managed-only commit', async (t) => {
+  const { repo, bare, root } = await pushFixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  await fs.writeFile(manifestPath, JSON.stringify({ schemaVersion: 1,
+    resources: [{ type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' }],
+    dependencies: [{ type: 'npm', name: 'fixture-package' }] }, null, 2) + '\n');
+  await fs.writeFile(path.join(repo, 'pi-sync.lock.json'), JSON.stringify({ schemaVersion: 1, packages: [
+    { type: 'npm', name: 'fixture-package', version: '1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' },
+  ] }, null, 2) + '\n');
+  gitAt(repo, ['add', '--all']);
+  gitAt(repo, ['commit', '-m', 'declare pinned package']);
+  gitAt(repo, ['push', 'origin', 'main']);
+
+  const bin = path.join(root, 'fake-bin');
+  await fs.mkdir(bin);
+  await fs.writeFile(path.join(bin, 'npm'), `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args[0] === 'view' && args[2] === 'versions') console.log(JSON.stringify(['1.0.0','1.1.0']));\nelse if (args[0] === 'view' && args[2] === 'time') console.log(JSON.stringify({'1.0.0':'2020-01-01T00:00:00.000Z','1.1.0':'2020-02-01T00:00:00.000Z'}));\nelse process.exit(2);\n`, { mode: 0o755 });
+  await fs.writeFile(path.join(bin, 'pi'), `#!${process.execPath}\nprocess.exit(0);\n`, { mode: 0o755 });
+  const agentDir = path.join(root, 'agent');
+
+  const message = 'Bump fixture-package to 1.1.0';
+  const updated = run(['update', '--apply', '--push', '--approve', '--message', message, '--repo', repo, '--agent-dir', agentDir], {
+    PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+  });
+  assert.equal(updated.status, 0, `${updated.stderr}\n${updated.stdout}`);
+  const output = result(updated);
+  assert.equal(output.push.mode, 'published');
+  assert.deepEqual(output.push.changes.map((item) => item.path), ['pi-sync.lock.json']);
+  assert.equal(output.push.commitMessage, message, 'the forwarded message appears in the embedded push output');
+  assert.equal(gitAt(repo, ['log', '-1', '--format=%s']), message, 'the forwarded message is the committed subject');
+  const lock = JSON.parse(spawnSync('git', ['--git-dir', bare, 'show', 'main:pi-sync.lock.json'], { encoding: 'utf8' }).stdout);
+  assert.equal(lock.packages[0].version, '1.1.0');
 });
 
 test('manifest rejects arbitrary or unsupported prerequisite declarations before apply', async (t) => {
@@ -4388,4 +5160,55 @@ test('bootstrap reports a local conflict while still reporting the refreshed set
     { type: 'skill', source: 'resources/skills/pi-sync', target: 'skills/pi-sync', action: 'refreshed' },
     { type: 'extension', source: 'resources/extensions/pi-sync', target: 'extensions/pi-sync', action: 'already-current' },
   ]);
+});
+
+test('runCommand timeout is deterministic: a killed child reports ETIMEDOUT, a completed child its own status', async (t) => {
+  const { runCommand } = await import('../dist/cli/process.js');
+  const timedOut = await runCommand(process.execPath, ['-e', 'setTimeout(() => {}, 400)'], {}, 100);
+  assert.equal(timedOut.status, null, 'a child killed at the deadline has no process status');
+  assert.equal(timedOut.error?.code, 'ETIMEDOUT');
+
+  const completed = await runCommand(process.execPath, ['-e', 'setTimeout(() => process.exit(7), 20)'], {}, 500);
+  assert.equal(completed.status, 7, 'a child that completes on its own reports its own status');
+  assert.equal(completed.error, null);
+});
+
+test('gitExecutable resolves to the bare name on non-Windows platforms', async (t) => {
+  if (process.platform === 'win32') return; // Windows resolution is covered by the platform-appropriate smoke test
+  const { gitExecutable } = await import('../dist/cli/process.js');
+  assert.equal(await gitExecutable(), 'git');
+});
+
+test('gitExecutable resolves a path-qualified Windows git.exe and distrusts shims', async (t) => {
+  // Exercise the Windows branch on any host: the platform check is the only
+  // host dependency, and the resolution is driven by a fake `where` on PATH.
+  // Fresh module instances (query-string imports) give fresh resolution caches.
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  const originalPath = process.env.PATH;
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  t.after(() => {
+    Object.defineProperty(process, 'platform', platformDescriptor);
+    process.env.PATH = originalPath;
+  });
+
+  const bin = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-where-'));
+  t.after(() => fs.rm(bin, { recursive: true, force: true }));
+  process.env.PATH = `${bin}${path.delimiter}${originalPath}`;
+
+  // A path-qualified .exe from `where` is trusted: git then spawns shell-free,
+  // so arguments are never interpreted by cmd.exe.
+  await fs.writeFile(path.join(bin, 'where'), `#!${process.execPath}\nconsole.log('C:/Program Files/Git/cmd/git.exe');\n`, { mode: 0o755 });
+  const resolved = await (await import(`../dist/cli/process.js?gitexe-exe-${Date.now()}`)).gitExecutable();
+  assert.equal(resolved, 'C:/Program Files/Git/cmd/git.exe');
+
+  // A .cmd shim cannot be launched shell-free, so the bare name keeps the
+  // legacy shell behavior rather than a broken direct spawn.
+  await fs.writeFile(path.join(bin, 'where'), `#!${process.execPath}\nconsole.log('C:/Program Files/Git/cmd/git.cmd');\n`, { mode: 0o755 });
+  const shimmed = await (await import(`../dist/cli/process.js?gitexe-shim-${Date.now()}`)).gitExecutable();
+  assert.equal(shimmed, 'git');
+
+  // `where` finding nothing falls back to the bare name as well.
+  await fs.rm(path.join(bin, 'where'));
+  const missing = await (await import(`../dist/cli/process.js?gitexe-none-${Date.now()}`)).gitExecutable();
+  assert.equal(missing, 'git');
 });

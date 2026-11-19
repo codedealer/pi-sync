@@ -7,11 +7,8 @@ import { fileURLToPath } from 'node:url';
 import {
   computeFingerprint,
   extractSummary,
-  fetchHeadPath,
-  FETCH_MAX_AGE_MS,
   fingerprintPaths,
   fingerprintsEqual,
-  isFetchFresh,
   isSyncSummary,
   readStatusCache,
   renderFooter,
@@ -211,27 +208,6 @@ test('shared cache lets a second session reuse a fingerprint without a recompute
   await fs.rm(file);
   assert.deepEqual(computeFingerprint([file]), [[file, null]], 'absent file uses the stable absent marker');
   assert.equal(fingerprintsEqual(cached.fingerprint, computeFingerprint([file])), false);
-});
-
-test('fetchHeadPath points at the setup repository FETCH_HEAD', () => {
-  assert.equal(fetchHeadPath('/repo'), '/repo/.git/FETCH_HEAD');
-  assert.equal(fetchHeadPath('relative'), path.join('relative', '.git', 'FETCH_HEAD'));
-});
-
-test('isFetchFresh skips the session-start fetch only for a recent FETCH_HEAD', () => {
-  const now = 1_000_000_000_000;
-  assert.equal(isFetchFresh(now - 60_000, now), true, 'one minute old: fresh');
-  assert.equal(isFetchFresh(now - (FETCH_MAX_AGE_MS - 1), now), true, 'just under five minutes: fresh');
-  assert.equal(isFetchFresh(now - FETCH_MAX_AGE_MS, now), false, 'exactly five minutes old: not fresh (fetch runs)');
-  assert.equal(isFetchFresh(now - (FETCH_MAX_AGE_MS + 1), now), false, 'five minutes plus one ms: stale');
-  assert.equal(isFetchFresh(now - 3_600_000, now), false, 'an hour old: stale');
-  assert.equal(isFetchFresh(null, now), false, 'absent FETCH_HEAD: the fetch runs');
-  assert.equal(isFetchFresh(undefined, now), false, 'missing mtime: the fetch runs');
-  assert.equal(isFetchFresh('nope', now), false, 'non-numeric mtime: the fetch runs');
-  assert.equal(isFetchFresh(now + 5_000, now), true, 'clock skew (future mtime): treated as fresh');
-  assert.equal(isFetchFresh(123, 'nope'), false, 'non-numeric now: the fetch runs (the safe direction)');
-  assert.equal(isFetchFresh(now - 60_000, now, 30_000), false, 'custom max age: one minute exceeds thirty seconds');
-  assert.equal(isFetchFresh(now - 10_000, now, 30_000), true, 'custom max age: ten seconds is within thirty seconds');
 });
 
 test('readStatusCache rejects absent, corrupt, and malformed entries', async (t) => {

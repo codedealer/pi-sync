@@ -28,6 +28,10 @@ export interface PushInput {
   // Without --publish the run stops after the preview; --publish authorizes
   // the managed-only commit and the ordinary fast-forward push.
   publish?: boolean;
+  // Optional subject for the new managed-only commit this run creates,
+  // passed as a process argument. It never rewrites existing commits and
+  // has no effect when no new commit is created.
+  message?: string;
   // The entry point owns stream output; the human-readable preview is passed
   // through this narrow writer, which the entry point supplies (the stderr
   // writer) for both the `push` command and `update --push`.
@@ -50,6 +54,9 @@ export interface PushOutput {
   publicationAuthorized?: boolean;
   // Published mode.
   commit?: string | null;
+  // The subject used (preview: to be used) for the new managed-only commit
+  // this run creates. Absent when no new commit is planned or created.
+  commitMessage?: string;
   patchSha256?: string;
   patchBytes?: number;
   forcePush?: boolean;
@@ -185,7 +192,8 @@ async function validateAheadCommitTree(repo: string, commit: string): Promise<vo
 // commits, remote divergence, ignored paths, ahead-commit tree validation,
 // push rejection) fails closed with a PUSH_BLOCKED error, preserving local
 // state.
-export async function runPush({ repo, declarations, publish = false, previewWriter }: PushInput): Promise<PushOutput> {
+export async function runPush({ repo, declarations, publish = false, message, previewWriter }: PushInput): Promise<PushOutput> {
+  const commitMessage = message ?? 'pi-sync: publish managed setup';
   const resourceSources = declarations.resources.map((item) => item.source);
   for (const managedFile of [MANIFEST_FILE, LOCK_FILE]) {
     const bytes = await fs.readFile(path.join(repo, managedFile));
@@ -295,13 +303,14 @@ export async function runPush({ repo, declarations, publish = false, previewWrit
     if (patchFindings.length) throw gitFailure('Publishable managed changes contain suspected credential material; review and remove it before push', { reviewRequired: patchFindings });
     if (!publish) return { apiVersion: 1, command: 'push', ok: true, exitCode: 0, repository: repo, branch, upstream,
       mode: 'preview', changes, patch, commitRequired, publicationAuthorized: false,
+      ...(commitRequired ? { commitMessage } : {}),
       note: 'Only these managed paths can be committed; rerun with --publish to authorize commit and push.' };
     const renderedPreview = patch || '(no new working-tree diff; publishing already-committed managed changes)';
     if (changes.length) previewWriter(`Pi Sync managed commit preview (before publication):\n${renderedPreview}\n`);
 
     if (commitRequired) {
       const committedPaths = changes.filter((item) => item.status !== 'committed').map((item) => item.path);
-      const commitResult = await gitResult(repo, ['-c', `core.hooksPath=${hooksPath}`, 'commit', '-m', 'pi-sync: publish managed setup'], env);
+      const commitResult = await gitResult(repo, ['-c', `core.hooksPath=${hooksPath}`, 'commit', '-m', commitMessage], env);
       if (commitResult.status !== 0) throw gitFailure('Could not create the managed-only commit; working-tree and index changes were preserved', { changes, gitStatus: commitResult.status });
       // The alternate index isolates unrelated staging. Rebase only the committed paths
       // in the user's index onto the new HEAD, leaving every unrelated staged change intact.
@@ -322,7 +331,8 @@ export async function runPush({ repo, declarations, publish = false, previewWrit
       mode: 'published', changes,
       patchSha256: crypto.createHash('sha256').update(renderedPreview, 'utf8').digest('hex'),
       patchBytes: Buffer.byteLength(renderedPreview, 'utf8'),
-      commit, forcePush: false };
+      commit, forcePush: false,
+      ...(commitRequired ? { commitMessage } : {}) };
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }

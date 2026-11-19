@@ -25,6 +25,8 @@ export interface UpdateInput {
   apply: boolean;
   approve: boolean;
   push: boolean;
+  // Forwarded to the managed-only push workflow for `update --apply --push`.
+  message?: string;
   // The entry point owns stream output: for `update --push` the push module's
   // human-readable preview is passed through this entry-point-supplied writer.
   previewWriter: (preview: string) => void;
@@ -89,7 +91,7 @@ export type UpdateOutput = UpdatePreviewOutput | UpdateAppliedNoUpdatesOutput | 
 // state under the package lock, and rolls package pins plus both pin files
 // back to their previous state when persistence fails. With --push the
 // approved pin change is published through the managed-only push workflow.
-export async function runUpdate({ repo, agentDir, declarations, apply, approve, push, previewWriter }: UpdateInput): Promise<UpdateOutput> {
+export async function runUpdate({ repo, agentDir, declarations, apply, approve, push, message, previewWriter }: UpdateInput): Promise<UpdateOutput> {
   const manifest = (await readJson(path.join(repo, MANIFEST_FILE), 'manifest')) as PolicyManifest;
   const updates = (await discoverUpdates(manifest, declarations.lock)) as PackageUpdate[];
   const minimumReleaseAgeDays = manifest.policy?.minimumReleaseAgeDays ?? 7;
@@ -135,7 +137,7 @@ export async function runUpdate({ repo, agentDir, declarations, apply, approve, 
     const output: UpdateAppliedInstalledOutput = { apiVersion: 1, command: 'update', ok: true, exitCode: 0, repository: repo,
       minimumReleaseAgeDays, policySource: 'setup repository pi-sync.json', mode: 'applied', updates,
       pins: nextLock.packages, installed };
-    if (push) output.push = await runPush({ repo, declarations: await validateRepository(repo), publish: true, previewWriter });
+    if (push) output.push = await runPush({ repo, declarations: await validateRepository(repo), publish: true, message, previewWriter });
     output.dependencyModel = 'exact top-level pins; transitive dependency tree is controlled by Pi and is not locked by Pi Sync';
     return output;
   } finally { await releasePackageLock(); }
