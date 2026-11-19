@@ -268,6 +268,53 @@ test('GitHub release metadata without a timestamp fails closed', async (t) => {
   assert.equal((await entries(f)).some(({ tool }) => tool === 'pi'), false);
 });
 
+test('update --apply installs a GitHub dependency through the Pi git: source spec', async (t) => {
+  const f = await setup(t, { dependencies: [{ type: 'github', repository: 'acme/extension' }] });
+  const release = [{ tag_name: 'v2.0.0', published_at: '2020-01-01T00:00:00Z', draft: false, prerelease: false }];
+  const denied = run(f, ['update', '--apply'], { FAKE_RELEASES: JSON.stringify(release) });
+  assert.equal(denied.status, 1, denied.stderr || denied.stdout);
+  assert.equal(output(denied).errorCode, 'APPROVAL_REQUIRED');
+
+  const applied = run(f, ['update', '--apply', '--approve'], { FAKE_RELEASES: JSON.stringify(release) });
+  assert.equal(applied.status, 0, applied.stderr || applied.stdout);
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.repo, 'pi-sync.lock.json'), 'utf8')).packages,
+    [{ type: 'github', repository: 'acme/extension', commit: sha, tag: 'v2.0.0', releasedAt: '2020-01-01T00:00:00.000Z' }]);
+  assert.deepEqual((await entries(f)).filter(({ tool, args }) => tool === 'pi').map(({ args }) => args),
+    [['install', `git:github.com/acme/extension#${sha}`]]);
+});
+
+test('failed GitHub update rolls installed pins back through the same git: source spec', async (t) => {
+  const dependencies = [{ type: 'github', repository: 'acme/one' }, { type: 'github', repository: 'acme/two' }];
+  const oldSha = 'a'.repeat(40);
+  const packages = dependencies.map(({ repository }) => ({ type: 'github', repository, commit: oldSha, tag: 'v1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' }));
+  const f = await setup(t, { dependencies, packages });
+  const seeded = run(f, ['apply', '--approve']);
+  assert.equal(seeded.status, 0, seeded.stderr || seeded.stdout);
+
+  const lockPath = path.join(f.repo, 'pi-sync.lock.json');
+  const lockBefore = await fs.readFile(lockPath, 'utf8');
+  const packageStatePath = path.join(f.agentDir, '.pi-sync', 'packages.json');
+  const packageStateBefore = await fs.readFile(packageStatePath, 'utf8');
+  const release = [{ tag_name: 'v2.0.0', published_at: '2020-06-01T00:00:00Z', draft: false, prerelease: false }];
+  const failed = run(f, ['update', '--apply', '--approve'], {
+    FAKE_RELEASES: JSON.stringify(release),
+    FAKE_PI_FAIL_SPEC: `git:github.com/acme/two#${sha}`,
+  });
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  assert.equal(output(failed).errorCode, 'PACKAGE_INSTALL_FAILED');
+  assert.equal(await fs.readFile(lockPath, 'utf8'), lockBefore, 'lockfile unchanged when the install fails');
+  assert.equal(await fs.readFile(packageStatePath, 'utf8'), packageStateBefore, 'local pin state unchanged when the install fails');
+  assert.deepEqual(JSON.parse(await fs.readFile(f.piState, 'utf8')).installed.sort(),
+    [`git:github.com/acme/one#${oldSha}`, `git:github.com/acme/two#${oldSha}`]);
+  // acme/one was installed at the new pin, then rolled back to its previous
+  // pin through the same git: source specification Pi installed it with.
+  assert.deepEqual((await entries(f)).filter(({ tool, args }) => tool === 'pi').slice(-3).map(({ args }) => args), [
+    ['install', `git:github.com/acme/one#${sha}`],
+    ['install', `git:github.com/acme/two#${sha}`],
+    ['install', `git:github.com/acme/one#${oldSha}`],
+  ]);
+});
+
 test('dependency add updates only the declaration and directs agents through update', async (t) => {
   const f = await setup(t);
   const added = run(f, ['add', '--type', 'dependency', '--source', 'npm:widget']);

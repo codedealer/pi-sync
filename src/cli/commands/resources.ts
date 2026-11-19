@@ -7,6 +7,7 @@ import {
   MANIFEST_FILE,
   RESOURCE_RULES,
   packageIdentity,
+  packageSpec,
   pathsOverlap,
   resolveInside,
   validateRelativePath,
@@ -506,7 +507,7 @@ async function removeDependency(repo: string, source: string, agentDir: string, 
     if (manifestWritten) await restoreFileAtomic(manifestPath, manifestText).catch(() => {});
     throw error;
   }
-  const spec = pin.type === 'npm' ? `npm:${pin.name}@${pin.version}` : `github:${pin.repository}#${pin.commit}`;
+  const spec = packageSpec(pin);
   const output: RemovedDependencyResult = { apiVersion: 1, command: 'remove', ok: true, exitCode: 0, repository: repo,
     removed: { dependency, pin },
     localInstallation: 'unchanged',

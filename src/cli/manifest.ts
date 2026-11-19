@@ -3,8 +3,9 @@ import path from 'node:path';
 import { validateRequiredTools } from '../prerequisites.js';
 import { validatePackageState } from '../packages.js';
 // Re-exported from the core module, which owns the single `npm:`/`github:`
-// identity implementation; CLI command modules import it from here.
-export { packageIdentity } from '../packages.js';
+// identity and install-spec implementations; CLI command modules import them
+// from here.
+export { packageIdentity, packageSpec } from '../packages.js';
 
 export const MANIFEST_FILE = 'pi-sync.json';
 export const LOCK_FILE = 'pi-sync.lock.json';

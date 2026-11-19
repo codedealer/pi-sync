@@ -4353,6 +4353,28 @@ test('remove --uninstall uninstalls the dependency explicitly and reports failur
   assert.deepEqual(JSON.parse(await fs.readFile(lockPath, 'utf8')).packages, [], 'lockfile change persisted despite the uninstall failure');
   const pinsStill = JSON.parse(await fs.readFile(pinsFile, 'utf8'));
   assert.equal(pinsStill.packages['npm:fixture-package'], '1.0.0', 'local pin bookkeeping is untouched when the uninstall fails');
+  // GitHub dependencies uninstall through Pi's git: source spec.
+  const githubCommit = 'b'.repeat(40);
+  const manifest3 = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest3.dependencies = [{ type: 'github', repository: 'acme/pi-extension' }];
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest3, null, 2)}\n`);
+  await fs.writeFile(lockPath, `${JSON.stringify({ schemaVersion: 1, packages: [
+    { type: 'github', repository: 'acme/pi-extension', commit: githubCommit, tag: 'v1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' },
+  ] }, null, 2)}\n`);
+  const githubApplied = run(['apply', '--approve', '--repo', repo, '--agent-dir', agentDir], { ...okPi, PI_CALL_LOG: okLog });
+  assert.equal(githubApplied.status, 0, githubApplied.stderr);
+  const okLogBefore2 = await fs.readFile(okLog, 'utf8');
+  const githubRemoved = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'github:acme/pi-extension', '--uninstall'],
+    { ...okPi, PI_CALL_LOG: okLog });
+  assert.equal(githubRemoved.status, 0, `${githubRemoved.stderr}\n${githubRemoved.stdout}`);
+  const githubOutput = result(githubRemoved);
+  assert.equal(githubOutput.ok, true);
+  assert.deepEqual(githubOutput.removed.dependency, { type: 'github', repository: 'acme/pi-extension' });
+  assert.deepEqual(githubOutput.uninstalled, { package: 'github:acme/pi-extension', spec: `git:github.com/acme/pi-extension#${githubCommit}` });
+  assert.equal(githubOutput.localInstallation, 'uninstalled');
+  assert.deepEqual(await piCalls(okLog), [...okLogBefore2.trim().split('\n').filter(Boolean), `uninstall git:github.com/acme/pi-extension#${githubCommit}`]);
+  const pinsGithub = JSON.parse(await fs.readFile(pinsFile, 'utf8'));
+  assert.equal(pinsGithub.packages['github:acme/pi-extension'], undefined, 'local pin bookkeeping cleared after a GitHub uninstall');
 });
 
 test('the full remove, stale, and prune sequence works end to end after publication', async (t) => {

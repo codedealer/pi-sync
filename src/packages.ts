@@ -65,7 +65,13 @@ function validDate(value: any) { return typeof value === 'string' && Number.isFi
 // cli/manifest re-exports it so the CLI command modules share this helper
 // instead of a duplicated implementation.
 export function packageIdentity(item: { type: string; name?: string; repository?: string }): string { return item.type === 'npm' ? `npm:${item.name}` : `github:${item.repository}`; }
-function spec(item: any) { return item.type === 'npm' ? `npm:${item.name}@${item.version}` : `github:${item.repository}#${item.commit}`; }
+// The single install specification handed to `pi install` and `pi uninstall`.
+// GitHub pins use Pi's git: source form (git:github.com/OWNER/REPO#COMMIT):
+// Pi's git URL parser accepts the owner/repository shorthand only behind the
+// git: prefix, so a github: spec would fall through to local-path handling.
+// cli/manifest re-exports it so the CLI command modules share this helper
+// instead of a duplicated implementation.
+export function packageSpec(item: { type: string; name?: string; version?: string; repository?: string; commit?: string }): string { return item.type === 'npm' ? `npm:${item.name}@${item.version}` : `git:github.com/${item.repository}#${item.commit}`; }
 function parseJson(output: any, source: any) {
   try { return JSON.parse(output); } catch { throw new Error(`${source} metadata was not valid JSON; update stopped closed`); }
 }
@@ -132,14 +138,18 @@ export async function discoverUpdates(manifest: any, lock: any, now: any = Date.
   for (const dep of manifest.dependencies) {
     const old = current.get(packageIdentity(dep));
     const next = dep.type === 'npm' ? await npmCandidate(dep, old, eligible) : await githubCandidate(dep, old, eligible);
-    if (next && (!old || packageIdentity(next) === packageIdentity(old))) updates.push({ from: old ?? null, to: next, installSpec: spec(next) });
+    if (next && (!old || packageIdentity(next) === packageIdentity(old))) updates.push({ from: old ?? null, to: next, installSpec: packageSpec(next) });
   }
   return updates;
 }
 
+// Rebuilds the install spec for a previously recorded exact revision so a
+// rollback reinstalls the previous pin through the same specification Pi
+// installed it with.
 function previousSpec(key: any, revision: any) {
-  if (key.startsWith('npm:')) return `npm:${key.slice(4)}@${revision}`;
-  return `github:${key.slice(7)}#${revision}`;
+  return key.startsWith('npm:')
+    ? packageSpec({ type: 'npm', name: key.slice(4), version: revision })
+    : packageSpec({ type: 'github', repository: key.slice(7), commit: revision });
 }
 
 export async function rollbackPinnedPackages(items: any, previousPins: any = {}) {
@@ -148,7 +158,7 @@ export async function rollbackPinnedPackages(items: any, previousPins: any = {})
     const key = packageIdentity(item);
     const previous = previousPins[key];
     const result = previous === undefined
-      ? await run('pi', ['uninstall', spec(item)])
+      ? await run('pi', ['uninstall', packageSpec(item)])
       : await run('pi', ['install', previousSpec(key, previous)]);
     if (result.status !== 0) errors.push({ package: key, action: previous === undefined ? 'uninstall' : 'restore-pin',
       error: result.error?.message ?? result.stderr.trim() ?? `Pi exited ${result.status}` });
@@ -162,21 +172,21 @@ export async function installPinnedPackages(lock: any, { approved = false, promp
   for (const item of lock.packages) {
     if (approvalRequired(item) && !approved && prompt && !await prompt(item)) throw Object.assign(new Error(`First-time installation approval was not granted for ${packageIdentity(item)}`), { errorCode: 'APPROVAL_REQUIRED' });
     if (approvalRequired(item) && !approved && !prompt) throw Object.assign(new Error(`First-time installation requires explicit approval for ${packageIdentity(item)}; rerun with --approve`), { errorCode: 'APPROVAL_REQUIRED' });
-    const result = await run('pi', ['install', spec(item)]);
+    const result = await run('pi', ['install', packageSpec(item)]);
     if (result.status !== 0) {
       // Only packages installed in this run can be rolled back; when Pi could
       // not even start, nothing was installed and no rollback is attempted.
       const rollbackErrors = await rollbackPinnedPackages(installed, previousPins);
       const failure = result.error ? `Pi could not be started (${result.error.message})` : result.stderr.trim() ? `Pi reported: ${result.stderr.trim()}` : `Pi exited ${result.status}`;
       const rollbackNote = rollbackErrors.length ? '; package rollback was incomplete' : installed.length ? '; previously installed package pins were restored' : '';
-      const error: any = Object.assign(new Error(`Pi package installation failed for ${packageIdentity(item)} at recorded pin ${spec(item)}: ${failure}${rollbackNote}`), {
+      const error: any = Object.assign(new Error(`Pi package installation failed for ${packageIdentity(item)} at recorded pin ${packageSpec(item)}: ${failure}${rollbackNote}`), {
         errorCode: 'PACKAGE_INSTALL_FAILED',
       });
       if (rollbackErrors.length) error.details = { message: error.message, rollbackErrors };
       throw error;
     }
     installed.push(item);
-    results.push({ package: packageIdentity(item), pin: spec(item), action: 'installed' });
+    results.push({ package: packageIdentity(item), pin: packageSpec(item), action: 'installed' });
   }
   return results;
 }
@@ -228,7 +238,7 @@ export async function obtainFirstInstallApproval(lock: any, pins: any, explicitl
 function approvalPrompt(item: any) {
   if (!process.stdin.isTTY) return null;
   return new Promise<any>((resolve) => {
-    process.stdout.write(`Install pinned Pi package ${spec(item)}? [y/N] `);
+    process.stdout.write(`Install pinned Pi package ${packageSpec(item)}? [y/N] `);
     process.stdin.resume();
     process.stdin.once('data', (data: any) => {
       process.stdin.pause();
