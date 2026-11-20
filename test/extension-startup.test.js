@@ -10,6 +10,7 @@ import { computeFingerprint, fingerprintPaths, statusCachePath } from '../resour
 const sourcePath = fileURLToPath(new URL('../resources/extensions/pi-sync/index.ts', import.meta.url));
 const statusPath = fileURLToPath(new URL('../resources/extensions/pi-sync/status.js', import.meta.url));
 const processPath = fileURLToPath(new URL('../resources/extensions/pi-sync/process.js', import.meta.url));
+const guardPath = fileURLToPath(new URL('../resources/extensions/pi-sync/guard.ts', import.meta.url));
 const envKeys = [
   'PI_SYNC_REPO_DIR', 'PI_SYNC_BIN', 'PI_TEST_AGENT_DIR', 'PI_TEST_CLI_LOG', 'PI_TEST_GIT_LOG',
   'PI_TEST_STATUS_DELAY_MS', 'PI_TEST_STATUS_FAIL', 'PI_TEST_STATUS_SUMMARY', 'PI_SKIP_VERSION_CHECK', 'PATH',
@@ -59,6 +60,12 @@ async function fixture(t, { delayMs = 0, statusSummary = CLEAN_SUMMARY } = {}) {
   await fs.writeFile(path.join(moduleDir, 'index.js'), 'export function getAgentDir() { return process.env.PI_TEST_AGENT_DIR; }\n');
   await fs.copyFile(statusPath, path.join(extensionDir, 'status.js'));
   await fs.copyFile(processPath, path.join(extensionDir, 'process.js'));
+  const guardTranspiled = ts.transpileModule(await fs.readFile(guardPath, 'utf8'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
+    reportDiagnostics: true,
+  });
+  assert.deepEqual(guardTranspiled.diagnostics ?? [], [], 'guard transpiles without TypeScript diagnostics');
+  await fs.writeFile(path.join(extensionDir, 'guard.js'), guardTranspiled.outputText);
   const transpiled = ts.transpileModule(await fs.readFile(sourcePath, 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
     reportDiagnostics: true,

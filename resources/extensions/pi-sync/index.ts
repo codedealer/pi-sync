@@ -63,12 +63,32 @@
  * separate warning notification with the explicit `pi-sync pi-update --apply`
  * command. The read-only check never delays startup or applies an update.
  *
+ * The extension also guards the first reflexive reach for the local
+ * installation: on a managed setup it intercepts tool calls that mutate
+ * files under the agent directory's resource roots (skills/, extensions/,
+ * prompts/, agents/, roles/). Manifest-declared settings targets are not
+ * gated: the settings watcher back-syncs local edits of managed settings
+ * into the setup repository's manifest, so those edits are captured instead
+ * of drifting, and blocking them would only add friction. The first such
+ * call in a session is blocked, and the warning — the qualified source path
+ * in the setup repository, then pi-sync apply (plus the concrete pi-sync
+ * register command for a new resource), and the explicit retry-to-allow
+ * bypass — is returned as the tool result. Every later call in the session
+ * passes (persistence is intent), and arming resets on each session_start.
+ * The gate is by input shape (path-like top-level fields), not tool name,
+ * and known read-only tools always pass. It carries no UI, works in TUI,
+ * RPC, and headless modes alike, stays silent on setups that are not
+ * managed by Pi Sync, and a failed guard evaluation passes the call
+ * through. See guard.ts for the module that implements it.
+ *
  * Environment overrides:
  *   PI_SYNC_REPO_DIR  setup repository path (default ~/.pi-sync/setup)
  *   PI_SYNC_BIN       pi-sync executable (default `pi-sync` on PATH)
+ *   PI_SYNC_GUARD     "off" disables the first-touch write guard (default: on)
  */
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
+import { createWriteGuard } from "./guard.js";
 import { shellFor } from "./process.js";
 import { existsSync, readFileSync, statSync, watch, type FSWatcher } from "node:fs";
 import os from "node:os";
@@ -237,7 +257,20 @@ export default function (pi: ExtensionAPI) {
     targetsMemo = { mtime, targets: managedTargets() };
     return targetsMemo.targets;
   }
-
+  // First-touch write guard: intercepts tool calls that mutate files under
+  // the agent directory's resource roots. The first such call in a session
+  // is blocked, and the warning (the qualified source path in the setup
+  // repository, pi-sync apply, plus the explicit retry-to-allow bypass) is
+  // delivered as the tool result; later calls pass — persistence is intent.
+  // Settings targets are not gated: the settings watcher back-syncs local
+  // edits into the manifest. Silent on setups that are not managed by Pi
+  // Sync and when PI_SYNC_GUARD=off; a failed guard evaluation passes the
+  // call through, so this never blocks or crashes a session (see guard.ts).
+  const writeGuard = createWriteGuard({
+    isManaged: isManagedSetup,
+    agentDir,
+    repoDir,
+  });
   /** The footer text for the current state, or undefined when no footer is shown (legacy CLI). */
   function footerText(ctx: ExtensionContext): string | undefined {
     let input: unknown;
@@ -520,6 +553,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (event, ctx) => {
     const dir = agentDir();
     if (!managedSetupAtInitialization || !existsSync(dir)) return; // not a managed setup: stay silent
+    // Arming is per session: a fresh session has no warning in context and
+    // gets its own first-touch block.
+    writeGuard.reset();
     const targets = currentTargets();
     // One-line startup orientation for managed setups: process startup only
     // (reason "startup" — not resume/fork/new/reload, whose users are
@@ -611,6 +647,19 @@ export default function (pi: ExtensionAPI) {
       }
     }
     footerShown = false;
+  });
+
+  pi.on("tool_call", (event, ctx) => {
+    // The first gated mutating call in a session is blocked, and the
+    // warning is returned as the tool result; every later call passes
+    // (persistence is intent). The block carries no UI, so it works in
+    // TUI, RPC, and headless modes alike.
+    try {
+      return writeGuard.evaluate(event, ctx.cwd);
+    } catch {
+      // The guard must never crash the session: pass the call through.
+      return undefined;
+    }
   });
 
   pi.registerCommand("pi-sync", {

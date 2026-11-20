@@ -1,6 +1,6 @@
 {
   "name": "@codedealer/pi-sync",
-  "version": "1.12.1",
+  "version": "1.13.0",
   "description": "A manifest-driven CLI for applying explicitly managed Pi resources.",
   "type": "module",
   "bin": {
@@ -11,6 +11,7 @@
     "dist",
     "src",
     "resources/skills/pi-sync/SKILL.md",
+    "resources/extensions/pi-sync/guard.ts",
     "resources/extensions/pi-sync/index.ts",
     "resources/extensions/pi-sync/status.js",
     "resources/extensions/pi-sync/process.js",
