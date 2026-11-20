@@ -4,7 +4,7 @@ import path from 'node:path';
 import { acquireLock } from '../local-state.js';
 import { runCommand } from '../process.js';
 
-const PACKAGE_NAME = '@mariozechner/pi-coding-agent';
+const PACKAGE_NAME = '@earendil-works/pi-coding-agent';
 const REGISTRY_URL = `https://registry.npmjs.org/${PACKAGE_NAME}`;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -182,7 +182,7 @@ async function packageAtExecutable(executable: string): Promise<{ root: string; 
     if (parent === directory) break;
     directory = parent;
   }
-  throw new Error('The Pi executable is not backed by the official @mariozechner/pi-coding-agent package; unsupported or custom-wrapper installations cannot be updated.');
+  throw new Error('The Pi executable is not backed by the official @earendil-works/pi-coding-agent package; unsupported or custom-wrapper installations cannot be updated.');
 }
 
 async function globalRoot(manager: Manager): Promise<string | null> {

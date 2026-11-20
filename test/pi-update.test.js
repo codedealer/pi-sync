@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolveWindowsCommandShim } from '../dist/cli/commands/pi-update.js';
 
 const cli = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
-const packageName = '@mariozechner/pi-coding-agent';
+const packageName = '@earendil-works/pi-coding-agent';
 
 async function fixture(t, { policy = 7, versions = ['1.2.0', '1.3.0'], managerBehavior = '', manager = 'npm' } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-pi-update-'));
@@ -237,7 +237,7 @@ test('pi-update --apply installs the exact rechecked version with scripts disabl
   const calls = await managerCalls(f.log);
   assert.equal(calls.filter((call) => call.startsWith('install ')).length, 1);
   assert.match(calls.find((call) => call.startsWith('install ')), /--ignore-scripts/);
-  assert.match(calls.find((call) => call.startsWith('install ')), /@mariozechner\/pi-coding-agent@1\.2\.0$/);
+  assert.match(calls.find((call) => call.startsWith('install ')), /@earendil-works\/pi-coding-agent@1\.2\.0$/);
   assert.doesNotMatch(calls.join('\n'), /pi update|--minimum-release-age|--age=0|--min-release-age=0/);
   assert.deepEqual(await snapshotRepo(f.repo), f.originalRepoFiles);
 });
@@ -300,8 +300,8 @@ test('a failed install attempts and verifies rollback without modifying the setu
   assert.match(json(result).error, /previous Pi version 1\.0\.0 was restored and verified/);
   assert.equal(await fs.readFile(path.join(f.packageRoot, 'package.json'), 'utf8').then((text) => JSON.parse(text).version), '1.0.0');
   const calls = await managerCalls(f.log);
-  assert.ok(calls.some((call) => call.endsWith('@mariozechner/pi-coding-agent@1.2.0')));
-  assert.ok(calls.some((call) => call.endsWith('@mariozechner/pi-coding-agent@1.0.0')));
+  assert.ok(calls.some((call) => call.endsWith('@earendil-works/pi-coding-agent@1.2.0')));
+  assert.ok(calls.some((call) => call.endsWith('@earendil-works/pi-coding-agent@1.0.0')));
   assert.deepEqual(await snapshotRepo(f.repo), f.originalRepoFiles);
 });
 
