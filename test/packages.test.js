@@ -38,7 +38,7 @@ async function setup(t, { dependencies, packages, policy } = {}) {
   const npm = `#!/usr/bin/env node\nconst fs=require('node:fs');const a=process.argv.slice(2);fs.appendFileSync(process.env.FAKE_LOG,JSON.stringify({tool:'npm',args:a})+'\\n');if(a[0]==='view'&&a[2]==='versions')process.stdout.write(process.env.FAKE_VERSIONS||'["1.0.0","2.0.0"]');else if(a[0]==='view'&&a[2]==='time')process.stdout.write(process.env.FAKE_TIMES||'{}');else process.exit(2);`;
   const gh = `#!/usr/bin/env node\nconst fs=require('node:fs');const a=process.argv.slice(2);fs.appendFileSync(process.env.FAKE_LOG,JSON.stringify({tool:'gh',args:a})+'\\n');if(a[0]==='api')process.stdout.write(process.env.FAKE_RELEASES||'[]');else process.exit(2);`;
   const git = `#!/usr/bin/env node\nconst fs=require('node:fs');const a=process.argv.slice(2);fs.appendFileSync(process.env.FAKE_LOG,JSON.stringify({tool:'git',args:a})+'\\n');if(a[0]==='ls-remote')console.log(process.env.FAKE_SHA+'\\t'+a.at(-1));else process.exit(2);`;
-  const pi = `#!/usr/bin/env node\nconst fs=require('node:fs');const a=process.argv.slice(2);fs.appendFileSync(process.env.FAKE_LOG,JSON.stringify({tool:'pi',args:a})+'\\n');const file=process.env.FAKE_PI_STATE;const state=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{installed:[]};if(a[0]==='install'){if(process.env.FAKE_PI_FAIL==='yes'||process.env.FAKE_PI_FAIL_SPEC===a[1])process.exit(1);const identity=a[1].startsWith('npm:')?a[1].slice(0,a[1].lastIndexOf('@')):a[1].split('#')[0];state.installed=state.installed.filter((item)=>!(item.startsWith(identity+'@')||item.startsWith(identity+'#')));state.installed.push(a[1]);fs.writeFileSync(file,JSON.stringify(state));process.exit(0)}if(a[0]==='uninstall'){state.installed=state.installed.filter((item)=>item!==a[1]);fs.writeFileSync(file,JSON.stringify(state));process.exit(0)}if(a[0]==='update'&&a[1]==='--extensions'){state.installed=['npm:widget@999.0.0'];fs.writeFileSync(file,JSON.stringify(state));process.exit(0)}process.exit(2);`;
+  const pi = `#!/usr/bin/env node\nconst fs=require('node:fs');const a=process.argv.slice(2);fs.appendFileSync(process.env.FAKE_LOG,JSON.stringify({tool:'pi',args:a})+'\\n');const file=process.env.FAKE_PI_STATE;const state=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{installed:[]};if(a[0]==='install'){if(process.env.FAKE_PI_FAIL==='yes'||process.env.FAKE_PI_FAIL_SPEC===a[1])process.exit(1);const identity=a[1].startsWith('npm:')?a[1].slice(0,a[1].lastIndexOf('@')):a[1].replace(/(?:#[^#]*|@[0-9a-f]{40})$/i,'');state.installed=state.installed.filter((item)=>!(item.startsWith(identity+'@')||item.startsWith(identity+'#')));state.installed.push(a[1]);fs.writeFileSync(file,JSON.stringify(state));process.exit(0)}if(a[0]==='uninstall'){state.installed=state.installed.filter((item)=>item!==a[1]);fs.writeFileSync(file,JSON.stringify(state));process.exit(0)}if(a[0]==='update'&&a[1]==='--extensions'){state.installed=['npm:widget@999.0.0'];fs.writeFileSync(file,JSON.stringify(state));process.exit(0)}process.exit(2);`;
   for (const [name, content] of Object.entries({ npm, gh, git, pi })) await fs.writeFile(path.join(bin, name), content, { mode: 0o755 });
   return { root, repo, agentDir, bin, log, piState, faultModule };
 }
@@ -82,6 +82,18 @@ test('apply uses exact npm pins; standalone pi update is unsupported and can mov
   assert.deepEqual((await entries(f)).filter(({ tool }) => tool === 'npm' || tool === 'gh'), []);
   assert.deepEqual((await entries(f)).filter(({ tool }) => tool === 'pi').map(({ args }) => args), [
     ['install', 'npm:widget@1.0.0'], ['update', '--extensions'],
+  ]);
+});
+
+test('apply installs a GitHub lock pin using a clean Pi git ref instead of a URL fragment', async (t) => {
+  const dependency = { type: 'github', repository: 'acme/extension' };
+  const pin = { type: 'github', repository: 'acme/extension', commit: sha, tag: 'v1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' };
+  const f = await setup(t, { dependencies: [dependency], packages: [pin] });
+
+  const applied = run(f, ['apply', '--approve']);
+  assert.equal(applied.status, 0, applied.stderr || applied.stdout);
+  assert.deepEqual((await entries(f)).filter(({ tool, args }) => tool === 'pi').map(({ args }) => args), [
+    ['install', `git:github.com/acme/extension@${sha}`],
   ]);
 });
 
@@ -280,7 +292,7 @@ test('update --apply installs a GitHub dependency through the Pi git: source spe
   assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.repo, 'pi-sync.lock.json'), 'utf8')).packages,
     [{ type: 'github', repository: 'acme/extension', commit: sha, tag: 'v2.0.0', releasedAt: '2020-01-01T00:00:00.000Z' }]);
   assert.deepEqual((await entries(f)).filter(({ tool, args }) => tool === 'pi').map(({ args }) => args),
-    [['install', `git:github.com/acme/extension#${sha}`]]);
+    [['install', `git:github.com/acme/extension@${sha}`]]);
 });
 
 test('failed GitHub update rolls installed pins back through the same git: source spec', async (t) => {
@@ -298,20 +310,20 @@ test('failed GitHub update rolls installed pins back through the same git: sourc
   const release = [{ tag_name: 'v2.0.0', published_at: '2020-06-01T00:00:00Z', draft: false, prerelease: false }];
   const failed = run(f, ['update', '--apply', '--approve'], {
     FAKE_RELEASES: JSON.stringify(release),
-    FAKE_PI_FAIL_SPEC: `git:github.com/acme/two#${sha}`,
+    FAKE_PI_FAIL_SPEC: `git:github.com/acme/two@${sha}`,
   });
   assert.equal(failed.status, 1, failed.stderr || failed.stdout);
   assert.equal(output(failed).errorCode, 'PACKAGE_INSTALL_FAILED');
   assert.equal(await fs.readFile(lockPath, 'utf8'), lockBefore, 'lockfile unchanged when the install fails');
   assert.equal(await fs.readFile(packageStatePath, 'utf8'), packageStateBefore, 'local pin state unchanged when the install fails');
   assert.deepEqual(JSON.parse(await fs.readFile(f.piState, 'utf8')).installed.sort(),
-    [`git:github.com/acme/one#${oldSha}`, `git:github.com/acme/two#${oldSha}`]);
+    [`git:github.com/acme/one@${oldSha}`, `git:github.com/acme/two@${oldSha}`]);
   // acme/one was installed at the new pin, then rolled back to its previous
   // pin through the same git: source specification Pi installed it with.
   assert.deepEqual((await entries(f)).filter(({ tool, args }) => tool === 'pi').slice(-3).map(({ args }) => args), [
-    ['install', `git:github.com/acme/one#${sha}`],
-    ['install', `git:github.com/acme/two#${sha}`],
-    ['install', `git:github.com/acme/one#${oldSha}`],
+    ['install', `git:github.com/acme/one@${sha}`],
+    ['install', `git:github.com/acme/two@${sha}`],
+    ['install', `git:github.com/acme/one@${oldSha}`],
   ]);
 });
 

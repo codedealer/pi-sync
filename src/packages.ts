@@ -66,12 +66,12 @@ function validDate(value: any) { return typeof value === 'string' && Number.isFi
 // instead of a duplicated implementation.
 export function packageIdentity(item: { type: string; name?: string; repository?: string }): string { return item.type === 'npm' ? `npm:${item.name}` : `github:${item.repository}`; }
 // The single install specification handed to `pi install` and `pi uninstall`.
-// GitHub pins use Pi's git: source form (git:github.com/OWNER/REPO#COMMIT):
+// GitHub pins use Pi's git: source form (git:github.com/OWNER/REPO@COMMIT):
 // Pi's git URL parser accepts the owner/repository shorthand only behind the
 // git: prefix, so a github: spec would fall through to local-path handling.
 // cli/manifest re-exports it so the CLI command modules share this helper
 // instead of a duplicated implementation.
-export function packageSpec(item: { type: string; name?: string; version?: string; repository?: string; commit?: string }): string { return item.type === 'npm' ? `npm:${item.name}@${item.version}` : `git:github.com/${item.repository}#${item.commit}`; }
+export function packageSpec(item: { type: string; name?: string; version?: string; repository?: string; commit?: string }): string { return item.type === 'npm' ? `npm:${item.name}@${item.version}` : `git:github.com/${item.repository}@${item.commit}`; }
 function parseJson(output: any, source: any) {
   try { return JSON.parse(output); } catch { throw new Error(`${source} metadata was not valid JSON; update stopped closed`); }
 }

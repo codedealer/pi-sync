@@ -4371,9 +4371,9 @@ test('remove --uninstall uninstalls the dependency explicitly and reports failur
   const githubOutput = result(githubRemoved);
   assert.equal(githubOutput.ok, true);
   assert.deepEqual(githubOutput.removed.dependency, { type: 'github', repository: 'acme/pi-extension' });
-  assert.deepEqual(githubOutput.uninstalled, { package: 'github:acme/pi-extension', spec: `git:github.com/acme/pi-extension#${githubCommit}` });
+  assert.deepEqual(githubOutput.uninstalled, { package: 'github:acme/pi-extension', spec: `git:github.com/acme/pi-extension@${githubCommit}` });
   assert.equal(githubOutput.localInstallation, 'uninstalled');
-  assert.deepEqual(await piCalls(okLog), [...okLogBefore2.trim().split('\n').filter(Boolean), `uninstall git:github.com/acme/pi-extension#${githubCommit}`]);
+  assert.deepEqual(await piCalls(okLog), [...okLogBefore2.trim().split('\n').filter(Boolean), `uninstall git:github.com/acme/pi-extension@${githubCommit}`]);
   const pinsGithub = JSON.parse(await fs.readFile(pinsFile, 'utf8'));
   assert.equal(pinsGithub.packages['github:acme/pi-extension'], undefined, 'local pin bookkeeping cleared after a GitHub uninstall');
 });
