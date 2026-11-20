@@ -38,6 +38,16 @@ async function main() {
     return;
   }
   if (command === 'bootstrap') {
+    // Missing-URL preflight: keep the "no URL and no valid setup repository"
+    // case a parser-style usage error (exit 2) instead of the bootstrap
+    // operational envelope. A valid destination proceeds to runBootstrap,
+    // which re-validates (deliberately duplicated) and infers the URL from
+    // the checkout's origin remote.
+    if (request.repoUrl === undefined) {
+      const destination = path.resolve(request.repoDir);
+      const existing = await validateRepository(destination).catch(() => null);
+      if (!existing) throw new Error(`bootstrap requires --repo-url to fetch a new setup repository (no valid setup repository at ${destination})`);
+    }
     const output = await runBootstrap({ repoUrl: request.repoUrl, repoDir: request.repoDir, agentDir: request.agentDir, binDir: request.binDir, approve: request.approve });
     console.log(JSON.stringify(output, null, 2));
     if (!output.ok) process.exitCode = output.exitCode;

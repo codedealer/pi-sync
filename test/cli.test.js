@@ -4803,6 +4803,101 @@ test('bootstrap --approve resumes a first run blocked on first-install approval 
   assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'hello', 'SKILL.md'), 'utf8'), '# Private fixture\n');
 });
 
+test('bootstrap rerun without --repo-url infers the repository URL from the checkout origin remote', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-infer-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+
+  const first = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir], { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+  const firstOutput = result(first);
+  assert.equal(firstOutput.repoUrl, 'https://github.com/acme/private-setup.git');
+  assert.equal(firstOutput.repoUrlSource, 'flag');
+
+  // The destination now holds a valid setup repository whose origin records
+  // the remote URL, so a rerun without --repo-url must infer it.
+  gitAt(setupDir, ['init', '--initial-branch=main']);
+  gitAt(setupDir, ['remote', 'add', 'origin', 'https://github.com/acme/private-setup.git']);
+
+  const resumed = run(['bootstrap', '--repo-dir', setupDir, '--agent-dir', agentDir], { ...repoDefaultEnv() });
+  assert.equal(resumed.status, 0, `${resumed.stderr}\n${resumed.stdout}`);
+  const output = result(resumed);
+  assert.equal(output.ok, true);
+  assert.equal(output.repoUrl, 'https://github.com/acme/private-setup.git');
+  assert.equal(output.repoUrlSource, 'remote');
+  assert.equal(output.authenticationMethod, null, 'a resumed bootstrap does not refetch the repository');
+});
+
+test('bootstrap first-time fetch without --repo-url fails with a usage error naming the flag and destination', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-nourl-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const setupDir = path.join(root, 'never-fetched');
+
+  const response = run(['bootstrap', '--repo-dir', setupDir, '--agent-dir', path.join(root, 'agent')], { ...repoDefaultEnv() });
+  assert.equal(response.status, 2, `${response.stderr}\n${response.stdout}`);
+  const output = result(response);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'VALIDATION_ERROR');
+  assert.match(output.error, /--repo-url/);
+  assert.ok(output.error.includes(setupDir), `usage error names the destination: ${output.error}`);
+});
+
+test('bootstrap without --repo-url fails closed when the checkout origin remote is missing or not a GitHub URL', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-badremote-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+
+  const first = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir], { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+  gitAt(setupDir, ['init', '--initial-branch=main']);
+
+  // A non-GitHub origin URL fails validation and is never trusted.
+  gitAt(setupDir, ['remote', 'add', 'origin', 'https://example.com/not-github.git']);
+  const badOrigin = run(['bootstrap', '--repo-dir', setupDir, '--agent-dir', agentDir], { ...repoDefaultEnv() });
+  assert.equal(badOrigin.status, 1, `${badOrigin.stderr}\n${badOrigin.stdout}`);
+  const badOriginOutput = result(badOrigin);
+  assert.equal(badOriginOutput.ok, false);
+  assert.equal(badOriginOutput.errorCode, 'REPOSITORY_REMOTE_UNRESOLVABLE');
+  assert.match(badOriginOutput.error, /--repo-url/);
+
+  // No origin remote at all fails the same way.
+  gitAt(setupDir, ['remote', 'remove', 'origin']);
+  const noOrigin = run(['bootstrap', '--repo-dir', setupDir, '--agent-dir', agentDir], { ...repoDefaultEnv() });
+  assert.equal(noOrigin.status, 1, `${noOrigin.stderr}\n${noOrigin.stdout}`);
+  const noOriginOutput = result(noOrigin);
+  assert.equal(noOriginOutput.ok, false);
+  assert.equal(noOriginOutput.errorCode, 'REPOSITORY_REMOTE_UNRESOLVABLE');
+  assert.match(noOriginOutput.error, /--repo-url/);
+});
+
+test('bootstrap explicit --repo-url wins over a differing origin remote and reports the flag source', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-flagwins-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+
+  const first = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir], { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+  gitAt(setupDir, ['init', '--initial-branch=main']);
+  gitAt(setupDir, ['remote', 'add', 'origin', 'https://github.com/acme/other-setup.git']);
+
+  const resumed = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir], { ...repoDefaultEnv() });
+  assert.equal(resumed.status, 0, `${resumed.stderr}\n${resumed.stdout}`);
+  const output = result(resumed);
+  assert.equal(output.ok, true);
+  assert.equal(output.repoUrl, 'https://github.com/acme/private-setup.git');
+  assert.equal(output.repoUrlSource, 'flag');
+  assert.equal(output.authenticationMethod, null, 'a resumed bootstrap does not refetch the repository');
+});
+
 test('bootstrap rerun resumes from an existing valid setup repository and applies repository changes', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-resume-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));

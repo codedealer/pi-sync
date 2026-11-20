@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { inspectRequiredTools, type PrerequisitesResult, type PrerequisiteTool } from '../../prerequisites.js';
 import { MANIFEST_FILE, pathsOverlap, readJson, validateRepository, type RepositoryDeclarations } from '../manifest.js';
-import { gitExecutable, runCommand } from '../process.js';
+import { gitExecutable, gitResult, runCommand } from '../process.js';
 import { ensureRealDirectory } from '../resource-operations.js';
 
 // Matches the entry point's operation-error exit status: bootstrap reports it
@@ -48,7 +48,10 @@ interface PiSyncSubprocessResult {
 }
 
 export interface BootstrapInput {
-  repoUrl: string;
+  // Optional: when absent, the entry point has already verified the
+  // destination holds a valid setup repository, and the URL is inferred
+  // from that checkout's origin remote.
+  repoUrl?: string;
   repoDir: string;
   agentDir: string;
   binDir: string;
@@ -61,7 +64,8 @@ export type BootstrapErrorCode =
   | 'AUTH_REQUIRED'
   | 'FETCH_FAILED'
   | 'RESOURCE_COLLISION'
-  | 'APPLY_CONFLICT';
+  | 'APPLY_CONFLICT'
+  | 'REPOSITORY_REMOTE_UNRESOLVABLE';
 
 export interface BootstrapOutput {
   apiVersion: 1;
@@ -72,6 +76,12 @@ export interface BootstrapOutput {
   exitCode: number;
   repository: string;
   packageVersion: string;
+  // The resolved repository URL and its source: the explicit --repo-url
+  // flag or the destination checkout's origin remote. Present on all
+  // success responses and on failure responses reached after the URL was
+  // resolved.
+  repoUrl?: string;
+  repoUrlSource?: 'flag' | 'remote';
   prerequisites?: PrerequisiteTool[];
   missingPrerequisites?: PrerequisiteTool[];
   authentication?: {
@@ -103,6 +113,23 @@ function validateBootstrapUrl(value: string) {
   const slug = parsed.pathname.replace(/^\//, '').replace(/\.git$/, '');
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(slug)) throw new Error('--repo-url must identify a GitHub owner/repository');
   return { value, githubSlug: slug };
+}
+
+// Resolves the repository URL when --repo-url was not passed, by reading
+// the destination checkout's origin remote. Only ever called after the
+// destination has passed validateRepository: a URL is never trusted from an
+// invalid directory, and a missing remote or a URL that fails validation
+// fails closed (the caller reports REPOSITORY_REMOTE_UNRESOLVABLE).
+async function inferOriginRemoteUrl(repoDir: string): Promise<{ value: string; githubSlug: string | null }> {
+  const result = await gitResult(repoDir, ['remote', 'get-url', 'origin']);
+  if (result.status !== 0 || result.output.length === 0) {
+    throw new Error('The setup repository at the destination has no readable origin remote; pass --repo-url explicitly or repair the remote');
+  }
+  try {
+    return validateBootstrapUrl(result.output);
+  } catch {
+    throw new Error('The setup repository origin remote URL is not an allowed GitHub (or local file) URL; pass --repo-url explicitly or repair the remote');
+  }
 }
 
 function bootstrapResponse(ok: boolean, errorCode: BootstrapErrorCode | undefined, error: string | undefined, extra: { repository: string; packageVersion: string } & Partial<Omit<BootstrapOutput, 'apiVersion' | 'command' | 'ok' | 'errorCode' | 'error' | 'exitCode' | 'repository' | 'packageVersion'>>): BootstrapOutput {
@@ -269,7 +296,15 @@ async function runPiSync(command: 'plan' | 'apply', repo: string, agentDir: stri
 // existing valid setup repository instead of requiring an empty path. Pi Sync
 // never requests, prints, or stores credentials.
 export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve = false }: BootstrapInput): Promise<BootstrapOutput> {
-  const remote = validateBootstrapUrl(repoUrl);
+  // An explicit --repo-url is validated up front, exactly as before; when
+  // it is absent, inference is deferred until the destination has proven
+  // to be a valid setup repository (resume path).
+  let remote: { value: string; githubSlug: string | null } | null = repoUrl !== undefined ? validateBootstrapUrl(repoUrl) : null;
+  let repoUrlSource: 'flag' | 'remote' = 'flag';
+  // Resolution is auditable on every response reached after the URL is
+  // known: the resolved URL and whether it came from the flag or the
+  // destination checkout's origin remote.
+  const urlFields = () => (remote === null ? {} : { repoUrl: remote.value, repoUrlSource });
   const packageVersion = await readPackageVersion();
   const destination = path.resolve(repoDir);
   // `binDir` always arrives resolved: the parser applies the `~/.local/bin`
@@ -283,18 +318,35 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
   let authenticationMethod: 'git' | 'github-cli' | null = 'git';
   if (existing) {
     if (!existing.isDirectory()) {
-      return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination exists and is not a directory; choose an empty path', { repository: destination, packageVersion });
+      return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination exists and is not a directory; choose an empty path', { repository: destination, packageVersion, ...urlFields() });
     }
     // A previous bootstrap (or the user) may already have placed the setup
     // repository at the destination. Resume from it instead of requiring an
     // empty path so a failed first run is rerun with the same command.
     setup = await validateRepository(destination).catch(() => null);
     if (!setup) {
-      return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination already exists but is not a valid Pi Sync setup repository; choose an empty path', { repository: destination, packageVersion });
+      return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination already exists but is not a valid Pi Sync setup repository; choose an empty path', { repository: destination, packageVersion, ...urlFields() });
     }
     checkout = destination;
     authenticationMethod = null;
+    if (remote === null) {
+      // The destination has just passed validateRepository, so it is safe
+      // to read its origin remote; a missing or invalid remote fails
+      // closed and tells the user to pass --repo-url explicitly.
+      try {
+        remote = await inferOriginRemoteUrl(destination);
+        repoUrlSource = 'remote';
+      } catch (error) {
+        return bootstrapResponse(false, 'REPOSITORY_REMOTE_UNRESOLVABLE', error instanceof Error ? error.message : String(error), { repository: destination, packageVersion });
+      }
+    }
   } else {
+    // The entry point preflights the missing-URL case, so a first-time fetch
+    // always carries an explicit URL; this guard keeps runBootstrap
+    // self-contained for any future call site.
+    if (remote === null) {
+      return bootstrapResponse(false, 'REPOSITORY_REMOTE_UNRESOLVABLE', 'Bootstrap requires --repo-url to fetch a new setup repository; no valid setup repository exists at the destination to infer the URL from', { repository: destination, packageVersion });
+    }
     const access = await runCommand(await gitExecutable(), ['ls-remote', remote.value]);
     if (access.status !== 0) {
       let ghAuthenticated = false;
@@ -305,7 +357,7 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
         ghAvailable = prerequisiteResult.ok;
         if (!ghAvailable) return bootstrapResponse(false, 'PREREQUISITE_INSTALL_REQUIRED',
           'GitHub CLI is required for this authentication handoff but could not be installed automatically.', {
-            repository: destination, packageVersion, prerequisites: prerequisiteResult.tools,
+            repository: destination, packageVersion, prerequisites: prerequisiteResult.tools, ...urlFields(),
             missingPrerequisites: prerequisiteResult.tools.filter((tool) => tool.status === 'failed'),
           });
         const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` };
@@ -319,7 +371,7 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
         const authArgs = [ghExecutable, 'auth', 'login', '--hostname', 'github.com'];
         return bootstrapResponse(false, 'AUTH_REQUIRED', 'Private setup repository access is unavailable. Complete the GitHub authentication handoff, then resume bootstrap.', {
           repository: destination,
-          packageVersion,
+          packageVersion, ...urlFields(),
           prerequisites: prerequisiteResult?.tools ?? [],
           authentication: {
             required: true,
@@ -347,7 +399,7 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
     if (clone.status !== 0) {
       return bootstrapResponse(false, 'FETCH_FAILED',
         authenticationMethod === 'git' ? 'GitHub access was detected but cloning the setup repository failed' : 'GitHub CLI authentication was detected but it could not fetch the setup repository',
-        { repository: destination, packageVersion });
+        { repository: destination, packageVersion, ...urlFields() });
     }
     setup = await validateRepository(checkout);
   }
@@ -355,13 +407,13 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
     const prerequisites = await inspectRequiredTools(setup.requiredTools, { binDir: bin });
     if (!prerequisites.ok) return bootstrapResponse(false, 'PREREQUISITE_INSTALL_REQUIRED',
       'One or more required setup tools are unavailable. Resolve the listed handoff before applying the setup.', {
-        repository: destination, packageVersion, prerequisites: prerequisites.tools,
+        repository: destination, packageVersion, prerequisites: prerequisites.tools, ...urlFields(),
         missingPrerequisites: prerequisites.tools.filter((tool) => tool.status === 'failed'),
       });
 
     const declaration = await refreshBundledResources(checkout);
     if (!declaration.ok) return bootstrapResponse(false, 'RESOURCE_COLLISION', 'A bundled pi-sync resource conflicts with existing setup repository content; no bundled resource was changed', {
-      repository: destination, packageVersion, collision: declaration.collision,
+      repository: destination, packageVersion, collision: declaration.collision, ...urlFields(),
     });
 
     await validateRepository(checkout);
@@ -370,13 +422,13 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
       const refreshed = declaration.actions.some((action) => action.action !== 'already-current');
       return bootstrapResponse(false, 'APPLY_CONFLICT',
         `Bootstrap plan found a collision or conflict; existing local content was left untouched${refreshed ? ' The setup repository was already refreshed to the executing package\'s bundled resources; resolve the conflict and rerun bootstrap.' : ''}`, {
-        repository: destination, packageVersion,
+        repository: destination, packageVersion, ...urlFields(),
         bundledResources: declaration.actions, plan: plan.output,
       });
     }
     if (checkout !== destination) {
       if (await fs.lstat(destination).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error))) {
-        return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination appeared during bootstrap; no content was replaced', { repository: destination, packageVersion });
+        return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination appeared during bootstrap; no content was replaced', { repository: destination, packageVersion, ...urlFields() });
       }
       await fs.rename(checkout, destination);
     }
@@ -384,7 +436,7 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
     const succeeded = applied.status === 0 && applied.output.ok;
     return bootstrapResponse(succeeded, succeeded ? undefined : 'APPLY_CONFLICT',
       succeeded ? undefined : 'Bootstrap apply did not complete cleanly; inspect the structured apply result and resume after resolving it', {
-        repository: destination, authenticationMethod, prerequisites: prerequisites.tools,
+        repository: destination, authenticationMethod, prerequisites: prerequisites.tools, ...urlFields(),
         packageVersion,
         bundledResources: declaration.actions,
         apply: applied.output,

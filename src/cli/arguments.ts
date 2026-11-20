@@ -112,7 +112,9 @@ export interface SyncRequest extends RequestBase {
 
 export interface BootstrapRequest {
   command: 'bootstrap';
-  repoUrl: string;
+  // Optional: when absent, the entry point requires a valid setup repository
+  // at the destination so the URL can be inferred from its origin remote.
+  repoUrl?: string;
   repoDir: string;
   agentDir: string;
   binDir: string;
@@ -226,7 +228,10 @@ function buildRequest(command: string, options: Options, argv: string[]): Comman
   if (options.uninstall && (command !== 'remove' || options.type !== 'dependency')) throw new Error('--uninstall is only supported by remove --type dependency');
   if (options.target !== undefined && !(command === 'remove' && options.type && options.type !== 'dependency')) throw new Error('--target is only supported by remove for resource types');
   if (command === 'bootstrap') {
-    if (!options.repoUrl) throw new Error('bootstrap requires --repo-url');
+    // --repo-url is no longer a parse-time requirement: the entry point
+    // preflights the missing-URL case (usage error when no valid setup
+    // repository exists at the destination), and bootstrap otherwise
+    // infers the URL from that repository's origin remote.
     // --repo is rejected for bootstrap wherever it appears in the arguments.
     // The check inspects the argv handed to this parser (not process.argv)
     // so the parser stays self-contained for any call site or test argv.
@@ -272,7 +277,7 @@ function buildRequest(command: string, options: Options, argv: string[]): Comman
     case 'sync':
       return { command, repo: options.repo, agentDir: options.agentDir, apply: options.applyUpdate };
     case 'bootstrap':
-      return { command, repoUrl: options.repoUrl as string, repoDir: options.repoDir, agentDir: options.agentDir, binDir: options.binDir, approve: options.approve };
+      return { command, repoUrl: options.repoUrl, repoDir: options.repoDir, agentDir: options.agentDir, binDir: options.binDir, approve: options.approve };
     default:
       throw new Error(`Unknown command: ${command}`);
   }
