@@ -1,8 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { GITATTRIBUTES_FILE, LOCK_FILE, MANIFEST_FILE, RESOURCE_RULES, isRecord, type RepositoryDeclarations } from '../manifest.js';
 import os from 'node:os';
 import crypto from 'node:crypto';
-import { LOCK_FILE, MANIFEST_FILE, RESOURCE_RULES, isRecord, type RepositoryDeclarations } from '../manifest.js';
 import { gitResult } from '../process.js';
 import { findLikelySecrets, findLikelySecretsInText } from '../resource-operations.js';
 
@@ -77,7 +77,7 @@ async function requireGit(repo: string, args: string[], message: string, extraEn
 }
 
 function managedGitPath(relative: string, resourceSources: string[]) {
-  return relative === MANIFEST_FILE || relative === LOCK_FILE || resourceSources.some((source) => relative === source || relative.startsWith(`${source}/`));
+  return relative === MANIFEST_FILE || relative === LOCK_FILE || relative === GITATTRIBUTES_FILE || resourceSources.some((source) => relative === source || relative.startsWith(`${source}/`));
 }
 
 // Returns the resource sources declared in the setup manifest at the given
@@ -270,8 +270,8 @@ export async function runPush({ repo, declarations, publish = false, message, pr
     const headSources = await managedSourcesAtCommit(repo, 'HEAD');
     const removedSources = headSources.filter((source) => !resourceSources.includes(source));
     const removedSourcePath = (relative: string) => removedSources.some((source) => relative === source || relative.startsWith(`${source}/`));
-    const pathspecs = [MANIFEST_FILE, LOCK_FILE, ...resourceSources, ...removedSources].map((item) => `:(top,literal)${item}`);
-    const currentPathspecs = [MANIFEST_FILE, LOCK_FILE, ...resourceSources].map((item) => `:(top,literal)${item}`);
+    const pathspecs = [MANIFEST_FILE, LOCK_FILE, GITATTRIBUTES_FILE, ...resourceSources, ...removedSources].map((item) => `:(top,literal)${item}`);
+    const currentPathspecs = [MANIFEST_FILE, LOCK_FILE, GITATTRIBUTES_FILE, ...resourceSources].map((item) => `:(top,literal)${item}`);
     const tracked = await requireGit(repo, ['ls-files', '--cached', '-z', '--', ...pathspecs], 'Could not enumerate managed files', env);
     const untracked = await requireGit(repo, ['ls-files', '--others', '--exclude-standard', '-z', '--', ...currentPathspecs], 'Could not enumerate managed files', env);
     const candidates = [...new Set([...tracked.split('\0'), ...untracked.split('\0')].filter(Boolean))];

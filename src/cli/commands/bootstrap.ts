@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { inspectRequiredTools, type PrerequisitesResult, type PrerequisiteTool } from '../../prerequisites.js';
-import { MANIFEST_FILE, pathsOverlap, readJson, validateRepository, type RepositoryDeclarations } from '../manifest.js';
+import { GITATTRIBUTES_FILE, GITATTRIBUTES_POLICY, MANIFEST_FILE, pathsOverlap, readJson, validateRepository, type RepositoryDeclarations } from '../manifest.js';
 import { gitExecutable, gitResult, runCommand } from '../process.js';
 import { ensureRealDirectory } from '../resource-operations.js';
 
@@ -95,6 +95,11 @@ export interface BootstrapOutput {
   collision?: BundledCollision;
   plan?: unknown;
   bundledResources?: { type: string; source: string; target: string; action: BundledAction }[];
+  // The setup repository EOL policy file managed by Pi Sync: `created` when a
+  // missing file was written with the fixed policy, `current` when the file
+  // already matches, `divergent` when an existing file differs and was left
+  // untouched for manual review.
+  repositoryPolicy?: { file: string; action: 'created' | 'current' | 'divergent' };
   authenticationMethod?: 'git' | 'github-cli' | null;
   apply?: unknown;
 }
@@ -271,6 +276,20 @@ async function refreshBundledResources(repo: string): Promise<BundledRefreshResu
   return { ok: true, actions };
 }
 
+// Ensures the repository EOL policy file in the setup repository. A missing
+// file is created with the fixed policy so working-tree line endings match
+// the LF content the CLI writes directly; a matching file is left alone; a
+// divergent file is never overwritten and is reported for manual review.
+async function ensureRepositoryPolicy(repo: string): Promise<'created' | 'current' | 'divergent'> {
+  const policyPath = path.join(repo, GITATTRIBUTES_FILE);
+  const existing = await fs.readFile(policyPath, 'utf8').catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
+  if (existing === null) {
+    await fs.writeFile(policyPath, GITATTRIBUTES_POLICY);
+    return 'created';
+  }
+  return existing === GITATTRIBUTES_POLICY ? 'current' : 'divergent';
+}
+
 // Runs a sibling pi-sync command (plan/apply) as a subprocess of this CLI
 // build so bootstrap drives the exact established workflows, including the
 // apply/reconciliation path, with their own locking and error envelopes.
@@ -417,13 +436,15 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
     });
 
     await validateRepository(checkout);
+    const policyAction = await ensureRepositoryPolicy(checkout);
+    const repositoryPolicy = { file: GITATTRIBUTES_FILE, action: policyAction };
     const plan = await runPiSync('plan', checkout, path.resolve(agentDir));
     if (plan.status !== 0 || !plan.output.ok) {
       const refreshed = declaration.actions.some((action) => action.action !== 'already-current');
       return bootstrapResponse(false, 'APPLY_CONFLICT',
         `Bootstrap plan found a collision or conflict; existing local content was left untouched${refreshed ? ' The setup repository was already refreshed to the executing package\'s bundled resources; resolve the conflict and rerun bootstrap.' : ''}`, {
         repository: destination, packageVersion, ...urlFields(),
-        bundledResources: declaration.actions, plan: plan.output,
+        bundledResources: declaration.actions, plan: plan.output, repositoryPolicy,
       });
     }
     if (checkout !== destination) {
@@ -439,6 +460,7 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
         repository: destination, authenticationMethod, prerequisites: prerequisites.tools, ...urlFields(),
         packageVersion,
         bundledResources: declaration.actions,
+        repositoryPolicy,
         apply: applied.output,
       });
   } finally {

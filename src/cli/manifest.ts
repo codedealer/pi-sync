@@ -9,6 +9,13 @@ export { packageIdentity, packageSpec } from '../packages.js';
 
 export const MANIFEST_FILE = 'pi-sync.json';
 export const LOCK_FILE = 'pi-sync.lock.json';
+// The repository EOL policy file. Pi Sync owns this file in the setup
+// repository: it pins every text file to LF so the working tree matches the
+// LF content the CLI writes directly (manifest, lockfile, bundles), keeping
+// Git's stat-dirty detection and the managed push flow stable on Windows
+// checkouts where core.autocrlf would otherwise expect CRLF.
+export const GITATTRIBUTES_FILE = '.gitattributes';
+export const GITATTRIBUTES_POLICY = '* text=auto eol=lf\n';
 
 export const SETTINGS_FILES = new Set(['settings.json', 'models.json', 'keybindings.json', 'mcp.json']);
 

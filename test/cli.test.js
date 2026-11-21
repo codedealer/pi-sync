@@ -244,6 +244,8 @@ test('bootstrap fetches a private setup fixture, declares the bundled skill and 
   const manifest = JSON.parse(await fs.readFile(path.join(setupDir, 'pi-sync.json'), 'utf8'));
   assert.ok(manifest.resources.some((item) => item.type === 'skill' && item.source === 'resources/skills/pi-sync' && item.target === 'skills/pi-sync'));
   assert.ok(manifest.resources.some((item) => item.type === 'extension' && item.source === 'resources/extensions/pi-sync' && item.target === 'extensions/pi-sync'));
+  assert.deepEqual(output.repositoryPolicy, { file: '.gitattributes', action: 'created' });
+  assert.equal(await fs.readFile(path.join(setupDir, '.gitattributes'), 'utf8'), '* text=auto eol=lf\n');
   assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'pi-sync', 'SKILL.md'), 'utf8'),
     await fs.readFile(new URL('../resources/skills/pi-sync/SKILL.md', import.meta.url), 'utf8'));
   assert.equal(await fs.readFile(path.join(agentDir, 'extensions', 'pi-sync', 'index.ts'), 'utf8'),
@@ -251,6 +253,30 @@ test('bootstrap fetches a private setup fixture, declares the bundled skill and 
   assert.equal(await fs.readFile(unrelated, 'utf8'), '# Keep local\n');
   const state = await fs.readFile(path.join(agentDir, '.pi-sync', 'state.json'), 'utf8').then(JSON.parse);
   assert.ok(state.resources['skills/pi-sync'], 'the bundled skill is installed and tracked by normal apply state');
+});
+
+test('bootstrap writes the missing EOL policy file, reports a matching one as current, and never overwrites divergent content', async (t) => {
+  const policy = '* text=auto eol=lf\n';
+  const scenarios = [
+    { label: 'missing', content: null, expected: 'created' },
+    { label: 'matching', content: policy, expected: 'current' },
+    { label: 'divergent', content: '* text=auto\n', expected: 'divergent' },
+  ];
+  for (const scenario of scenarios) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), `pi-sync-bootstrap-policy-${scenario.label}-`));
+    t.after(() => fs.rm(root, { recursive: true, force: true }));
+    const sourceRepo = await bootstrapRepo(t, root);
+    if (scenario.content !== null) await fs.writeFile(path.join(sourceRepo, '.gitattributes'), scenario.content);
+    const fakeTools = await fakeGitHubTools(t, sourceRepo);
+    const setupDir = path.join(root, 'private-checkout');
+    const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', path.join(root, 'agent')], {
+      ...fakeTools, FAKE_GIT_ACCESS: 'yes',
+    });
+    assert.equal(response.status, 0, `${response.stderr}\n${response.stdout}`);
+    const output = result(response);
+    assert.deepEqual(output.repositoryPolicy, { file: '.gitattributes', action: scenario.expected }, scenario.label);
+    assert.equal(await fs.readFile(path.join(setupDir, '.gitattributes'), 'utf8'), scenario.expected === 'divergent' ? scenario.content : policy, scenario.label);
+  }
 });
 
 test('bootstrap uses authenticated GitHub CLI as a fetch fallback without exposing credentials', async (t) => {
@@ -2341,6 +2367,36 @@ test('push preview and publish include only explicit managed, non-ignored paths 
   assert.deepEqual(remoteFiles.stdout.trim().split(/\r?\n/).sort(), ['pi-sync.json', 'resources/skills/hello/SKILL.md']);
   assert.match(gitAt(repo, ['diff', '--cached', '--name-only']), /^unrelated\.txt$/);
   assert.equal(await fs.readFile(path.join(repo, 'unrelated.txt'), 'utf8'), 'unrelated content\n');
+});
+
+test('push publishes the managed EOL policy file and accepts ahead commits touching it', async (t) => {
+  const { repo, bare } = await pushFixture(t);
+  // Bootstrap-style adoption: the policy file appears untracked in the working tree.
+  await fs.writeFile(path.join(repo, '.gitattributes'), '* text=auto eol=lf\n');
+  const preview = run(['push', '--repo', repo]);
+  assert.equal(preview.status, 0, `${preview.stderr}\n${preview.stdout}`);
+  const plan = result(preview);
+  assert.deepEqual(plan.changes.map((item) => item.path), ['.gitattributes']);
+  assert.equal(plan.commitRequired, true);
+
+  const published = run(['push', '--publish', '--repo', repo]);
+  assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
+  const output = result(published);
+  assert.equal(output.mode, 'published');
+  assert.deepEqual(output.changes.map((item) => item.path), ['.gitattributes']);
+  const remoteFiles = spawnSync('git', ['--git-dir', bare, 'ls-tree', '--name-only', 'main'], { encoding: 'utf8' });
+  assert.equal(remoteFiles.status, 0, remoteFiles.stderr);
+  assert.ok(remoteFiles.stdout.includes('.gitattributes'));
+
+  // A previously committed change to the policy file is publishable too.
+  await fs.writeFile(path.join(repo, '.gitattributes'), '* text=auto eol=lf\n# managed by pi-sync\n');
+  gitAt(repo, ['add', '--', '.gitattributes']);
+  gitAt(repo, ['commit', '-m', 'annotate policy']);
+  const republished = run(['push', '--publish', '--repo', repo]);
+  assert.equal(republished.status, 0, `${republished.stderr}\n${republished.stdout}`);
+  const republishedOutput = result(republished);
+  assert.equal(republishedOutput.mode, 'published');
+  assert.deepEqual(republishedOutput.changes.map((item) => item.path), ['.gitattributes']);
 });
 
 test('published push output omits the patch text and reports a digest of the stderr preview', async (t) => {
