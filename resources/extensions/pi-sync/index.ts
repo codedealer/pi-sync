@@ -66,7 +66,7 @@
  * The extension also guards the first reflexive reach for the local
  * installation: on a managed setup it intercepts tool calls that mutate
  * files under the agent directory's resource roots (skills/, extensions/,
- * prompts/, agents/, roles/). Manifest-declared settings targets are not
+ * prompts/, agents/, roles/, workflows/). Manifest-declared settings targets are not
  * gated: the settings watcher back-syncs local edits of managed settings
  * into the setup repository's manifest, so those edits are captured instead
  * of drifting, and blocking them would only add friction. The first such

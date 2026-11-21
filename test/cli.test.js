@@ -2844,6 +2844,117 @@ test('prompt, agent, and role resources reconcile with the same three-way semant
   assert.equal(result(conflict).actions.find((item) => item.target === 'agents/reviewer.md').action, 'conflict');
   assert.equal(await fs.readFile(agentTarget, 'utf8'), '# Local agent edit\n');
 });
+test('add imports workflow scripts and rejects non-.js or nested workflow sources', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  await fs.mkdir(path.join(agentDir, 'workflows'), { recursive: true });
+  await fs.writeFile(path.join(agentDir, 'workflows', 'octopus-loop.js'), 'export async function run() {}\n');
+  await fs.writeFile(path.join(agentDir, 'workflows', 'notes.txt'), 'not a workflow\n');
+
+  const response = run(['add', '--type', 'workflow', '--source', 'workflows/octopus-loop.js', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(response.status, 0, `${response.stderr}\n${response.stdout}`);
+  const output = result(response);
+  assert.equal(output.action, 'added');
+  assert.equal(output.type, 'workflow');
+  assert.equal(output.source, 'workflows/octopus-loop.js');
+  assert.equal(output.target, 'workflows/octopus-loop.js');
+  assert.equal(output.repositorySource, 'resources/workflows/octopus-loop.js');
+  const manifest = JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8'));
+  assert.deepEqual(manifest.resources, [{ type: 'workflow', source: 'resources/workflows/octopus-loop.js', target: 'workflows/octopus-loop.js' }]);
+  assert.equal(await fs.readFile(path.join(repo, 'resources', 'workflows', 'octopus-loop.js'), 'utf8'), 'export async function run() {}\n');
+  assert.equal(await fs.readFile(path.join(agentDir, 'workflows', 'octopus-loop.js'), 'utf8'), 'export async function run() {}\n');
+
+  // A non-.js file and a nested path are validation rejections that write nothing.
+  for (const source of ['workflows/notes.txt', 'workflows/inner/deep.js']) {
+    const rejected = run(['add', '--type', 'workflow', '--source', source, '--repo', repo, '--agent-dir', agentDir]);
+    assert.equal(rejected.status, 2, `${source}: ${rejected.stderr}\n${rejected.stdout}`);
+  }
+  assert.equal(JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8')).resources.length, 1);
+});
+
+test('register registers repository-present workflow scripts, and --list and --all discover them', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  await fs.mkdir(path.join(repo, 'resources', 'workflows'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'workflows', 'octopus-loop.js'), 'export async function run() {}\n');
+  // Non-resources: a non-.js file and a nested file are not candidates.
+  await fs.writeFile(path.join(repo, 'resources', 'workflows', 'notes.txt'), 'not a workflow\n');
+  await fs.mkdir(path.join(repo, 'resources', 'workflows', 'inner'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'workflows', 'inner', 'deep.js'), 'export const deep = true;\n');
+
+  const listed = run(['register', '--list', '--type', 'workflow', '--repo', repo]);
+  assert.equal(listed.status, 0, listed.stderr);
+  assert.deepEqual(result(listed).unregistered, [
+    { type: 'workflow', source: 'resources/workflows/octopus-loop.js', target: 'workflows/octopus-loop.js' },
+  ]);
+
+  const response = run(['register', '--type', 'workflow', '--source', 'resources/workflows/octopus-loop.js', '--repo', repo]);
+  assert.equal(response.status, 0, response.stderr);
+  const output = result(response);
+  assert.equal(output.action, 'registered');
+  assert.equal(output.type, 'workflow');
+  assert.equal(output.source, 'resources/workflows/octopus-loop.js');
+  assert.equal(output.target, 'workflows/octopus-loop.js');
+  const manifest = JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8'));
+  assert.deepEqual(manifest.resources.at(-1), { type: 'workflow', source: 'resources/workflows/octopus-loop.js', target: 'workflows/octopus-loop.js' });
+  // No import or copy: the local installation is not created or modified.
+  await assert.rejects(fs.access(path.join(agentDir, 'workflows')));
+
+  // Re-registering the exact declaration is an idempotent no-op.
+  const again = run(['register', '--type', 'workflow', '--source', 'resources/workflows/octopus-loop.js', '--repo', repo]);
+  assert.equal(result(again).action, 'already-registered');
+
+  // --all batch-registers the remaining candidate of the narrowed type.
+  await fs.writeFile(path.join(repo, 'resources', 'workflows', 'second.js'), 'export async function second() {}\n');
+  const batched = run(['register', '--all', '--type', 'workflow', '--repo', repo]);
+  assert.equal(batched.status, 0, batched.stderr);
+  const batchedOutput = result(batched);
+  assert.equal(batchedOutput.action, 'registered');
+  assert.deepEqual(batchedOutput.registered, [{ type: 'workflow', source: 'resources/workflows/second.js', target: 'workflows/second.js' }]);
+  const finalManifest = JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8'));
+  assert.deepEqual(finalManifest.resources.map((item) => item.type), ['skill', 'workflow', 'workflow']);
+});
+
+test('apply installs workflow scripts, and remove and prune handle them like the other file types', async (t) => {
+  const { repo, agentDir } = await extendedFixture(t);
+  await fs.mkdir(path.join(agentDir, 'workflows'), { recursive: true });
+  await fs.writeFile(path.join(agentDir, 'workflows', 'octopus-loop.js'), 'export async function run() {}\n');
+  assert.equal(run(['add', '--type', 'workflow', '--source', 'workflows/octopus-loop.js', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+
+  // Remove the local original so apply performs a real install.
+  await fs.rm(path.join(agentDir, 'workflows', 'octopus-loop.js'));
+  const installed = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(installed.status, 0, installed.stderr);
+  assert.deepEqual(result(installed).actions.map((item) => item.target), ['workflows/octopus-loop.js']);
+  assert.equal(result(installed).actions[0].action, 'installed');
+  assert.equal(await fs.readFile(path.join(agentDir, 'workflows', 'octopus-loop.js'), 'utf8'), 'export async function run() {}\n');
+
+  // plan and status report nothing pending once applied.
+  for (const command of ['plan', 'status']) {
+    const clean = run([command, '--repo', repo, '--agent-dir', agentDir]);
+    assert.equal(clean.status, 0, clean.stderr);
+    assert.deepEqual(result(clean).actions, []);
+  }
+
+  // Removal is repository-only: manifest entry and repository content are gone,
+  // the local installation is unchanged, and the resource is reported stale.
+  const removed = run(['remove', '--type', 'workflow', '--target', 'workflows/octopus-loop.js', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(removed.status, 0, removed.stderr);
+  const removedOutput = result(removed);
+  assert.deepEqual(removedOutput.removed, { type: 'workflow', source: 'resources/workflows/octopus-loop.js', target: 'workflows/octopus-loop.js' });
+  await assert.rejects(fs.access(path.join(repo, 'resources', 'workflows', 'octopus-loop.js')));
+  assert.equal(await fs.readFile(path.join(agentDir, 'workflows', 'octopus-loop.js'), 'utf8'), 'export async function run() {}\n');
+
+  const stale = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(stale.status, 0, stale.stderr);
+  const staleOutput = result(stale);
+  assert.deepEqual(staleOutput.staleResources.map((item) => item.target), ['workflows/octopus-loop.js']);
+  assert.equal(staleOutput.actions.find((item) => item.target === 'workflows/octopus-loop.js').action, 'stale');
+
+  // A confirmed prune removes the local file copy.
+  const pruned = run(['prune', '--confirm', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(pruned.status, 0, pruned.stderr);
+  assert.deepEqual(result(pruned).staleResources.map((item) => item.target), ['workflows/octopus-loop.js']);
+  await assert.rejects(fs.access(path.join(agentDir, 'workflows', 'octopus-loop.js')));
+});
 
 test('multi-file extension directories are managed end to end with the same three-way semantics', async (t) => {
   const { repo, agentDir } = await extendedFixture(t);

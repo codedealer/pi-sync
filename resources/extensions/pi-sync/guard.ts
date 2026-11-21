@@ -13,9 +13,8 @@
  *   resolved candidate path falls under a gated root. This covers the
  *   built-in `write`/`edit` tools and third-party mutation toolsets (for
  *   example hashline's `replace`, `replace_match`, `insert`) alike.
- * - Gated roots: the five resource roots under the agent directory
- *   (skills/, extensions/, prompts/, agents/, roles/). Manifest-declared
- *   settings targets are deliberately not gated: the extension's settings
+ * - Gated roots: the six resource roots under the agent directory
+ *   (skills/, extensions/, prompts/, agents/, roles/, workflows/). Manifest-declared
  *   watcher back-syncs local edits of managed settings into the setup
  *   repository's manifest, so those edits are captured instead of drifting,
  *   and blocking them would only add friction. Gating the resource roots —
@@ -61,8 +60,8 @@ export interface GuardContext {
   repoDir: () => string;
 }
 
-/** The five resource roots under the agent directory, one per manifest resource type. */
-const RESOURCE_ROOTS = ["skills", "extensions", "prompts", "agents", "roles"];
+/** The six resource roots under the agent directory, one per manifest resource type. */
+const RESOURCE_ROOTS = ["skills", "extensions", "prompts", "agents", "roles", "workflows"];
 
 /**
  * Read-only tools: agents legitimately read the installed copies (for
@@ -113,8 +112,8 @@ export function createWriteGuard(ctx: GuardContext) {
    * resources/<root>/ file — so the agent never has to hunt for the setup
    * repository, and gives the concrete register command for a brand-new
    * resource. The register unit is the first segment under the type root
-   * (a skill directory, an extension file or directory, or a single .md
-   * prompt/agent/role file); `--source` takes it repository-relative.
+   * (a skill directory, an extension file or directory, a single .md
+   * prompt/agent/role file, or a single .js workflow file); `--source` takes it repository-relative.
    */
   function resourceWarning(target: string, root: string, relative: string): string {
     const repoDir = ctx.repoDir();

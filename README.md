@@ -35,7 +35,7 @@ After the bundle refresh, bootstrap previews the normal manifest-driven apply an
 
 ## Setup repository format (schema version 1)
 
-Place `pi-sync.json` and `pi-sync.lock.json` at the root of the setup repository. Schema version 1 supports authored Pi resources: skill directories, extensions (single files or directories), prompts, agents, and roles. It also supports explicitly declared npm and GitHub Pi packages. Package pins are kept in the lockfile and ordinary apply never discovers newer releases.
+Place `pi-sync.json` and `pi-sync.lock.json` at the root of the setup repository. Schema version 1 supports authored Pi resources: skill directories, extensions (single files or directories), prompts, agents, roles, and workflow scripts. It also supports explicitly declared npm and GitHub Pi packages. Package pins are kept in the lockfile and ordinary apply never discovers newer releases.
 
 ```json
 {
@@ -94,6 +94,7 @@ Resources use per-type roots, and every source and target must stay inside its d
 | `prompt` | `resources/prompts/NAME.md` | `prompts/NAME.md` | single `.md` file |
 | `agent` | `resources/agents/NAME.md` | `agents/NAME.md` | single `.md` file |
 | `role` | `resources/roles/NAME.md` | `roles/NAME.md` | single `.md` file |
+| `workflow` | `resources/workflows/NAME.js` | `workflows/NAME.js` | single `.js` file |
 
 For non-skill types the source and target must use the same name. Symbolic links are rejected, paths use relative POSIX syntax, and no path may traverse outside its root. `node_modules` directories are never imported or managed; only authored content and portable extension configuration belong in the setup repository. Package-installed code is never imported.
 
@@ -118,6 +119,7 @@ pi-sync add --type extension --source extensions/NAME [--repo PATH] [--agent-dir
 pi-sync add --type prompt --source prompts/NAME.md [--repo PATH] [--agent-dir PATH]
 pi-sync add --type agent --source agents/NAME.md [--repo PATH] [--agent-dir PATH]
 pi-sync add --type role --source roles/NAME.md [--repo PATH] [--agent-dir PATH]
+pi-sync add --type workflow --source workflows/NAME.js [--repo PATH] [--agent-dir PATH]
 pi-sync add --type dependency --source npm:PACKAGE [--repo PATH]
 pi-sync add --type dependency --source github:OWNER/REPOSITORY [--repo PATH]
 pi-sync register --type skill --source resources/skills/NAME [--repo PATH]
@@ -125,6 +127,7 @@ pi-sync register --type extension --source resources/extensions/NAME [--repo PAT
 pi-sync register --type prompt --source resources/prompts/NAME.md [--repo PATH]
 pi-sync register --type agent --source resources/agents/NAME.md [--repo PATH]
 pi-sync register --type role --source resources/roles/NAME.md [--repo PATH]
+pi-sync register --type workflow --source resources/workflows/NAME.js [--repo PATH]
 pi-sync register --list [--type T] [--repo PATH]
 pi-sync register --all [--type T] [--repo PATH]
 pi-sync remove --type skill --target skills/NAME [--repo PATH] [--agent-dir PATH]
@@ -132,6 +135,7 @@ pi-sync remove --type extension --target extensions/NAME [--repo PATH] [--agent-
 pi-sync remove --type prompt --target prompts/NAME.md [--repo PATH] [--agent-dir PATH]
 pi-sync remove --type agent --target agents/NAME.md [--repo PATH] [--agent-dir PATH]
 pi-sync remove --type role --target roles/NAME.md [--repo PATH] [--agent-dir PATH]
+pi-sync remove --type workflow --target workflows/NAME.js [--repo PATH] [--agent-dir PATH]
 pi-sync remove --type dependency --source npm:PACKAGE [--repo PATH] [--agent-dir PATH] [--uninstall]
 pi-sync remove --type dependency --source github:OWNER/REPOSITORY [--repo PATH] [--agent-dir PATH] [--uninstall]
 pi-sync update [--repo PATH]
@@ -150,7 +154,7 @@ pi-sync --version
 
 The target defaults to `PI_CODING_AGENT_DIR`, then `~/.pi/agent`. Each command emits JSON. `--version` reports the installed CLI package name and version in the same JSON envelope and does not touch a repository or agent directory. `status` and `plan` report `install`, `update`, `unchanged`, `local-divergence`, `conflict`, or `collision` actions. Apply installs absent resources, reconciles tracked changes, and leaves unlisted resources and settings untouched. Unknown pre-existing resource paths and settings collisions are never overwritten.
 
-`add` imports one resource of each type from the local Pi agent directory: a skill directory from `skills/NAME`, an extension file or directory from `extensions/NAME`, or a single `.md` file from `prompts/NAME.md`, `agents/NAME.md`, or `roles/NAME.md`. It copies only the selected file or directory to the matching `resources/<type-root>/` path and appends the corresponding manifest resource. `add --type dependency` declares only the selected npm package or GitHub repository; it does not edit pins or install packages. Run `update` to preview mature exact pins, then `update --apply` to apply the eligible updates. Use `pi-sync update` for managed package updates; ordinary `apply` uses lockfile pins without registry or GitHub update lookups. First-time installs require interactive confirmation or explicit `--approve` for non-interactive use. Known credential-store paths and likely secret material stop resource import and are reported for review. The scanner is best-effort and does not guarantee arbitrary content is secret-free.
+`add` imports one resource of each type from the local Pi agent directory: a skill directory from `skills/NAME`, an extension file or directory from `extensions/NAME`, or a single `.md` file from `prompts/NAME.md`, `agents/NAME.md`, or `roles/NAME.md`, or a single `.js` file from `workflows/NAME.js`. It copies only the selected file or directory to the matching `resources/<type-root>/` path and appends the corresponding manifest resource. `add --type dependency` declares only the selected npm package or GitHub repository; it does not edit pins or install packages. Run `update` to preview mature exact pins, then `update --apply` to apply the eligible updates. Use `pi-sync update` for managed package updates; ordinary `apply` uses lockfile pins without registry or GitHub update lookups. First-time installs require interactive confirmation or explicit `--approve` for non-interactive use. Known credential-store paths and likely secret material stop resource import and are reported for review. The scanner is best-effort and does not guarantee arbitrary content is secret-free.
 
 `register` declares a resource that already exists under the setup repository's `resources/` tree as a managed resource, without hand-editing the manifest. The content must already be present with the per-type shape: a skill directory, an extension file or directory, or a single `.md` prompt, agent, or role file directly under its root. `--source` is a repository-relative path under `resources/`, unlike `add`, whose `--source` is a local-installation path. The agent-relative target is derived from the source: `resources/prompts/NAME.md` registers as `prompts/NAME.md`, and so on for the other types. `register` writes only the manifest entry. It performs no import or copy, never touches the local installation, and never commits or pushes. The subsequent `apply` copies the resource into the local installation, and an authorized `push` publishes it, exactly as for a resource added through `add`. `register` does not require or use `--agent-dir`. Re-registering an existing exact source+target declaration is an idempotent no-op (`action: already-registered`, manifest unchanged, exit `0`). Any other overlap is a `RESOURCE_COLLISION` (exit `2`) that writes nothing: the target declared under a different source, the source declared under a different target, or a nested overlap. A missing source, a source outside the type's root, an unsupported type, or a mode combination is a validation error (exit `2`). Suspected secret material in the repository content produces `SECRET_REVIEW_REQUIRED` (`ok: false`, exit `2`) and registers nothing.
 

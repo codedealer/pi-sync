@@ -153,6 +153,27 @@ test('first touch of a gated path is blocked with the main path and bypass; late
   assert.equal(await toolCall(state, 'write', { path: path.join(state.agentDir, 'prompts', 'deploy.md'), content: 'x' }), undefined, 'a second gated root passes too');
   state.shutdown();
 });
+test('the workflows root is gated with the concrete workflow register hint', async (t) => {
+  const state = await fixture(t);
+  state.handlers.get('session_start')({ reason: 'startup' }, state.ctx);
+
+  const target = path.join(state.agentDir, 'workflows', 'octopus-loop.js');
+  const blocked = await toolCall(state, 'write', { path: target, content: 'x' });
+  assert.equal(blocked?.block, true, 'the first mutating call to a workflow script is blocked');
+  const reason = blocked.reason;
+  assert.ok(reason.includes(target), 'the warning names the target');
+  const source = path.join(state.setup, 'resources', 'workflows', 'octopus-loop.js');
+  assert.ok(reason.includes(source), 'the warning names the qualified source path in the setup repository');
+  assert.ok(reason.includes('pi-sync register --type workflow --source resources/workflows/octopus-loop.js'), 'the warning gives the concrete workflow register command');
+  assert.ok(reason.includes('pi-sync apply'), 'the warning states the main path');
+  assert.ok(reason.includes('retry the same operation'), 'the warning ends with the bypass');
+
+  // Read-only tools pass on the new root, and the retry of the same
+  // mutating call passes because the first touch already armed the session.
+  assert.equal(await toolCall(state, 'read', { path: target }), undefined, 'read passes on a workflow script');
+  assert.equal(await toolCall(state, 'write', { path: target, content: 'x' }), undefined, 'the retry of the same call passes');
+  state.shutdown();
+});
 
 test('read-listed tools on gated paths always pass and never arm', async (t) => {
   const state = await fixture(t);

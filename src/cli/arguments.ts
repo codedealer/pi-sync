@@ -8,8 +8,8 @@ import os from 'node:os';
 
 export const DEFAULT_SETUP_REPO = path.join(os.homedir(), '.pi-sync', 'setup');
 
-export const RESOURCE_TYPES = ['skill', 'extension', 'prompt', 'agent', 'role'] as const;
-export const REMOVABLE_TYPES = ['skill', 'extension', 'prompt', 'agent', 'role', 'dependency'] as const;
+export const RESOURCE_TYPES = ['skill', 'extension', 'prompt', 'agent', 'role', 'workflow'] as const;
+export const REMOVABLE_TYPES = ['skill', 'extension', 'prompt', 'agent', 'role', 'workflow', 'dependency'] as const;
 
 export interface RequestBase {
   agentDir: string;
@@ -36,7 +36,7 @@ export interface PruneRequest extends RequestBase {
 export interface AddRequest extends RequestBase {
   command: 'add';
   repo: string;
-  type: 'skill' | 'extension' | 'prompt' | 'agent' | 'role' | 'dependency';
+  type: 'skill' | 'extension' | 'prompt' | 'agent' | 'role' | 'workflow' | 'dependency';
   source: string;
 }
 
@@ -55,7 +55,7 @@ export interface RemoveDependencyRequest extends RequestBase {
 export interface RemoveResourceRequest extends RequestBase {
   command: 'remove';
   repo: string;
-  type: 'skill' | 'extension' | 'prompt' | 'agent' | 'role';
+  type: 'skill' | 'extension' | 'prompt' | 'agent' | 'role' | 'workflow';
   target: string;
   uninstall: boolean;
 }
@@ -294,7 +294,7 @@ export function parseCommandRequest(argv: string[]): CommandRequest {
     return { command: 'version' };
   }
   if (!['status', 'plan', 'pull', 'apply', 'add', 'remove', 'register', 'prune', 'bootstrap', 'update', 'push', 'pi-update', 'sync'].includes(command as any)) {
-    throw new Error('Usage: pi-sync --version | pi-sync <status|plan|pull|apply|add|remove|register|prune|update|pi-update|push|bootstrap|sync> [--repo PATH] [--repo-url URL --repo-dir PATH] [--agent-dir PATH] [--no-fetch] [--type skill|extension|prompt|agent|role|dependency --target VALUE | --source VALUE] [--list] [--all] [--confirm] [--approve] [--apply] [--push] [--publish] [--uninstall] [--message TEXT]');
+    throw new Error('Usage: pi-sync --version | pi-sync <status|plan|pull|apply|add|remove|register|prune|update|pi-update|push|bootstrap|sync> [--repo PATH] [--repo-url URL --repo-dir PATH] [--agent-dir PATH] [--no-fetch] [--type skill|extension|prompt|agent|role|workflow|dependency --target VALUE | --source VALUE] [--list] [--all] [--confirm] [--approve] [--apply] [--push] [--publish] [--uninstall] [--message TEXT]');
   }
   return buildRequest(command as 'status' | 'plan' | 'pull' | 'apply' | 'add' | 'remove' | 'register' | 'prune' | 'bootstrap' | 'update' | 'pi-update' | 'push' | 'sync', parseOptions(argv.slice(1)), argv);
 }

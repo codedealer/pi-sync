@@ -546,7 +546,7 @@ async function removeDependency(repo: string, source: string, agentDir: string, 
 export interface AddInput {
   repo: string;
   agentDir: string;
-  type: 'skill' | 'extension' | 'prompt' | 'agent' | 'role' | 'dependency';
+  type: 'skill' | 'extension' | 'prompt' | 'agent' | 'role' | 'workflow' | 'dependency';
   source: string;
 }
 
@@ -579,7 +579,7 @@ export async function runRegister({ repo, mode }: RegisterInput): Promise<Regist
 // carry the required --source, resource removals the required --target.
 export type RemoveInput =
   | { repo: string; agentDir: string; type: 'dependency'; source: string; uninstall: boolean }
-  | { repo: string; agentDir: string; type: 'skill' | 'extension' | 'prompt' | 'agent' | 'role'; target: string; uninstall: boolean };
+  | { repo: string; agentDir: string; type: 'skill' | 'extension' | 'prompt' | 'agent' | 'role' | 'workflow'; target: string; uninstall: boolean };
 
 // The remove workflow: `remove --type dependency` (with --source, and
 // optionally --uninstall) and every other type (with --target). Both paths

@@ -12,7 +12,7 @@ export const LOCK_FILE = 'pi-sync.lock.json';
 
 export const SETTINGS_FILES = new Set(['settings.json', 'models.json', 'keybindings.json', 'mcp.json']);
 
-export type ResourceType = 'skill' | 'extension' | 'prompt' | 'agent' | 'role';
+export type ResourceType = 'skill' | 'extension' | 'prompt' | 'agent' | 'role' | 'workflow';
 export type SourceKind = 'file' | 'directory';
 
 export interface ResourceRule {
@@ -29,6 +29,7 @@ export const RESOURCE_RULES: Record<string, ResourceRule> = {
   prompt: { sourceRoot: 'resources/prompts', targetRoot: 'prompts', label: 'Prompt', shape: 'file', suffix: '.md' },
   agent: { sourceRoot: 'resources/agents', targetRoot: 'agents', label: 'Agent', shape: 'file', suffix: '.md' },
   role: { sourceRoot: 'resources/roles', targetRoot: 'roles', label: 'Role', shape: 'file', suffix: '.md' },
+  workflow: { sourceRoot: 'resources/workflows', targetRoot: 'workflows', label: 'Workflow', shape: 'file', suffix: '.js' },
 };
 export const RESOURCE_TARGET_ROOTS = Object.values(RESOURCE_RULES).map((rule) => `${rule.targetRoot}/`);
 

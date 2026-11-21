@@ -129,6 +129,7 @@ export interface ResourceAddRule {
   sourceRoot: string;
   shape: 'directory' | 'file' | 'any';
   label: string;
+  suffix?: string;
   pattern: RegExp;
   patternError: string;
 }
@@ -144,6 +145,8 @@ export const RESOURCE_ADD_RULES: Record<string, ResourceAddRule> = {
     pattern: /^agents\/[A-Za-z0-9._-]+\.md$/, patternError: 'Agent source must be a .md file directly under agents/ (for example, agents/reviewer.md)' },
   role: { localRoot: 'roles', sourceRoot: 'resources/roles', shape: 'file', label: 'Role',
     pattern: /^roles\/[A-Za-z0-9._-]+\.md$/, patternError: 'Role source must be a .md file directly under roles/ (for example, roles/moderator.md)' },
+  workflow: { localRoot: 'workflows', sourceRoot: 'resources/workflows', shape: 'file', label: 'Workflow', suffix: '.js',
+    pattern: /^workflows\/[A-Za-z0-9._-]+\.js$/, patternError: 'Workflow source must be a .js file directly under workflows/ (for example, workflows/octopus-loop.js)' },
 };
 
 // Normalizes an add --source value into an agent-relative POSIX path and
@@ -177,8 +180,9 @@ export interface ResourceCandidate {
 // Discovery for register --list and --all: candidates are the resources
 // present directly under a type root that the manifest does not declare.
 // The per-type shape rules are reused: .md files directly under the
-// prompts/agents/roles roots, direct child directories under the skills
-// root, and direct file-or-directory children under the extensions root.
+// prompts/agents/roles roots, .js files directly under the workflows
+// root, direct child directories under the skills root, and direct
+// file-or-directory children under the extensions root.
 // Files under any other path in resources/ are not resources and are
 // ignored. Candidates are reported in RESOURCE_RULES type order and by
 // name within a root, so --list and --all agree on the candidate set.
@@ -201,7 +205,7 @@ export async function unregisteredCandidates(repo: string, resources: ResourceDe
         const isFile = entry.isFile();
         if (!isDirectory && !isFile) return false; // symbolic links and other entries are not resources
         if (rule.shape === 'directory') return isDirectory;
-        if (rule.shape === 'file') return isFile && entry.name.endsWith('.md');
+        if (rule.shape === 'file') return isFile && entry.name.endsWith(rule.suffix ?? '.md');
         return true;
       })
       .filter((entry) => rule.pattern.test(`${rule.localRoot}/${entry.name}`))
