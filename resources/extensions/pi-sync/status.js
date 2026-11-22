@@ -43,12 +43,12 @@ export function isSyncSummary(value) {
 }
 
 /**
- * Extract the usable summary from a parsed `pi-sync status`/`plan` result.
- * Returns null when the result is not an object or carries no well-formed
- * `summary` block — the older-CLI case, which callers render as "no footer".
+ * Extract the usable summary from a parsed `pi-sync status` result.
+ * Returns null unless the result is an apiVersion 2 object with a well-formed
+ * `summary` block — older or unsupported CLI results render as "no footer".
  */
 export function extractSummary(result) {
-  if (result === null || typeof result !== "object" || Array.isArray(result)) return null;
+  if (result === null || typeof result !== "object" || Array.isArray(result) || result.apiVersion !== 2) return null;
   return isSyncSummary(result.summary) ? result.summary : null;
 }
 

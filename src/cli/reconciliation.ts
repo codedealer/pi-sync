@@ -377,7 +377,7 @@ export interface SyncClassification {
 }
 
 // Read-only sync classification shared by the `sync` preview/apply and the
-// status/plan `sync` block, so every consumer sees identical content:
+// status `sync` block, so every consumer sees identical content:
 // syncable fields (local-only and portable, with from/to), conflicts (changed
 // in both places or without a baseline), rejected (non-portable local
 // values), and review (locally removed managed fields). No manifest write,
@@ -451,7 +451,7 @@ export interface ReportBlocks {
 }
 
 // Builds the reporting blocks (actions, conflicts, stale resources) from a
-// plan; shared by the read-only status/plan workflow and apply so their
+// plan; shared by the read-only status workflow and apply so their
 // reported content stays identical.
 export function reportBlocks(plan: ReconciliationPlan): ReportBlocks {
   const actions: PlanOutputAction[] = [
@@ -477,7 +477,7 @@ export interface PublishState {
   upstream?: 'unavailable';
 }
 
-// Default bound for the status/plan upstream fetch; the same 15 seconds the
+// Default bound for the status upstream fetch; the same 15 seconds the
 // extension applied to its former session-start fetch.
 export const UPSTREAM_FETCH_TIMEOUT_MS = 15_000;
 

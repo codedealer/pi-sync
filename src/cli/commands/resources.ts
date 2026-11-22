@@ -16,22 +16,23 @@ import {
   validateSourceFile,
   validateSourceTree,
   type LockPackage,
+  type RepositoryDeclarations,
 } from '../manifest.js';
 import { runCommand } from '../process.js';
-import { sameValue, snapshotPath } from '../reconciliation.js';
-import { STATE_DIR, loadPackagePins, writeLocalPackagePins } from '../local-state.js';
+import { buildPlan, sameValue, safeSnapshot, snapshotPath, type PlanStale } from '../reconciliation.js';
+import { STATE_DIR, acquireLock, createBackup, loadPackagePins, loadState, writeLocalPackagePins, writeState } from '../local-state.js';
 import {
   RESOURCE_ADD_RULES,
   ensureRealDirectory,
   findLikelySecrets,
-  normalizeResourceSource,
+  normalizeResourceTarget,
   restoreFileAtomic,
   unregisteredCandidates,
   writeJsonFileAtomic,
   type ResourceCandidate,
   type SecretFinding,
 } from '../resource-operations.js';
-import type { RegisterMode } from '../arguments.js';
+
 
 // Match the entry point's validation and operation exit statuses: the
 // structured results report them and the entry point mirrors them onto
@@ -47,18 +48,20 @@ interface ResourceError extends Error {
 type Dependency = { type: 'npm'; name: string } | { type: 'github'; repository: string };
 
 export interface AddedDependencyResult {
-  apiVersion: 1;
+  apiVersion: 2;
   command: 'add';
   ok: true;
   exitCode: 0;
   type: 'dependency';
   dependency: Dependency;
   action: 'added';
+  mode: 'applied' | 'preview';
   next: string;
+  note?: string;
 }
 
 export interface AddedResourceResult {
-  apiVersion: 1;
+  apiVersion: 2;
   command: 'add';
   ok: true;
   exitCode: 0;
@@ -66,12 +69,14 @@ export interface AddedResourceResult {
   source: string;
   target: string;
   repositorySource: string;
-  action: 'added';
+  action: 'added' | 'declared' | 'already-added';
+  mode: 'applied' | 'preview';
   reviewRequired: SecretFinding[];
+  note?: string;
 }
 
 export interface AddSecretReviewResult {
-  apiVersion: 1;
+  apiVersion: 2;
   command: 'add';
   ok: false;
   errorCode: 'SECRET_REVIEW_REQUIRED';
@@ -81,67 +86,52 @@ export interface AddSecretReviewResult {
   details: { reviewRequired: SecretFinding[] };
 }
 
-export type AddOutput = AddedDependencyResult | AddedResourceResult | AddSecretReviewResult;
 
-export interface RegisterListResult {
-  apiVersion: 1;
-  command: 'register';
+export interface AddResourceListResult {
+  apiVersion: 2;
+  command: 'add';
   ok: true;
   exitCode: 0;
   unregistered: ResourceCandidate[];
 }
 
-export interface RegisterResult {
-  apiVersion: 1;
-  command: 'register';
-  ok: true;
-  exitCode: 0;
-  type: string;
-  source: string;
-  target: string;
-  action: 'registered' | 'already-registered';
-}
-
-export interface RegisterBatchResult {
-  apiVersion: 1;
-  command: 'register';
+export interface AddResourceBatchResult {
+  apiVersion: 2;
+  command: 'add';
   ok: true;
   exitCode: 0;
   action: 'registered' | 'up-to-date';
   registered: ResourceCandidate[];
 }
 
-export interface RegisterSecretReviewResult {
-  apiVersion: 1;
-  command: 'register';
-  ok: false;
-  errorCode: 'SECRET_REVIEW_REQUIRED';
-  exitCode: number;
-  error: string;
-  reviewRequired: SecretFinding[];
-  details: { reviewRequired: SecretFinding[] };
-}
+export type AddOutput = AddedDependencyResult | AddedResourceResult | AddSecretReviewResult | AddResourceListResult | AddResourceBatchResult;
 
-export type RegisterOutput = RegisterListResult | RegisterResult | RegisterBatchResult | RegisterSecretReviewResult;
 
+// The local block reports what happened to the local installation:
+// `removed` (backed up under .pi-sync/backups first), `preserved` (a
+// diverged, untracked, or overlapping local copy that removal never touches),
+// or `unchanged` (no local copy, or --keep-local). `would-remove` is the
+// preview-mode counterpart of `removed`.
 export interface RemovedResourceResult {
-  apiVersion: 1;
+  apiVersion: 2;
   command: 'remove';
   ok: true;
   exitCode: 0;
   repository: string;
+  mode: 'applied' | 'preview';
   removed: { type: string; source: string; target: string };
-  stale: { target: string; localInstallation: 'unchanged'; note: string };
+  local: { target: string; action: 'removed' | 'would-remove' | 'preserved' | 'unchanged'; backup?: string; reason?: string };
 }
 
 export interface RemovedDependencyResult {
-  apiVersion: 1;
+  apiVersion: 2;
   command: 'remove';
   ok: true;
   exitCode: 0;
   repository: string;
+  mode: 'applied' | 'preview';
   removed: { dependency: Dependency; pin: LockPackage };
-  localInstallation: 'unchanged' | 'uninstalled';
+  localInstallation: 'unchanged' | 'uninstalled' | 'would-uninstall';
   note: string;
   uninstalled?: { package: string; spec: string };
 }
@@ -150,7 +140,7 @@ export interface RemovedDependencyResult {
 // after the success-shape fields (repository/removed/localInstallation/note),
 // matching the pre-refactor response exactly.
 export interface RemoveUninstallFailedResult {
-  apiVersion: 1;
+  apiVersion: 2;
   command: 'remove';
   ok: false;
   exitCode: number;
@@ -164,9 +154,9 @@ export interface RemoveUninstallFailedResult {
   uninstall: { package: string; spec: string; status: 'failed'; error: string };
 }
 
-export type RemoveOutput = RemovedResourceResult | RemovedDependencyResult | RemoveUninstallFailedResult;
+export type RemoveOutput = RemovedResourceResult | RemovedDependencyResult | RemoveUninstallFailedResult | RemoveStaleOutput;
 
-async function addDependency(repo: string, source: string): Promise<AddedDependencyResult> {
+async function addDependency(repo: string, source: string, dryRun: boolean): Promise<AddedDependencyResult> {
   const match = /^(npm):(.+)$/.exec(source) ?? /^(github):(.+)$/.exec(source);
   if (!match) throw new Error('Dependency source must be npm:PACKAGE or github:OWNER/REPOSITORY; Pi Sync resolves and writes the pin through update');
   const dependency: Dependency = match[1] === 'npm' ? { type: 'npm', name: match[2] } : { type: 'github', repository: match[2] };
@@ -183,6 +173,10 @@ async function addDependency(repo: string, source: string): Promise<AddedDepende
     error.errorCode = 'DEPENDENCY_COLLISION';
     throw error;
   }
+  const result: AddedDependencyResult = { apiVersion: 2, command: 'add', ok: true, exitCode: 0, type: 'dependency', dependency, action: 'added', mode: dryRun ? 'preview' : 'applied',
+    next: dryRun ? 'Run bare pi-sync add --source to declare the dependency, then pi-sync update --dry-run' : 'Run pi-sync update to preview an age-eligible exact pin',
+    ...(dryRun ? { note: 'Dry run: no dependency was declared; nothing was changed.' } : {}) };
+  if (dryRun) return result;
   const next = { ...manifest, dependencies: [...manifest.dependencies, dependency] };
   const temporary = `${manifestPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   // Deliberately no `mode` here: the pre-refactor dependency add wrote its
@@ -193,66 +187,116 @@ async function addDependency(repo: string, source: string): Promise<AddedDepende
     if (await fs.readFile(manifestPath, 'utf8') !== manifestText) throw new Error('Manifest changed during add; retry without overwriting concurrent changes');
     await fs.rename(temporary, manifestPath);
   } catch (error) { await fs.rm(temporary, { force: true }); throw error; }
-  return { apiVersion: 1, command: 'add', ok: true, exitCode: 0, type: 'dependency', dependency, action: 'added', next: 'Run pi-sync update to preview an age-eligible exact pin' };
+  return result;
 }
 
-async function addResource(repo: string, agentDir: string, type: string, source: string): Promise<AddedResourceResult | AddSecretReviewResult> {
+async function addResource(repo: string, agentDir: string, type: string, selector: string, dryRun: boolean): Promise<AddedResourceResult | AddSecretReviewResult> {
   const rule = RESOURCE_ADD_RULES[type];
-  const relative = normalizeResourceSource(type, source, agentDir);
-  const sourcePath = resolveInside(agentDir, relative, '--source');
-  const info = await fs.lstat(sourcePath).catch((error: any) => error.code === 'ENOENT' ? null : Promise.reject(error));
-  if (!info || info.isSymbolicLink()) throw new Error(`Resource source does not exist or is a symbolic link: ${relative}`);
-  const isFile = info.isFile();
-  if (rule.shape === 'directory' && !info.isDirectory()) throw new Error(`${rule.label} source must be an existing directory: ${relative}`);
-  if (rule.shape === 'file' && !isFile) throw new Error(`${rule.label} source must be an existing regular file: ${relative}`);
-  if (rule.shape === 'any' && !isFile && !info.isDirectory()) throw new Error(`Extension source must be an existing file or directory: ${relative}`);
-  if (isFile) await validateSourceFile(agentDir, relative);
-  else await validateSourceTree(agentDir, sourcePath, relative);
-  const findings = await findLikelySecrets(sourcePath, relative);
+  const relative = normalizeResourceTarget(type, selector, agentDir);
+  const targetPath = resolveInside(agentDir, relative, '--target');
+  const managedSource = `${rule.sourceRoot}/${path.posix.relative(rule.localRoot, relative)}`;
+  const repositoryPath = resolveInside(repo, managedSource, 'repository resource');
+  const localInfo = await fs.lstat(targetPath).catch((error: any) => error.code === 'ENOENT' ? null : Promise.reject(error));
+  const repositoryInfo = await fs.lstat(repositoryPath).catch((error: any) => error.code === 'ENOENT' ? null : Promise.reject(error));
+  if (!localInfo && !repositoryInfo) {
+    const declarations = await validateRepository(repo);
+    if (declarations.resources.some((item) => pathsOverlap(item.target, relative) || pathsOverlap(item.source, managedSource))) {
+      const error: ResourceError = new Error(`Resource collision: ${relative} or ${managedSource} is already declared`);
+      error.errorCode = 'RESOURCE_COLLISION';
+      error.details = { type, source: relative, target: relative, repositorySource: managedSource };
+      throw error;
+    }
+    throw new Error(`Resource does not exist in the setup repository or local installation: ${managedSource} and ${relative}`);
+  }
+
+  const validateShape = async (info: any, file: string, source: string, label: string, repository: boolean) => {
+    if (info?.isSymbolicLink()) throw new Error(`Symbolic links are not supported for ${label}: ${source}`);
+    if (!info) throw new Error(`${label} does not exist: ${source}`);
+    const isFile = info.isFile();
+    if (rule.shape === 'directory' && !info.isDirectory()) throw new Error(`${rule.label} ${label} must be a directory: ${source}`);
+    if (rule.shape === 'file' && !isFile) throw new Error(`${rule.label} ${label} must be a regular file: ${source}`);
+    if (rule.shape === 'any' && !isFile && !info.isDirectory()) throw new Error(`${rule.label} ${label} must be a file or directory: ${source}`);
+    if (repository) await validateResourceSource(repo, file, source, rule);
+    else if (isFile) await validateSourceFile(agentDir, relative);
+    else await validateSourceTree(agentDir, file, relative);
+  };
+  if (localInfo) await validateShape(localInfo, targetPath, relative, 'target', false);
+  if (repositoryInfo) await validateShape(repositoryInfo, repositoryPath, managedSource, 'repository source', true);
+
+  if (localInfo && repositoryInfo) {
+    const [localSnapshot, repositorySnapshot] = await Promise.all([snapshotPath(targetPath), snapshotPath(repositoryPath)]);
+    if (!sameValue(localSnapshot, repositorySnapshot)) {
+      const error: ResourceError = new Error(`Resource collision: local target ${targetPath} differs from setup repository source ${repositoryPath}`);
+      error.errorCode = 'RESOURCE_COLLISION';
+      error.details = { localPath: targetPath, repositoryPath };
+      throw error;
+    }
+  }
+  const declarations = await validateRepository(repo);
+  const target = relative;
+  if (declarations.resources.some((item) => item.source === managedSource && item.target === target)) {
+    return { apiVersion: 2, command: 'add', ok: true, exitCode: 0, type, source: relative, target, repositorySource: managedSource, action: 'already-added', mode: dryRun ? 'preview' : 'applied', reviewRequired: [], ...(dryRun ? { note: 'Dry run: the resource is already declared; nothing was changed.' } : {}) };
+  }
+
+  const sourceToReview = repositoryInfo ? repositoryPath : targetPath;
+  const sourceLabel = repositoryInfo ? managedSource : relative;
+  const findings = await findLikelySecrets(sourceToReview, sourceLabel);
   if (findings.length) return {
-    apiVersion: 1, command: 'add', ok: false, errorCode: 'SECRET_REVIEW_REQUIRED', exitCode: VALIDATION_ERROR,
+    apiVersion: 2, command: 'add', ok: false, errorCode: 'SECRET_REVIEW_REQUIRED', exitCode: VALIDATION_ERROR,
     error: 'Import was not performed; review suspected secret material and remove it before retrying', reviewRequired: findings,
     details: { reviewRequired: findings },
   };
 
-  const manifestPath = path.join(repo, MANIFEST_FILE);
-  const manifestText = await fs.readFile(manifestPath, 'utf8');
-  const manifest = JSON.parse(manifestText);
-  const declarations = await validateRepository(repo);
-  const target = relative;
-  const managedSource = `${rule.sourceRoot}/${path.posix.relative(rule.localRoot, relative)}`;
   if (declarations.resources.some((item) => pathsOverlap(item.target, target) || pathsOverlap(item.source, managedSource))) {
     const error: ResourceError = new Error(`Resource collision: ${target} or ${managedSource} is already declared`);
     error.errorCode = 'RESOURCE_COLLISION';
     error.details = { type, source: relative, target, repositorySource: managedSource };
     throw error;
   }
-  const destination = resolveInside(repo, managedSource, 'new resource source');
-  if (await fs.lstat(destination).then(() => true).catch((error: any) => error.code === 'ENOENT' ? false : Promise.reject(error))) {
-    const error: ResourceError = new Error(`Resource collision: setup repository path already exists: ${managedSource}`);
-    error.errorCode = 'RESOURCE_COLLISION';
-    error.details = { type, source: relative, target, repositorySource: managedSource };
-    throw error;
+
+  const action = repositoryInfo ? 'declared' : 'added';
+  const result: AddedResourceResult = {
+    apiVersion: 2, command: 'add', ok: true, exitCode: 0, type, source: relative, target, repositorySource: managedSource,
+    action,
+    mode: dryRun ? 'preview' : 'applied',
+    reviewRequired: [],
+    ...(dryRun
+      ? { note: action === 'declared'
+          ? (localInfo && repositoryInfo
+              ? 'Dry run: the setup repository and local content match; the resource would be declared without copying; nothing was changed.'
+              : 'Dry run: the setup repository resource would be declared in the manifest; nothing was changed.')
+          : 'Dry run: the local resource would be copied into the setup repository and declared in the manifest; nothing was changed.' }
+      : localInfo && repositoryInfo ? { note: 'Setup repository and local content match; declared without copying.' } : {}),
+  };
+  if (dryRun) return result;
+
+  const manifestPath = path.join(repo, MANIFEST_FILE);
+  const manifestText = await fs.readFile(manifestPath, 'utf8');
+  const manifest = JSON.parse(manifestText);
+  if (repositoryInfo) {
+    await writeJsonFileAtomic(manifestPath, { ...manifest, resources: [...manifest.resources, { type, source: managedSource, target }] }, manifestText, 'add');
+    return result;
   }
+
   const parent = path.posix.dirname(managedSource);
   const parentExists = await ensureRealDirectory(repo, parent, true);
   if (!parentExists) throw new Error(`Could not create ${parent} in the setup repository`);
-  const before = await snapshotPath(sourcePath);
+  const before = await snapshotPath(targetPath);
   const temporary = `${manifestPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   let createdDestination = false;
   try {
-    if (isFile) {
-      await fs.mkdir(path.dirname(destination), { recursive: true });
-      await fs.copyFile(sourcePath, destination);
+    if (localInfo!.isFile()) {
+      await fs.mkdir(path.dirname(repositoryPath), { recursive: true });
+      await fs.copyFile(targetPath, repositoryPath);
     } else {
-      await fs.mkdir(destination);
+      await fs.mkdir(repositoryPath);
       createdDestination = true;
-      for (const entry of await fs.readdir(sourcePath)) {
-        await fs.cp(path.join(sourcePath, entry), path.join(destination, entry), { recursive: true, errorOnExist: true, force: false });
+      for (const entry of await fs.readdir(targetPath)) {
+        await fs.cp(path.join(targetPath, entry), path.join(repositoryPath, entry), { recursive: true, errorOnExist: true, force: false });
       }
     }
-    const after = await snapshotPath(sourcePath);
-    const imported = await snapshotPath(destination);
+    const after = await snapshotPath(targetPath);
+    const imported = await snapshotPath(repositoryPath);
     if (!sameValue(before, after) || !sameValue(before, imported)) throw new Error(`Selected ${rule.label.toLowerCase()} changed during import; retry after it is stable`);
     const nextManifest = { ...manifest, resources: [...manifest.resources, { type, source: managedSource, target }] };
     const manifestInfo = await fs.stat(manifestPath);
@@ -262,69 +306,19 @@ async function addResource(repo: string, agentDir: string, type: string, source:
     await fs.rename(temporary, manifestPath);
   } catch (error) {
     await fs.rm(temporary, { force: true }).catch(() => {});
-    if (createdDestination) await fs.rm(destination, { recursive: true, force: true }).catch(() => {});
-    if (isFile) await fs.rm(destination, { force: true }).catch(() => {});
+    if (createdDestination) await fs.rm(repositoryPath, { recursive: true, force: true }).catch(() => {});
+    if (localInfo!.isFile()) await fs.rm(repositoryPath, { force: true }).catch(() => {});
     throw error;
   }
-  return { apiVersion: 1, command: 'add', ok: true, exitCode: 0, type, source: relative, target, repositorySource: managedSource, action: 'added', reviewRequired: [] };
+  return result;
 }
 
-// Register is the inverse-direction complement of add: the resource content
-// must already be present under the type's repository sourceRoot, and only
-// the manifest entry is written. There is no import or copy, no
-// local-installation write, and no commit or push; the subsequent apply
-// copies the resource into the local installation and push publishes it,
-// exactly as for resources added through add.
-async function registerResource(repo: string, type: string, source: string): Promise<RegisterResult | RegisterSecretReviewResult> {
-  const rule = RESOURCE_ADD_RULES[type];
-  if (!rule) throw new Error(`Unsupported resource type: ${type}`);
-  if (typeof source !== 'string' || source.length === 0) throw new Error('--source must be a non-empty path');
-  if (source.includes('\\')) throw new Error('Relative --source paths must use POSIX separators');
-  if (path.isAbsolute(source)) throw new Error('register --source must be a repository-relative path under resources/ (for example, resources/prompts/example.md)');
-  validateRelativePath(source, '--source');
-  // The per-type shape rules are expressed against the agent-relative local
-  // root; the repository source is the same path under resources/, and the
-  // target is derived by substituting the type's localRoot.
-  const localRelative = path.posix.relative('resources', source);
-  if (!rule.pattern.test(localRelative)) throw new Error(rule.patternError.split(rule.localRoot).join(`resources/${rule.localRoot}`));
-  const target = localRelative;
-  const sourcePath = resolveInside(repo, source, '--source');
-  await validateResourceSource(repo, sourcePath, source, rule);
-  const findings = await findLikelySecrets(sourcePath, source);
-  if (findings.length) {
-    return {
-      apiVersion: 1, command: 'register', ok: false, errorCode: 'SECRET_REVIEW_REQUIRED', exitCode: VALIDATION_ERROR,
-      error: 'Registration was not performed; review suspected secret material and remove it before retrying',
-      reviewRequired: findings, details: { reviewRequired: findings },
-    };
-  }
-  const declarations = await validateRepository(repo);
-  if (declarations.resources.some((item) => item.source === source && item.target === target)) {
-    return { apiVersion: 1, command: 'register', ok: true, exitCode: 0, type, source, target, action: 'already-registered' };
-  }
-  if (declarations.resources.some((item) => pathsOverlap(item.target, target) || pathsOverlap(item.source, source))) {
-    const error: ResourceError = new Error(`Resource collision: ${target} or ${source} is already declared`);
-    error.errorCode = 'RESOURCE_COLLISION';
-    error.details = { type, source, target };
-    throw error;
-  }
-  const manifestPath = path.join(repo, MANIFEST_FILE);
-  const manifestText = await fs.readFile(manifestPath, 'utf8');
-  const manifest = JSON.parse(manifestText);
-  // The manifest write reuses the same atomic, concurrency-guarded write as
-  // remove: an exclusively created temp file whose manifest text is compared
-  // before rename, so a concurrent change is never overwritten.
-  await writeJsonFileAtomic(manifestPath, { ...manifest, resources: [...manifest.resources, { type, source, target }] }, manifestText, 'register');
-  return { apiVersion: 1, command: 'register', ok: true, exitCode: 0, type, source, target, action: 'registered' };
-}
-
-// register --list: read-only discovery. It validates the repository up
-// front, reports the unregistered candidates with their inferred type,
-// source, and derived target, and changes nothing.
-async function listUnregisteredResources(repo: string, type?: string): Promise<RegisterListResult> {
+// Discovery and batch registration use the repository's type roots as their
+// candidate set. --list is read-only; --all validates, reviews, and collision-
+// checks the complete set before performing one atomic manifest write.
+async function listAddCandidates(repo: string): Promise<AddResourceListResult> {
   const resources = (await validateRepository(repo)).resources;
-  const unregistered = await unregisteredCandidates(repo, resources, type);
-  return { apiVersion: 1, command: 'register', ok: true, exitCode: 0, unregistered };
+  return { apiVersion: 2, command: 'add', ok: true, exitCode: 0, unregistered: await unregisteredCandidates(repo, resources) };
 }
 
 function resourceCollision(candidate: ResourceCandidate, other: ResourceCandidate): ResourceError {
@@ -334,44 +328,25 @@ function resourceCollision(candidate: ResourceCandidate, other: ResourceCandidat
   return error;
 }
 
-// register --all: batch registration of the same candidate set --list
-// reports. It is all-or-nothing: the repository content of every candidate
-// is validated, every candidate is secret-scanned, and a collision
-// pre-flight runs against the existing declarations and the candidate set
-// itself; any failure registers nothing. Otherwise a single atomic,
-// concurrency-guarded manifest write appends every new entry. As with
-// single mode there is no copy, no local-installation write, and no commit
-// or push; apply performs the copy afterward.
-async function registerAllResources(repo: string, type?: string): Promise<RegisterBatchResult | RegisterSecretReviewResult> {
+async function addAllResources(repo: string): Promise<AddResourceBatchResult | AddSecretReviewResult> {
   const declarations = await validateRepository(repo);
-  const candidates = await unregisteredCandidates(repo, declarations.resources, type);
-  if (candidates.length === 0) {
-    return { apiVersion: 1, command: 'register', ok: true, exitCode: 0, action: 'up-to-date', registered: [] };
-  }
-  // Every candidate must be registrable the way single mode registers it,
-  // so the manifest that is about to be written stays valid.
+  const candidates = await unregisteredCandidates(repo, declarations.resources);
+  if (candidates.length === 0) return { apiVersion: 2, command: 'add', ok: true, exitCode: 0, action: 'up-to-date', registered: [] };
   for (const candidate of candidates) {
     const rule = RESOURCE_ADD_RULES[candidate.type];
     const sourcePath = resolveInside(repo, candidate.source, '--source');
     await validateResourceSource(repo, sourcePath, candidate.source, rule);
   }
-  // All-or-nothing secret review: every candidate is scanned up front and
-  // any finding aborts the whole batch with all findings reported. The
-  // suspected value is never echoed.
   const findings: SecretFinding[] = [];
   for (const candidate of candidates) {
     const sourcePath = resolveInside(repo, candidate.source, '--source');
     findings.push(...(await findLikelySecrets(sourcePath, candidate.source)));
   }
-  if (findings.length) {
-    return {
-      apiVersion: 1, command: 'register', ok: false, errorCode: 'SECRET_REVIEW_REQUIRED', exitCode: VALIDATION_ERROR,
-      error: 'Registration was not performed; review suspected secret material and remove it before retrying',
-      reviewRequired: findings, details: { reviewRequired: findings },
-    };
-  }
-  // Collision pre-flight against the existing declarations and against the
-  // candidate set itself (case-insensitive target/source overlap).
+  if (findings.length) return {
+    apiVersion: 2, command: 'add', ok: false, errorCode: 'SECRET_REVIEW_REQUIRED', exitCode: VALIDATION_ERROR,
+    error: 'Registration was not performed; review suspected secret material and remove it before retrying',
+    reviewRequired: findings, details: { reviewRequired: findings },
+  };
   for (let i = 0; i < candidates.length; i += 1) {
     const candidate = candidates[i];
     const conflict = [...declarations.resources, ...candidates.slice(i + 1)]
@@ -381,17 +356,21 @@ async function registerAllResources(repo: string, type?: string): Promise<Regist
   const manifestPath = path.join(repo, MANIFEST_FILE);
   const manifestText = await fs.readFile(manifestPath, 'utf8');
   const manifest = JSON.parse(manifestText);
-  await writeJsonFileAtomic(manifestPath, { ...manifest, resources: [...manifest.resources, ...candidates] }, manifestText, 'register');
-  return { apiVersion: 1, command: 'register', ok: true, exitCode: 0, action: 'registered', registered: candidates };
+  await writeJsonFileAtomic(manifestPath, { ...manifest, resources: [...manifest.resources, ...candidates] }, manifestText, 'add');
+  return { apiVersion: 2, command: 'add', ok: true, exitCode: 0, action: 'registered', registered: candidates };
 }
 
-// Removal is repository-only by design: it deletes the manifest entry and the
-// repository content, never touches the local Pi installation, and queues or
-// schedules nothing for deletion. Removed resources surface as stale through
-// the existing status/plan/apply reporting and stay installed until an
-// explicit `prune --confirm` removes them (with its baseline-match and
-// backup protections).
-async function removeResource(repo: string, type: string, target: string): Promise<RemovedResourceResult> {
+// Full resource removal: manifest entry + repository content + local
+// installation. The local side keeps the stale-batch safety, evaluated
+// through the same plan the `remove --stale` workflow uses, against the
+// manifest with this target taken out: a local copy that still exactly
+// matches its saved last-applied baseline is backed up under
+// .pi-sync/backups and removed; a diverged, untracked, or overlapping local
+// copy is preserved and reported, never overwritten or destroyed.
+// `--keep-local` limits the removal to the manifest and repository content,
+// leaving the local copy installed (and stale-reported) as before.
+// `--dry-run` previews the removal set without mutating.
+async function removeResource(repo: string, agentDir: string, type: string, target: string, keepLocal: boolean, dryRun: boolean): Promise<RemovedResourceResult> {
   const rule = RESOURCE_RULES[type];
   if (!rule) throw new Error(`Unsupported resource type: ${type}`);
   validateRelativePath(target, '--target');
@@ -403,50 +382,131 @@ async function removeResource(repo: string, type: string, target: string): Promi
     throw error;
   }
   if (entry.type !== type) {
-    const error: ResourceError = new Error(`Target ${target} is managed as ${entry.type}, not ${type}; use remove --type ${entry.type}`);
+    const error: ResourceError = new Error(`Target ${target} is managed as ${entry.type}, not ${type}; use a target under the matching resource root`);
     error.errorCode = 'REMOVE_TYPE_MISMATCH';
     throw error;
   }
-  const manifestPath = path.join(repo, MANIFEST_FILE);
-  const manifestText = await fs.readFile(manifestPath, 'utf8');
-  const manifest = JSON.parse(manifestText);
-  const nextManifest = { ...manifest, resources: manifest.resources.filter((item: any) => item.target !== target) };
-  // Snapshot the repository content before deleting it so a failure after the
-  // manifest rewrite can leave the repository exactly as it was.
-  const contentBackup = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-remove-content-'));
-  try {
-    await fs.cp(entry.sourcePath, path.join(contentBackup, 'source'), { recursive: true, errorOnExist: true, force: false });
-  } catch (error) {
-    await fs.rm(contentBackup, { recursive: true, force: true }).catch(() => {});
-    throw new Error(`Could not snapshot managed resource content before removal: ${entry.source} (${error.message})`);
+  const targetPath = resolveInside(agentDir, target, '--target');
+  const declarationsAfter: RepositoryDeclarations = { ...declarations, resources: declarations.resources.filter((item) => item.target !== target) };
+
+  const describeLocal = async (staleItem: PlanStale | undefined): Promise<RemovedResourceResult['local']> => {
+    if (keepLocal) return { target, action: 'unchanged', reason: 'kept by --keep-local; status reports it as stale' };
+    if (staleItem === undefined) {
+      return (await localExists(targetPath))
+        ? { target, action: 'preserved', reason: 'local copy is not tracked by Pi Sync (no last-applied baseline); it stays installed' }
+        : { target, action: 'unchanged', reason: 'no local installation' };
+    }
+    if (!staleItem.eligible) {
+      const reason = staleItem.overlaps.length
+        ? `local copy overlaps currently managed targets: ${staleItem.overlaps.join(', ')}; it stays installed`
+        : 'local copy diverged from its last-applied baseline; it stays installed and is reported as stale by status';
+      return { target, action: 'preserved', reason };
+    }
+    if (staleItem.localSnapshot === null) return { target, action: 'unchanged', reason: 'no local copy; the baseline entry is forgotten' };
+    return dryRun ? { target, action: 'would-remove' } : { target, action: 'removed' };
+  };
+
+  if (dryRun) {
+    const state = await loadState(agentDir);
+    const plan = await buildPlan(repo, agentDir, declarationsAfter, state);
+    const staleItem = plan.stale.find((item) => item.target === target);
+    return { apiVersion: 2, command: 'remove', ok: true, exitCode: 0, repository: repo, mode: 'preview',
+      removed: { type: entry.type, source: entry.source, target: entry.target }, local: await describeLocal(staleItem) };
   }
-  let manifestWritten = false;
+
+  // The local installation and its state are apply-owned, so the removal runs
+  // under the apply lock, re-reading the baseline after acquiring it (the same
+  // discipline as the stale batch).
+  const releaseLock = await acquireLock(agentDir);
   try {
-    await writeJsonFileAtomic(manifestPath, nextManifest, manifestText, 'remove');
-    manifestWritten = true;
+    const state = await loadState(agentDir);
+    const plan = await buildPlan(repo, agentDir, declarationsAfter, state);
+    const staleItem = plan.stale.find((item) => item.target === target);
+    const manifestPath = path.join(repo, MANIFEST_FILE);
+    const manifestText = await fs.readFile(manifestPath, 'utf8');
+    const manifest = JSON.parse(manifestText);
+    const nextManifest = { ...manifest, resources: manifest.resources.filter((item: any) => item.target !== target) };
+    // Snapshot the repository content before deleting it so a failure after
+    // the manifest rewrite can leave the repository exactly as it was.
+    const contentBackup = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-remove-content-'));
+    let manifestWritten = false;
     try {
-      await fs.rm(entry.sourcePath, { recursive: true });
-    } catch (error) {
-      if (manifestWritten) await restoreFileAtomic(manifestPath, manifestText);
-      throw new Error(`Could not remove managed resource content: ${entry.source} (${error.message})`);
+      try {
+        await fs.cp(entry.sourcePath, path.join(contentBackup, 'source'), { recursive: true, errorOnExist: true, force: false });
+      } catch (error) {
+        throw new Error(`Could not snapshot managed resource content before removal: ${entry.source} (${error.message})`);
+      }
+      await writeJsonFileAtomic(manifestPath, nextManifest, manifestText, 'remove');
+      manifestWritten = true;
+      try {
+        await fs.rm(entry.sourcePath, { recursive: true });
+      } catch (error) {
+        if (manifestWritten) await restoreFileAtomic(manifestPath, manifestText);
+        throw new Error(`Could not remove managed resource content: ${entry.source} (${error.message})`);
+      }
+      try {
+        await validateRepository(repo);
+      } catch (error) {
+        if (manifestWritten) await restoreFileAtomic(manifestPath, manifestText);
+        await fs.cp(path.join(contentBackup, 'source'), entry.sourcePath, { recursive: true, errorOnExist: true, force: false });
+        throw error;
+      }
+    } finally {
+      await fs.rm(contentBackup, { recursive: true, force: true }).catch(() => {});
     }
-    try {
-      await validateRepository(repo);
-    } catch (error) {
-      if (manifestWritten) await restoreFileAtomic(manifestPath, manifestText);
-      await fs.cp(path.join(contentBackup, 'source'), entry.sourcePath, { recursive: true, errorOnExist: true, force: false });
-      throw error;
-    }
+    const local = keepLocal
+      ? { target, action: 'unchanged' as const, reason: 'kept by --keep-local; status reports it as stale' }
+      : await removeLocalIfEligible(agentDir, target, targetPath, staleItem, state);
+    return { apiVersion: 2, command: 'remove', ok: true, exitCode: 0, repository: repo, mode: 'applied',
+      removed: { type: entry.type, source: entry.source, target: entry.target }, local };
   } finally {
-    await fs.rm(contentBackup, { recursive: true, force: true }).catch(() => {});
+    await releaseLock();
   }
-  return { apiVersion: 1, command: 'remove', ok: true, exitCode: 0, repository: repo,
-    removed: { type: entry.type, source: entry.source, target: entry.target },
-    stale: { target: entry.target, localInstallation: 'unchanged',
-      note: 'Removal is repository-only: the local installation is unchanged and nothing is queued or scheduled for deletion. status, plan, and apply now report this resource as stale until it is pruned with `pi-sync prune --confirm` or re-declared in the manifest.' } };
 }
 
-async function removeDependency(repo: string, source: string, agentDir: string, uninstall: boolean): Promise<RemovedDependencyResult | RemoveUninstallFailedResult> {
+async function localExists(targetPath: string): Promise<boolean> {
+  const info = await fs.lstat(targetPath).catch((error: any) => (error.code === 'ENOENT' ? null : Promise.reject(error)));
+  return info !== null;
+}
+
+// Removes the local copy when it still exactly matches its saved baseline
+// (after backing it up under .pi-sync/backups and re-verifying it unchanged),
+// or forgets a baseline whose local copy is already gone. Diverged,
+// untracked, and overlapping copies are preserved and reported.
+async function removeLocalIfEligible(agentDir: string, target: string, targetPath: string, staleItem: PlanStale | undefined, state: Awaited<ReturnType<typeof loadState>>): Promise<RemovedResourceResult['local']> {
+  if (staleItem === undefined) {
+    return (await localExists(targetPath))
+      ? { target, action: 'preserved', reason: 'local copy is not tracked by Pi Sync (no last-applied baseline); it stays installed' }
+      : { target, action: 'unchanged', reason: 'no local installation' };
+  }
+  if (!staleItem.eligible) {
+    const reason = staleItem.overlaps.length
+      ? `local copy overlaps currently managed targets: ${staleItem.overlaps.join(', ')}; it stays installed`
+      : 'local copy diverged from its last-applied baseline; it stays installed and is reported as stale by status';
+    return { target, action: 'preserved', reason };
+  }
+  let backup: string | undefined;
+  if (staleItem.localSnapshot !== null) {
+    const info = await fs.lstat(targetPath);
+    backup = await createBackup(agentDir, target, targetPath, info.isDirectory());
+    const observed = await safeSnapshot(targetPath);
+    if (!sameValue(observed, staleItem.localSnapshot)) throw new Error(`Managed resource changed during remove; refusing to remove: ${target}`);
+    const tombstone = path.join(path.dirname(targetPath), `.${path.basename(targetPath)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.removed`);
+    await fs.rename(targetPath, tombstone);
+    try { await fs.rm(tombstone, { recursive: true }); }
+    catch (error) {
+      await fs.rename(tombstone, targetPath).catch(() => {});
+      throw error;
+    }
+  }
+  delete state.resources[target];
+  await writeState(agentDir, state);
+  return staleItem.localSnapshot === null
+    ? { target, action: 'unchanged', reason: 'no local copy; the baseline entry is forgotten' }
+    : { target, action: 'removed', backup };
+}
+
+async function removeDependency(repo: string, source: string, agentDir: string, uninstall: boolean, dryRun: boolean): Promise<RemovedDependencyResult | RemoveUninstallFailedResult> {
   const match = /^(npm):(.+)$/.exec(source) ?? /^(github):(.+)$/.exec(source);
   if (!match) throw new Error('Dependency source must be npm:PACKAGE or github:OWNER/REPOSITORY');
   const dependency: Dependency = match[1] === 'npm' ? { type: 'npm', name: match[2] } : { type: 'github', repository: match[2] };
@@ -486,6 +546,12 @@ async function removeDependency(repo: string, source: string, agentDir: string, 
     const pinsInfo = await fs.lstat(pinsFile).catch((error: any) => (error.code === 'ENOENT' ? null : Promise.reject(error)));
     if (pinsInfo && pinsInfo.isFile()) localPins = await loadPackagePins(agentDir);
   }
+  if (dryRun) {
+    return { apiVersion: 2, command: 'remove', ok: true, exitCode: 0, repository: repo, mode: 'preview',
+      removed: { dependency, pin },
+      localInstallation: uninstall ? 'would-uninstall' : 'unchanged',
+      note: `Dry run: the manifest dependency and its exact lockfile pin would be removed${uninstall ? ' and the package uninstalled' : ', leaving it installed locally'}; nothing was changed.` };
+  }
   const nextManifest = { ...manifest, dependencies: manifest.dependencies.filter((item: any) => packageIdentity(item) !== identity) };
   const nextLock = { ...lock, packages: lock.packages.filter((item: any) => packageIdentity(item) !== identity) };
   let manifestWritten = false;
@@ -508,7 +574,7 @@ async function removeDependency(repo: string, source: string, agentDir: string, 
     throw error;
   }
   const spec = packageSpec(pin);
-  const output: RemovedDependencyResult = { apiVersion: 1, command: 'remove', ok: true, exitCode: 0, repository: repo,
+  const output: RemovedDependencyResult = { apiVersion: 2, command: 'remove', ok: true, exitCode: 0, repository: repo, mode: 'applied',
     removed: { dependency, pin },
     localInstallation: 'unchanged',
     note: 'Removal is repository-only: the package remains installed locally and nothing is queued or scheduled for deletion. Rerun with --uninstall to uninstall it explicitly.' };
@@ -520,7 +586,7 @@ async function removeDependency(repo: string, source: string, agentDir: string, 
     const detail = uninstalled.error?.message ?? uninstalled.stderr.trim() ?? `Pi exited ${uninstalled.status}`;
     // Key order matches the pre-refactor response: the success-shape fields
     // come first, then the failure metadata.
-    const failed: RemoveUninstallFailedResult = { apiVersion: 1, command: 'remove', ok: false, exitCode: OPERATION_ERROR,
+    const failed: RemoveUninstallFailedResult = { apiVersion: 2, command: 'remove', ok: false, exitCode: OPERATION_ERROR,
       repository: repo, removed: { dependency, pin }, localInstallation: 'unchanged',
       note: 'The repository removal is in place, but the package is still installed locally; retry the uninstall when Pi can remove it.',
       errorCode: 'UNINSTALL_FAILED',
@@ -543,51 +609,122 @@ async function removeDependency(repo: string, source: string, agentDir: string, 
   return output;
 }
 
-export interface AddInput {
-  repo: string;
-  agentDir: string;
-  type: 'skill' | 'extension' | 'prompt' | 'agent' | 'role' | 'workflow' | 'dependency';
-  source: string;
+export type AddInput =
+  | { repo: string; agentDir: string; type: 'dependency'; source: string; dryRun: boolean }
+  | { repo: string; agentDir: string; type: 'resource-discovery'; mode: { list: true } | { all: true } }
+  | { repo: string; agentDir: string; type: 'skill' | 'extension' | 'prompt' | 'agent' | 'role' | 'workflow'; target: string; dryRun: boolean };
+
+// Dependency sources remain declarations only. Resource additions resolve
+// repository and local copies together, while discovery operates repository-first.
+export async function runAdd(input: AddInput): Promise<AddOutput> {
+  if (input.type === 'dependency') return addDependency(input.repo, input.source, input.dryRun);
+  if (input.type === 'resource-discovery') return 'list' in input.mode ? listAddCandidates(input.repo) : addAllResources(input.repo);
+  return addResource(input.repo, input.agentDir, input.type, input.target, input.dryRun);
 }
 
-// The add workflow: `add --type dependency` declares a dependency without
-// pinning it (update resolves and writes the pin), and every other type
-// imports the selected agent-directory resource into the setup repository
-// and declares it. Both paths change only the explicitly selected content
-// and the manifest declarations.
-export async function runAdd({ repo, agentDir, type, source }: AddInput): Promise<AddOutput> {
-  if (type === 'dependency') return addDependency(repo, source);
-  return addResource(repo, agentDir, type, source);
+// The `remove --stale` batch: the old prune workflow. It removes local
+// installations that Pi Sync installed and that now exactly match their saved
+// last-applied baseline. Diverged local copies stay and are reported, as do
+// copies that overlap still-managed targets. The output shape mirrors the
+// former prune output (staleResources with per-target action/installed) so
+// the workflow reads the same.
+export interface RemoveStaleResourceResult {
+  target: string;
+  action: string;
+  installed: boolean;
+  overlaps?: string[];
 }
 
-export interface RegisterInput {
-  repo: string;
-  mode: RegisterMode;
+export interface RemoveStaleResult {
+  apiVersion: 2;
+  command: 'remove';
+  ok: boolean;
+  exitCode: number;
+  repository: string;
+  agentDirectory: string;
+  mode: 'applied' | 'preview';
+  staleResources: RemoveStaleResourceResult[];
 }
 
-// The register workflow: exactly one mode is selected by the parser — a
-// single registration via --source, read-only discovery via --list, or a
-// batch registration via --all. None of the modes requires or uses
-// --agent-dir. The parser requires --type for single registration.
-export async function runRegister({ repo, mode }: RegisterInput): Promise<RegisterOutput> {
-  if ('source' in mode) return registerResource(repo, mode.type, mode.source);
-  if ('list' in mode) return listUnregisteredResources(repo, mode.type);
-  return registerAllResources(repo, mode.type);
+export type RemoveStaleOutput = RemoveStaleResult;
+
+// Matches the entry point's operation-error exit status: retained or modified
+// stale resources fail the command so a caller sees they were not all removed.
+const REMOVE_STALE_OPERATION_ERROR = 1;
+
+async function removeStale(agentDir: string, state: Awaited<ReturnType<typeof loadState>>, stale: PlanStale[], dryRun: boolean): Promise<RemoveStaleResourceResult[]> {
+  const results: RemoveStaleResourceResult[] = [];
+  const nextState = structuredClone(state);
+  for (const item of stale) {
+    if (item.overlaps.length) {
+      results.push({ target: item.target, action: 'retained-overlap', installed: item.localSnapshot !== null, overlaps: item.overlaps });
+      continue;
+    }
+    if (dryRun) {
+      results.push({ target: item.target, action: item.eligible ? 'would-prune' : 'modified', installed: item.localSnapshot !== null });
+      continue;
+    }
+    if (!item.eligible) {
+      results.push({ target: item.target, action: 'retained-modified', installed: true });
+      continue;
+    }
+    if (item.localSnapshot !== null) {
+      const info = await fs.lstat(item.targetPath);
+      await createBackup(agentDir, item.target, item.targetPath, info.isDirectory());
+      const observed = await safeSnapshot(item.targetPath);
+      if (!sameValue(observed, item.localSnapshot)) throw new Error(`Stale resource changed during remove; refusing to remove: ${item.target}`);
+      const tombstone = path.join(path.dirname(item.targetPath), `.${path.basename(item.targetPath)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.removed`);
+      await fs.rename(item.targetPath, tombstone);
+      try { await fs.rm(tombstone, { recursive: true }); }
+      catch (error) {
+        await fs.rename(tombstone, item.targetPath).catch(() => {});
+        throw error;
+      }
+    }
+    delete nextState.resources[item.target];
+    await writeState(agentDir, nextState);
+    results.push({ target: item.target, action: item.localSnapshot === null ? 'forgotten-missing' : 'pruned', installed: false });
+  }
+  return results;
 }
 
-// Mirrors the parser's discriminated remove request: dependency removals
-// carry the required --source, resource removals the required --target.
+// The stale workflow is distinct from ordinary apply. It takes the apply lock
+// and re-reads the baseline for the default mutating action; `--dry-run` is
+// read-only and never locks or writes.
+async function runRemoveStale(repo: string, agentDir: string, declarations: RepositoryDeclarations, dryRun: boolean): Promise<RemoveStaleResult> {
+  const state = await loadState(agentDir);
+  const releaseLock = dryRun ? null : await acquireLock(agentDir);
+  try {
+    const currentState = releaseLock ? await loadState(agentDir) : state;
+    const plan = await buildPlan(repo, agentDir, declarations, currentState);
+    const staleResources = await removeStale(agentDir, currentState, plan.stale, dryRun);
+    const ok = !staleResources.some((item) => ['modified', 'retained-modified', 'retained-overlap'].includes(item.action));
+    return { apiVersion: 2, command: 'remove', ok, exitCode: ok ? 0 : REMOVE_STALE_OPERATION_ERROR, repository: repo, agentDirectory: agentDir,
+      mode: dryRun ? 'preview' : 'applied', staleResources };
+  } finally {
+    if (releaseLock) await releaseLock();
+  }
+}
+
+// The remove workflow: `remove --target` removes a managed resource fully
+// (manifest entry, repository content, and — unless --keep-local — the local
+// installation), `remove --source` removes a dependency declaration and its
+// exact lockfile pin (optionally uninstalling the package), and
+// `remove --stale` removes stale local installations in one batch. The
+// discriminated input type carries the parser's selector guarantee, so no
+// optional-field casts are needed.
 export type RemoveInput =
-  | { repo: string; agentDir: string; type: 'dependency'; source: string; uninstall: boolean }
-  | { repo: string; agentDir: string; type: 'skill' | 'extension' | 'prompt' | 'agent' | 'role' | 'workflow'; target: string; uninstall: boolean };
+  | { repo: string; agentDir: string; type: 'stale'; dryRun: boolean }
+  | { repo: string; agentDir: string; type: 'dependency'; source: string; uninstall: boolean; dryRun: boolean }
+  | { repo: string; agentDir: string; type: 'skill' | 'extension' | 'prompt' | 'agent' | 'role' | 'workflow'; target: string; keepLocal: boolean; dryRun: boolean };
 
-// The remove workflow: `remove --type dependency` (with --source, and
-// optionally --uninstall) and every other type (with --target). Both paths
-// are repository-only by design and change only the explicitly selected
-// manifest declarations and repository content. The discriminated input
-// type carries the parser's selector guarantee, so no optional-field casts
-// are needed.
 export async function runRemove(input: RemoveInput): Promise<RemoveOutput> {
-  if (input.type === 'dependency') return removeDependency(input.repo, input.source, input.agentDir, input.uninstall);
-  return removeResource(input.repo, input.type, input.target);
+  if (input.type === 'stale') {
+    // The stale batch does not touch dependency pins, so missing pins are
+    // tolerated here, matching the entry point's remove validation.
+    const declarations = await validateRepository(input.repo, { allowMissingPins: true });
+    return runRemoveStale(input.repo, input.agentDir, declarations, input.dryRun);
+  }
+  if (input.type === 'dependency') return removeDependency(input.repo, input.source, input.agentDir, input.uninstall, input.dryRun);
+  return removeResource(input.repo, input.agentDir, input.type, input.target, input.keepLocal, input.dryRun);
 }

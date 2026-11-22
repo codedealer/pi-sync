@@ -137,14 +137,16 @@ async function snapshotRepo(repo) {
   return result;
 }
 
-function run(args, env) {
-  return spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', env });
 
+function run(args, env) {
+  const jsonArgs = args.includes('--json') ? args : [...args, '--json'];
+  return spawnSync(process.execPath, [cli, ...jsonArgs], { encoding: 'utf8', env });
 }
 
 function runAsync(args, env) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [cli, ...args], { encoding: 'utf8', env });
+    const jsonArgs = args.includes('--json') ? args : [...args, '--json'];
+    const child = spawn(process.execPath, [cli, ...jsonArgs], { encoding: 'utf8', env });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
@@ -210,7 +212,7 @@ test('current npm and pnpm Windows shims resolve their declared package target a
 
 test('pi-update previews newest mature stable Pi version read-only', async (t) => {
   const f = await fixture(t);
-  const result = run(['pi-update', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
+  const result = run(['pi-update', '--dry-run', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
   assert.equal(result.status, 0, result.stderr + result.stdout);
   const output = json(result);
   assert.equal(output.command, 'pi-update');
@@ -220,15 +222,17 @@ test('pi-update previews newest mature stable Pi version read-only', async (t) =
   assert.equal(output.minimumReleaseAgeDays, 7);
   assert.equal(output.policySource, 'setup repository pi-sync.json');
   assert.equal(output.candidate.version, '1.2.0');
-  assert.equal(output.candidate.ageDays, 9);
+  // The fixture publishes 1.2.0 at now − 9d, but the wall clock can step
+  // between fixture creation and the CLI's Date.now(); assert with tolerance.
+  assert.ok(output.candidate.ageDays > 8.9 && output.candidate.ageDays < 9.1, `ageDays ${output.candidate.ageDays} should be approximately 9`);
   assert.deepEqual(await snapshotRepo(f.repo), f.originalRepoFiles);
   assert.equal(await fs.readFile(path.join(f.packageRoot, 'package.json'), 'utf8').then((text) => JSON.parse(text).version), '1.0.0');
   assert.deepEqual(await managerCalls(f.log), (process.platform === 'win32' ? ['root --global', 'prefix --global'] : ['root --global']));
 });
 
-test('pi-update --apply installs the exact rechecked version with scripts disabled', async (t) => {
+test('pi-update installs the exact rechecked version with scripts disabled', async (t) => {
   const f = await fixture(t);
-  const result = run(['pi-update', '--apply', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
+  const result = run(['pi-update', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
   assert.equal(result.status, 0, result.stderr + result.stdout);
   const output = json(result);
   assert.equal(output.mode, 'applied');
@@ -244,13 +248,13 @@ test('pi-update --apply installs the exact rechecked version with scripts disabl
 
 test('a too-young newest release is not proposed and a machine age override is rejected', async (t) => {
   const f = await fixture(t, { versions: ['1.2.0', '1.3.0'] });
-  const preview = run(['pi-update', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
+  const preview = run(['pi-update', '--dry-run', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
   assert.equal(json(preview).candidate.version, '1.2.0');
-  const noOverride = run(['pi-update', '--minimum-release-age-days', '0', '--repo', f.repo], f.env);
+  const noOverride = run(['pi-update', '--dry-run', '--minimum-release-age-days', '0', '--repo', f.repo], f.env);
   assert.notEqual(noOverride.status, 0);
   assert.match(json(noOverride).error, /Unknown option/);
   const f2 = await fixture(t, { versions: ['1.3.0'] });
-  const onlyYoung = run(['pi-update', '--repo', f2.repo, '--agent-dir', f2.agentDir], f2.env);
+  const onlyYoung = run(['pi-update', '--dry-run', '--repo', f2.repo, '--agent-dir', f2.agentDir], f2.env);
   assert.equal(json(onlyYoung).candidate, null);
 });
 
@@ -259,7 +263,7 @@ test('missing or malformed publication timestamps stop discovery closed', async 
   const metadata = JSON.parse(await fs.readFile(f.metadataPath, 'utf8'));
   delete metadata.time['1.2.0'];
   await fs.writeFile(f.metadataPath, JSON.stringify(metadata));
-  const result = run(['pi-update', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
+  const result = run(['pi-update', '--dry-run', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
   assert.notEqual(result.status, 0);
   assert.match(json(result).error, /timestamp.*stopped closed/i);
   assert.deepEqual(await managerCalls(f.log), (process.platform === 'win32' ? ['root --global', 'prefix --global'] : ['root --global']));
@@ -273,7 +277,7 @@ test('malformed, non-canonical, and future publication timestamps stop discovery
     const metadata = JSON.parse(await fs.readFile(f.metadataPath, 'utf8'));
     metadata.time['1.2.0'] = publishedAt;
     await fs.writeFile(f.metadataPath, JSON.stringify(metadata));
-    const result = run(['pi-update', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
+    const result = run(['pi-update', '--dry-run', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
     assert.notEqual(result.status, 0);
     assert.match(json(result).error, /timestamp.*stopped closed/i);
     assert.equal((await managerCalls(f.log)).some((call) => /^(install|add) /.test(call)), false);
@@ -283,7 +287,7 @@ test('malformed, non-canonical, and future publication timestamps stop discovery
 
 test('registry transport errors fail closed with an operational error envelope', async (t) => {
   const f = await fixture(t);
-  const result = run(['pi-update', '--repo', f.repo, '--agent-dir', f.agentDir], { ...f.env, PI_METADATA_FAIL: '1' });
+  const result = run(['pi-update', '--dry-run', '--repo', f.repo, '--agent-dir', f.agentDir], { ...f.env, PI_METADATA_FAIL: '1' });
   assert.equal(result.status, 1);
   const output = json(result);
   assert.equal(output.errorCode, 'OPERATION_FAILED');
@@ -295,7 +299,7 @@ test('registry transport errors fail closed with an operational error envelope',
 test('a failed install attempts and verifies rollback without modifying the setup repository', async (t) => {
   const behavior = `const marker = process.env.PI_MANAGER_LOG + '.first'; if (!fs.existsSync(marker)) { fs.writeFileSync(marker, '1'); metadata.version = version; fs.writeFileSync(path.join(pkg, 'package.json'), JSON.stringify(metadata)); process.exit(9); }`;
   const f = await fixture(t, { managerBehavior: behavior });
-  const result = run(['pi-update', '--apply', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
+  const result = run(['pi-update', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
   assert.notEqual(result.status, 0);
   assert.match(json(result).error, /previous Pi version 1\.0\.0 was restored and verified/);
   assert.equal(await fs.readFile(path.join(f.packageRoot, 'package.json'), 'utf8').then((text) => JSON.parse(text).version), '1.0.0');
@@ -307,7 +311,7 @@ test('a failed install attempts and verifies rollback without modifying the setu
 
 test('verifiable global pnpm installations use pnpm add with scripts disabled', async (t) => {
   const f = await fixture(t, { manager: 'pnpm' });
-  const result = run(['pi-update', '--apply', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
+  const result = run(['pi-update', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
   assert.equal(result.status, 0, result.stderr + result.stdout);
   const output = json(result);
   assert.equal(output.installationMethod, 'pnpm');
@@ -323,7 +327,7 @@ test('unsupported wrapper installations and invalid repository age policies fail
   const launcher = path.join(binDir, process.platform === 'win32' ? 'pi.cmd' : 'pi');
   await fs.unlink(launcher);
   await fs.writeFile(launcher, process.platform === 'win32' ? '@ECHO off\r\necho custom wrapper\r\n' : '#!/usr/bin/env node\n', { mode: 0o755 });
-  const unsupported = run(['pi-update', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
+  const unsupported = run(['pi-update', '--dry-run', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
   assert.notEqual(unsupported.status, 0);
   assert.match(json(unsupported).error, /unsupported|custom-wrapper/i);
 
@@ -332,7 +336,7 @@ test('unsupported wrapper installations and invalid repository age policies fail
   const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
   manifest.policy.minimumReleaseAgeDays = 1;
   await fs.writeFile(manifestPath, JSON.stringify(manifest));
-  const invalidPolicy = run(['pi-update', '--repo', f2.repo, '--agent-dir', f2.agentDir], f2.env);
+  const invalidPolicy = run(['pi-update', '--dry-run', '--repo', f2.repo, '--agent-dir', f2.agentDir], f2.env);
   assert.notEqual(invalidPolicy.status, 0);
   assert.match(json(invalidPolicy).error, /at least seven days/);
 });
@@ -340,32 +344,32 @@ test('unsupported wrapper installations and invalid repository age policies fail
 test('ambiguous managers and packages outside global roots fail closed', async (t) => {
   const ambiguous = await fixture(t);
   await addFakeManager(ambiguous, 'pnpm');
-  const ambiguousResult = run(['pi-update', '--repo', ambiguous.repo, '--agent-dir', ambiguous.agentDir], ambiguous.env);
+  const ambiguousResult = run(['pi-update', '--dry-run', '--repo', ambiguous.repo, '--agent-dir', ambiguous.agentDir], ambiguous.env);
   assert.notEqual(ambiguousResult.status, 0);
   assert.match(json(ambiguousResult).error, /matches multiple global package managers/);
 
   const unmanaged = await fixture(t);
   await fs.mkdir(unmanaged.env.PI_OTHER_ROOT, { recursive: true });
-  const unmanagedResult = run(['pi-update', '--repo', unmanaged.repo, '--agent-dir', unmanaged.agentDir], { ...unmanaged.env, PI_GLOBAL_ROOT: unmanaged.env.PI_OTHER_ROOT });
+  const unmanagedResult = run(['pi-update', '--dry-run', '--repo', unmanaged.repo, '--agent-dir', unmanaged.agentDir], { ...unmanaged.env, PI_GLOBAL_ROOT: unmanaged.env.PI_OTHER_ROOT });
   assert.notEqual(unmanagedResult.status, 0);
   assert.match(json(unmanagedResult).error, /not verifiably managed by global npm or pnpm/);
 });
 
 test('apply fails closed when policy, installation, or candidate changes during the locked recheck', async (t) => {
   const policy = await fixture(t);
-  const policyResult = run(['pi-update', '--apply', '--repo', policy.repo, '--agent-dir', policy.agentDir], { ...policy.env, PI_POLICY_CHANGE_FETCH: '1' });
+  const policyResult = run(['pi-update', '--repo', policy.repo, '--agent-dir', policy.agentDir], { ...policy.env, PI_POLICY_CHANGE_FETCH: '1' });
   assert.notEqual(policyResult.status, 0);
   assert.match(json(policyResult).error, /release-age policy changed/);
   assert.equal((await managerCalls(policy.log)).some((call) => /^(install|add) /.test(call)), false);
 
   const installation = await fixture(t);
-  const installationResult = run(['pi-update', '--apply', '--repo', installation.repo, '--agent-dir', installation.agentDir], { ...installation.env, PI_PACKAGE_CHANGE_FETCH: '1' });
+  const installationResult = run(['pi-update', '--repo', installation.repo, '--agent-dir', installation.agentDir], { ...installation.env, PI_PACKAGE_CHANGE_FETCH: '1' });
   assert.notEqual(installationResult.status, 0);
   assert.match(json(installationResult).error, /local Pi installation changed/);
   assert.equal((await managerCalls(installation.log)).some((call) => /^(install|add) /.test(call)), false);
 
   const candidate = await fixture(t);
-  const candidateResult = run(['pi-update', '--apply', '--repo', candidate.repo, '--agent-dir', candidate.agentDir], { ...candidate.env, PI_CANDIDATE_CHANGE_FETCH: '2' });
+  const candidateResult = run(['pi-update', '--repo', candidate.repo, '--agent-dir', candidate.agentDir], { ...candidate.env, PI_CANDIDATE_CHANGE_FETCH: '2' });
   assert.notEqual(candidateResult.status, 0);
   assert.match(json(candidateResult).error, /release eligibility changed/);
   assert.equal((await managerCalls(candidate.log)).some((call) => /^(install|add) /.test(call)), false);
@@ -373,7 +377,7 @@ test('apply fails closed when policy, installation, or candidate changes during 
 
 test('simultaneous pi-update applies do not race the host installation', async (t) => {
   const f = await fixture(t, { managerBehavior: "if (version === '1.2.0') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3200);" });
-  const args = ['pi-update', '--apply', '--repo', f.repo, '--agent-dir', f.agentDir];
+  const args = ['pi-update', '--repo', f.repo, '--agent-dir', f.agentDir];
   const first = runAsync(args, f.env);
   await new Promise((resolve) => setTimeout(resolve, 300));
   const second = runAsync(args, f.env);
@@ -388,7 +392,7 @@ test('simultaneous pi-update applies do not race the host installation', async (
 test('a serialized apply proceeds after the preceding operation rolls back and releases its lock', async (t) => {
   const behavior = `const marker = process.env.PI_MANAGER_LOG + '.delayed-failure'; if (version === '1.2.0' && !fs.existsSync(marker)) { fs.writeFileSync(marker, '1'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200); process.exit(9); }`;
   const f = await fixture(t, { managerBehavior: behavior });
-  const args = ['pi-update', '--apply', '--repo', f.repo, '--agent-dir', f.agentDir];
+  const args = ['pi-update', '--repo', f.repo, '--agent-dir', f.agentDir];
   const first = runAsync(args, f.env);
   await new Promise((resolve) => setTimeout(resolve, 150));
   const second = runAsync(args, f.env);
@@ -403,7 +407,7 @@ test('a serialized apply proceeds after the preceding operation rolls back and r
 test('an unverifiable rollback is reported explicitly', async (t) => {
   const behavior = `if (version === '1.2.0') { metadata.version = version; fs.writeFileSync(path.join(pkg, 'package.json'), JSON.stringify(metadata)); } process.exit(9);`;
   const f = await fixture(t, { managerBehavior: behavior });
-  const result = run(['pi-update', '--apply', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
+  const result = run(['pi-update', '--repo', f.repo, '--agent-dir', f.agentDir], f.env);
   assert.notEqual(result.status, 0);
   assert.match(json(result).error, /rollback was incomplete/);
   assert.deepEqual(await snapshotRepo(f.repo), f.originalRepoFiles);

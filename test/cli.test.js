@@ -111,8 +111,17 @@ async function pushFixture(t) {
   return { root, repo, bare };
 }
 
-function runWith(entry, args, env = {}, options = {}) {
+function runRawWith(entry, args, env = {}, options = {}) {
   return spawnSync(process.execPath, [entry, ...args], {
+    encoding: 'utf8',
+    env: { ...process.env, ...env },
+    ...options,
+  });
+}
+
+function runWith(entry, args, env = {}, options = {}) {
+  const jsonArgs = args.includes('--json') ? args : [...args, '--json'];
+  return spawnSync(process.execPath, [entry, ...jsonArgs], {
     encoding: 'utf8',
     env: { ...process.env, ...env },
     ...options,
@@ -122,6 +131,7 @@ function runWith(entry, args, env = {}, options = {}) {
 function run(args, env = {}, options = {}) {
   return runWith(cli, args, env, options);
 }
+
 
 // Environment for the --repo default-resolution tests: the inherited
 // environment is scrubbed of PI_SYNC_REPO_DIR and PI_CODING_AGENT_DIR so an
@@ -208,7 +218,8 @@ async function piCalls(logFile) {
 
 function runAsync(args, env = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [cli, ...args], { encoding: 'utf8', env: { ...process.env, ...env } });
+    const jsonArgs = args.includes('--json') ? args : [...args, '--json'];
+    const child = spawn(process.execPath, [cli, ...jsonArgs], { encoding: 'utf8', env: { ...process.env, ...env } });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
@@ -217,6 +228,24 @@ function runAsync(args, env = {}) {
     child.on('close', (status) => resolve({ status, stdout, stderr }));
   });
 }
+
+test('bootstrap --dry-run stages a full preview without creating the setup checkout or local installation', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-dry-run-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const setupDir = path.join(root, 'setup');
+  const agentDir = path.join(root, 'agent');
+  const response = runRawWith(cli, ['bootstrap', '--dry-run', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir, '--json'], {
+    ...fakeTools, FAKE_GIT_ACCESS: 'yes',
+  });
+  assert.equal(response.status, 0, `${response.stderr}\n${response.stdout}`);
+  const output = JSON.parse(response.stdout);
+  assert.equal(output.mode, 'preview');
+  assert.equal(output.plan.command, 'status');
+  await assert.rejects(fs.access(setupDir));
+  await assert.rejects(fs.access(agentDir));
+});
 
 test('bootstrap fetches a private setup fixture, declares the bundled skill and extension, and installs them through apply', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-test-'));
@@ -229,7 +258,7 @@ test('bootstrap fetches a private setup fixture, declares the bundled skill and 
   await fs.writeFile(unrelated, '# Keep local\n');
   const setupDir = path.join(root, 'private-checkout');
 
-  const bootstrapped = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir], {
+  const bootstrapped = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir], {
     ...fakeTools, FAKE_GIT_ACCESS: 'yes',
   });
   assert.equal(bootstrapped.status, 0, `${bootstrapped.stderr}\n${bootstrapped.stdout}`);
@@ -269,7 +298,7 @@ test('bootstrap writes the missing EOL policy file, reports a matching one as cu
     if (scenario.content !== null) await fs.writeFile(path.join(sourceRepo, '.gitattributes'), scenario.content);
     const fakeTools = await fakeGitHubTools(t, sourceRepo);
     const setupDir = path.join(root, 'private-checkout');
-    const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', path.join(root, 'agent')], {
+    const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', path.join(root, 'agent')], {
       ...fakeTools, FAKE_GIT_ACCESS: 'yes',
     });
     assert.equal(response.status, 0, `${response.stderr}\n${response.stdout}`);
@@ -285,7 +314,7 @@ test('bootstrap uses authenticated GitHub CLI as a fetch fallback without exposi
   const sourceRepo = await bootstrapRepo(t, root);
   const fakeTools = await fakeGitHubTools(t, sourceRepo);
   const setupDir = path.join(root, 'private-checkout');
-  const response = run(['bootstrap', '--repo-url', 'git@github.com:acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', path.join(root, 'agent')], {
+  const response = run(['bootstrap', '--repo-url', 'git@github.com:acme/private-setup.git', '--repo', setupDir, '--agent-dir', path.join(root, 'agent')], {
     ...fakeTools, FAKE_GIT_ACCESS: 'no', FAKE_GH_AUTH: 'yes',
   });
   assert.equal(response.status, 0, `${response.stderr}\n${response.stdout}`);
@@ -303,14 +332,14 @@ test('bootstrap pauses safely for authentication and returns a resumable command
   const agentDir = path.join(root, 'agent');
   const setupDir = path.join(root, 'private-checkout');
   const binDir = path.join(root, 'user-bin');
-  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir, '--bin-dir', binDir], {
+  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir, '--bin-dir', binDir], {
     ...fakeTools, FAKE_GIT_ACCESS: 'no', FAKE_GH_AUTH: 'no',
   });
   assert.equal(response.status, 1);
   const output = result(response);
   assert.equal(output.errorCode, 'AUTH_REQUIRED');
   assert.deepEqual(output.authentication, { required: true, cliAvailable: true, command: 'gh auth login --hostname github.com', commandArgs: ['gh', 'auth', 'login', '--hostname', 'github.com'], credentialHandling: 'Pi Sync does not request, print, or store credentials' });
-  assert.deepEqual(output.resumeArgs, ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir, '--bin-dir', binDir]);
+  assert.deepEqual(output.resumeArgs, ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir, '--bin-dir', binDir]);
   await assert.rejects(fs.access(setupDir));
   await assert.rejects(fs.access(agentDir));
   assert.doesNotMatch(response.stdout, /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/i);
@@ -326,7 +355,7 @@ test('bootstrap reports skill collisions without overwriting local content or re
   await fs.mkdir(path.dirname(localSkill), { recursive: true });
   await fs.writeFile(localSkill, '# Existing user skill\n');
   const setupDir = path.join(root, 'private-checkout');
-  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir], {
+  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir], {
     ...fakeTools, FAKE_GIT_ACCESS: 'yes',
   });
   assert.equal(response.status, 1, `${response.stderr}\n${response.stdout}`);
@@ -350,7 +379,7 @@ test('bootstrap detects manifest-owned skill target collisions without editing t
   const fakeTools = await fakeGitHubTools(t, sourceRepo);
   const setupDir = path.join(root, 'private-checkout');
   const agentDir = path.join(root, 'agent');
-  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir], {
+  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir], {
     ...fakeTools, FAKE_GIT_ACCESS: 'yes',
   });
   assert.equal(response.status, 1);
@@ -386,7 +415,6 @@ test('public npm package allowlist includes the CLI, skill, and extension but ex
   assert.ok(files.includes('dist/cli/commands/apply.js'));
   assert.ok(files.includes('dist/cli/commands/sync.js'));
   assert.ok(files.includes('dist/cli/commands/bootstrap.js'));
-  assert.ok(files.includes('dist/cli/commands/prune.js'));
   assert.ok(files.includes('dist/cli/commands/push.js'));
   assert.ok(files.includes('dist/cli/commands/pull.js'));
   assert.ok(files.includes('dist/cli/commands/resources.js'));
@@ -399,7 +427,6 @@ test('public npm package allowlist includes the CLI, skill, and extension but ex
   assert.ok(files.includes('src/cli/resource-operations.ts'));
   assert.ok(files.includes('src/cli/commands/apply.ts'));
   assert.ok(files.includes('src/cli/commands/sync.ts'));
-  assert.ok(files.includes('src/cli/commands/prune.ts'));
   assert.ok(files.includes('src/cli/commands/resources.ts'));
   assert.ok(files.includes('src/cli/commands/push.ts'));
   assert.ok(files.includes('src/cli/commands/update.ts'));
@@ -409,32 +436,181 @@ test('public npm package allowlist includes the CLI, skill, and extension but ex
   assert.ok(files.includes('resources/extensions/pi-sync/status.js'));
   assert.ok(files.includes('resources/extensions/pi-sync/process.js'));
   assert.ok(!files.some((item) => /^(?:test(?:\/|$)|test-support(?:\/|$)|\.scratch(?:\/|$)|resources\/skills\/(?!pi-sync\/))/.test(item)));
-  assert.deepEqual(files.sort(), ['LICENSE', 'README.md', 'dist/cli.js', 'dist/cli/arguments.js', 'dist/cli/commands/apply.js', 'dist/cli/commands/bootstrap.js', 'dist/cli/commands/inspect.js', 'dist/cli/commands/pi-update.js', 'dist/cli/commands/prune.js', 'dist/cli/commands/pull.js', 'dist/cli/commands/push.js', 'dist/cli/commands/resources.js', 'dist/cli/commands/sync.js', 'dist/cli/commands/update.js', 'dist/cli/local-state.js', 'dist/cli/manifest.js', 'dist/cli/process.js', 'dist/cli/reconciliation.js', 'dist/cli/resource-operations.js', 'dist/packages.js', 'dist/prerequisites.js', 'package.json', 'resources/extensions/pi-sync/README.md', 'resources/extensions/pi-sync/guard.ts', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/process.js', 'resources/extensions/pi-sync/status.js', 'resources/skills/pi-sync/SKILL.md', 'src/cli.ts', 'src/cli/README.md', 'src/cli/arguments.ts', 'src/cli/commands/apply.ts', 'src/cli/commands/bootstrap.ts', 'src/cli/commands/inspect.ts', 'src/cli/commands/pi-update.ts', 'src/cli/commands/prune.ts', 'src/cli/commands/pull.ts', 'src/cli/commands/push.ts', 'src/cli/commands/resources.ts', 'src/cli/commands/sync.ts', 'src/cli/commands/update.ts', 'src/cli/local-state.ts', 'src/cli/manifest.ts', 'src/cli/process.ts', 'src/cli/reconciliation.ts', 'src/cli/resource-operations.ts', 'src/packages.ts', 'src/prerequisites.ts']);
+  assert.deepEqual(files.sort(), ['LICENSE', 'README.md', 'dist/cli.js', 'dist/cli/arguments.js', 'dist/cli/commands/apply.js', 'dist/cli/commands/bootstrap.js', 'dist/cli/commands/inspect.js', 'dist/cli/commands/pi-update.js', 'dist/cli/commands/pull.js', 'dist/cli/commands/push.js', 'dist/cli/commands/resources.js', 'dist/cli/commands/sync.js', 'dist/cli/commands/update.js', 'dist/cli/local-state.js', 'dist/cli/manifest.js', 'dist/cli/process.js', 'dist/cli/reconciliation.js', 'dist/cli/resource-operations.js', 'dist/packages.js', 'dist/prerequisites.js', 'package.json', 'resources/extensions/pi-sync/README.md', 'resources/extensions/pi-sync/guard.ts', 'resources/extensions/pi-sync/index.ts', 'resources/extensions/pi-sync/process.js', 'resources/extensions/pi-sync/status.js', 'resources/skills/pi-sync/SKILL.md', 'src/cli.ts', 'src/cli/README.md', 'src/cli/arguments.ts', 'src/cli/commands/apply.ts', 'src/cli/commands/bootstrap.ts', 'src/cli/commands/inspect.ts', 'src/cli/commands/pi-update.ts', 'src/cli/commands/pull.ts', 'src/cli/commands/push.ts', 'src/cli/commands/resources.ts', 'src/cli/commands/sync.ts', 'src/cli/commands/update.ts', 'src/cli/local-state.ts', 'src/cli/manifest.ts', 'src/cli/process.ts', 'src/cli/reconciliation.ts', 'src/cli/resource-operations.ts', 'src/packages.ts', 'src/prerequisites.ts']);
+});
+
+test('CLI output tiers provide compact text by default and version-2 compact or legacy-pretty JSON', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  const baseArgs = ['status', '--no-fetch', '--repo', repo, '--agent-dir', agentDir];
+  const text = runRawWith(cli, baseArgs);
+  assert.equal(text.status, 0, text.stderr);
+  assert.match(text.stdout, /^ok\ncommand: status\n/);
+  assert.match(text.stdout, /summary:/);
+  assert.match(text.stdout, /localPending:/);
+  assert.match(text.stdout, /actions: 1/);
+  assert.match(text.stdout, /  - type: skill\n    target: skills\/hello/);
+  assert.doesNotMatch(text.stdout, /"apiVersion"/);
+
+  const compact = runRawWith(cli, [...baseArgs, '--json']);
+  assert.equal(compact.status, 0, compact.stderr);
+  assert.equal(compact.stdout.trim().split('\n').length, 1);
+  const compactOutput = JSON.parse(compact.stdout);
+  assert.equal(compactOutput.apiVersion, 2);
+  assert.equal(compactOutput.command, 'status');
+  const pretty = runRawWith(cli, [...baseArgs, '--json', '--pretty']);
+  assert.equal(pretty.status, 0, pretty.stderr);
+  assert.ok(pretty.stdout.includes('\n  "apiVersion": 2'));
+  assert.deepEqual(JSON.parse(pretty.stdout), compactOutput);
+
+  const invalidPretty = runRawWith(cli, ['--version', '--pretty']);
+  assert.equal(invalidPretty.status, 2);
+  assert.match(invalidPretty.stdout, /^error VALIDATION_ERROR\n/);
+  // The error envelope derives the command from the leading --version flag.
+  const invalidVersionJson = runRawWith(cli, ['--version', '--json', 'extra']);
+  assert.equal(invalidVersionJson.status, 2);
+  const invalidVersionOutput = JSON.parse(invalidVersionJson.stdout);
+  assert.equal(invalidVersionOutput.ok, false);
+  assert.equal(invalidVersionOutput.command, 'version');
+  const invalidJson = runRawWith(cli, ['status', '--unknown-option', '--json']);
+  assert.equal(invalidJson.status, 2);
+  assert.equal(JSON.parse(invalidJson.stdout).apiVersion, 2);
+});
+
+test('condensed CLI rejects removed plan and legacy repository/type flags', () => {
+  const removedPlan = runRawWith(cli, ['plan', '--json']);
+  assert.equal(removedPlan.status, 2);
+  assert.match(JSON.parse(removedPlan.stdout).error, /Usage: pi-sync/);
+  for (const command of ['status', 'pull', 'apply', 'add', 'remove', 'bootstrap', 'update', 'push', 'pi-update', 'sync']) {
+    for (const flags of [['--type', 'skill'], ['--repo-dir', '/tmp/setup']]) {
+      const response = runRawWith(cli, [command, ...flags, '--json']);
+      assert.equal(response.status, 2, `${command} ${flags[0]}: ${response.stdout}`);
+      assert.match(JSON.parse(response.stdout).error, /Unknown option/);
+    }
+  }
+});
+
+test('register is rejected as an unknown command', () => {
+  const response = runRawWith(cli, ['register', '--json']);
+  assert.equal(response.status, 2);
+  assert.match(JSON.parse(response.stdout).error, /Usage: pi-sync/);
+});
+test('prune is rejected as an unknown command', () => {
+  const response = runRawWith(cli, ['prune', '--json']);
+  assert.equal(response.status, 2);
+  assert.match(JSON.parse(response.stdout).error, /Usage: pi-sync/);
+  for (const extra of [['--confirm'], ['--dry-run']]) {
+    const rejected = runRawWith(cli, ['prune', ...extra, '--json']);
+    assert.equal(rejected.status, 2);
+  }
+});
+
+test('remove requires exactly one selector and rejects flag combinations', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  const base = ['--repo', repo, '--agent-dir', agentDir];
+  const invalid = [
+    ['remove', ...base],
+    ['remove', '--target', 'skills/hello', '--source', 'npm:example', ...base],
+    ['remove', '--stale', '--target', 'skills/hello', ...base],
+    ['remove', '--stale', '--source', 'npm:example', ...base],
+    ['remove', '--source', 'npm:example', '--keep-local', ...base],
+    ['remove', '--stale', '--uninstall', ...base],
+    ['remove', '--target', 'skills/hello', '--uninstall', ...base],
+  ];
+  for (const args of invalid) {
+    const response = runRawWith(cli, [...args, '--json']);
+    assert.equal(response.status, 2, `${args.join(' ')}: ${response.stdout}`);
+    assert.equal(JSON.parse(response.stdout).ok, false);
+  }
+});
+
+test('add and remove infer resource types from roots and dependency kind from source schemes', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  const added = runRawWith(cli, ['add', '--target', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir, '--json']);
+  assert.equal(added.status, 0, added.stderr);
+  assert.equal(JSON.parse(added.stdout).type, 'skill');
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  let manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  assert.ok(manifest.resources.some((item) => item.target === 'skills/local-only' && item.type === 'skill'));
+
+  const rejectedSource = runRawWith(cli, ['add', '--source', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir, '--json']);
+  assert.equal(rejectedSource.status, 2);
+  const rejectedTarget = runRawWith(cli, ['add', '--target', 'npm:example', '--repo', repo, '--agent-dir', agentDir, '--json']);
+  assert.equal(rejectedTarget.status, 2);
+
+  const removed = runRawWith(cli, ['remove', '--target', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir, '--json']);
+  assert.equal(removed.status, 0, removed.stderr);
+  manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  assert.ok(!manifest.resources.some((item) => item.target === 'skills/local-only'));
+
+  const repositoryPrompt = path.join(repo, 'resources', 'prompts', 'deploy.md');
+  await fs.mkdir(path.dirname(repositoryPrompt), { recursive: true });
+  await fs.writeFile(repositoryPrompt, '# Deploy\n');
+  const repositoryAdd = runRawWith(cli, ['add', '--target', 'prompts/deploy.md', '--repo', repo, '--json']);
+  assert.equal(repositoryAdd.status, 0, repositoryAdd.stderr);
+  assert.equal(JSON.parse(repositoryAdd.stdout).type, 'prompt');
+  const dependency = runRawWith(cli, ['add', '--source', 'npm:example', '--repo', repo, '--json']);
+  assert.equal(dependency.status, 0, dependency.stderr);
+  assert.equal(JSON.parse(dependency.stdout).type, 'dependency');
+});
+
+test('retired action flags are rejected everywhere and unsupported dry-run invocations fail closed', () => {
+  const commands = ['status', 'plan', 'pull', 'apply', 'add', 'remove', 'update', 'push', 'pi-update', 'bootstrap', 'sync'];
+  for (const command of commands) {
+    for (const flag of ['--apply', '--confirm', '--publish', '--approve']) {
+      const response = runRawWith(cli, [command, flag, '--json']);
+      assert.equal(response.status, 2, `${command} ${flag}: ${response.stdout}`);
+    }
+  }
+  const updatePush = runRawWith(cli, ['update', '--push', '--json']);
+  assert.equal(updatePush.status, 2);
+  // No command accepts --push: push reports it as removed, not update-only.
+  const pushPush = runRawWith(cli, ['push', '--push', '--json']);
+  assert.equal(pushPush.status, 2);
+  assert.match(JSON.parse(pushPush.stdout).error, /--push is no longer supported/);
+  for (const command of ['status', 'add']) {
+    const response = runRawWith(cli, [command, '--dry-run', '--json']);
+    assert.equal(response.status, 2, `${command}: ${response.stdout}`);
+  }
+  const invalidVersion = runRawWith(cli, ['--version', '--dry-run', '--json']);
+  assert.equal(invalidVersion.status, 2);
+});
+
+test('apply --dry-run returns the plan without creating local state or installing resources', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  const manifestBefore = await fs.readFile(path.join(repo, 'pi-sync.json'));
+  const preview = runRawWith(cli, ['apply', '--dry-run', '--json', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(preview.status, 0, preview.stderr);
+  const output = JSON.parse(preview.stdout);
+  assert.equal(output.command, 'status');
+  assert.equal(output.actions[0].target, 'skills/hello');
+  await assert.rejects(fs.access(path.join(agentDir, 'skills', 'hello')));
+  await assert.rejects(fs.access(path.join(agentDir, '.pi-sync')));
+  assert.deepEqual(await fs.readFile(path.join(repo, 'pi-sync.json')), manifestBefore);
 });
 
 test('supported agent commands share a versioned JSON response contract', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const responses = [];
-  for (const command of ['status', 'plan', 'apply']) {
+  for (const command of ['status', 'apply']) {
     const processResult = run([command, '--repo', repo, '--agent-dir', agentDir]);
     assert.equal(processResult.status, 0, processResult.stderr);
     responses.push(result(processResult));
   }
-  const added = run(['add', '--type', 'skill', '--source', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
+  const added = run(['add', '--target', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(added.status, 0, added.stderr);
   responses.push(result(added));
-  const removed = run(['remove', '--type', 'skill', '--target', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
+  const removed = run(['remove', '--target', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(removed.status, 0, removed.stderr);
   responses.push(result(removed));
-  const pruned = run(['prune', '--repo', repo, '--agent-dir', agentDir]);
+  const pruned = run(['remove', '--stale', '--dry-run', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(pruned.status, 0, pruned.stderr);
   responses.push(result(pruned));
 
   for (const response of responses) {
-    assert.equal(response.apiVersion, 1);
+    assert.equal(response.apiVersion, 2);
     assert.equal(response.ok, true);
     assert.equal(response.exitCode, 0);
-    assert.ok(['status', 'plan', 'apply', 'add', 'remove', 'prune'].includes(response.command));
+    assert.ok(['status', 'apply', 'add', 'remove'].includes(response.command));
   }
   const manifestAfterRemove = JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8'));
   assert.equal(manifestAfterRemove.resources.some((item) => item.target === 'skills/local-only'), false);
@@ -442,7 +618,7 @@ test('supported agent commands share a versioned JSON response contract', async 
   const skill = await fs.readFile(new URL('../resources/skills/pi-sync/SKILL.md', import.meta.url), 'utf8');
   const packageJson = JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8'));
   assert.ok(packageJson.files.includes('resources/skills/pi-sync/SKILL.md'));
-  for (const workflow of ['pi-sync status', 'pi-sync plan', 'pi-sync apply', 'pi-sync add', 'pi-sync register', 'pi-sync remove', 'pi-sync prune', 'pi-sync prune --confirm']) {
+  for (const workflow of ['pi-sync status', 'pi-sync apply', 'pi-sync add', 'pi-sync add --list', 'pi-sync add --all', 'pi-sync remove', 'pi-sync remove --stale', 'pi-sync remove --stale --dry-run']) {
     assert.ok(skill.includes(workflow), `skill documents ${workflow}`);
   }
 });
@@ -451,7 +627,7 @@ test('--version reports the installed package name and version without touching 
   const response = run(['--version']);
   assert.equal(response.status, 0, response.stderr);
   const output = result(response);
-  assert.equal(output.apiVersion, 1);
+  assert.equal(output.apiVersion, 2);
   assert.equal(output.command, 'version');
   assert.equal(output.ok, true);
   assert.equal(output.exitCode, 0);
@@ -473,11 +649,11 @@ test('agent API reports conflicts and invalid operations as structured JSON with
   await fs.mkdir(target);
   await fs.writeFile(path.join(target, 'SKILL.md'), '# Keep local\n');
 
-  for (const command of ['status', 'plan', 'apply']) {
+  for (const command of ['status', 'apply']) {
     const processResult = run([command, '--repo', repo, '--agent-dir', agentDir]);
     assert.equal(processResult.status, 1, processResult.stderr);
     const output = result(processResult);
-    assert.equal(output.apiVersion, 1);
+    assert.equal(output.apiVersion, 2);
     assert.equal(output.ok, false);
     assert.equal(output.exitCode, 1);
     assert.equal(output.conflicts[0].target, 'skills/hello');
@@ -488,16 +664,16 @@ test('agent API reports conflicts and invalid operations as structured JSON with
   const invalid = run(['status', '--unknown-option']);
   assert.equal(invalid.status, 2);
   const output = result(invalid);
-  assert.equal(output.apiVersion, 1);
+  assert.equal(output.apiVersion, 2);
   assert.equal(output.ok, false);
   assert.equal(output.errorCode, 'VALIDATION_ERROR');
   assert.equal(output.exitCode, 2);
   assert.equal(output.details.message, output.error);
 });
 
-test('plan, apply and repeat apply through the real CLI subprocess; preserve unlisted resources', async (t) => {
+test('status, apply and repeat apply through the real CLI subprocess; preserve unlisted resources', async (t) => {
   const { repo, agentDir } = await fixture(t);
-  const planned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  const planned = run(['status', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(planned.status, 0, planned.stderr);
   assert.equal(result(planned).actions[0].action, 'install');
   await assert.rejects(fs.access(path.join(agentDir, 'skills', 'hello')));
@@ -556,7 +732,7 @@ test('manifest rejects resource targets that overlap under Windows case-insensit
     dependencies: [],
   }));
 
-  const rejected = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  const rejected = run(['status', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(rejected.status, 2);
   assert.match(result(rejected).error, /Overlapping resource targets/);
   assert.match(result(rejected).error, /skills\/Shared/);
@@ -636,13 +812,13 @@ test('reconciles independent resource files separately and conflicts only on the
   assert.equal(await fs.readFile(path.join(target, 'b.md'), 'utf8'), 'B second repository edit\n');
 });
 
-test('fully unchanged multi-file resources are omitted from actions in status, plan, and apply', async (t) => {
+test('fully unchanged multi-file resources are omitted from actions in status and apply', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const source = path.join(repo, 'resources', 'skills', 'hello');
   await fs.writeFile(path.join(source, 'a.md'), 'A baseline\n');
   await fs.writeFile(path.join(source, 'b.md'), 'B baseline\n');
   assert.equal(run(['apply', '--repo', repo, '--agent-dir', agentDir]).status, 0);
-  for (const command of ['status', 'plan', 'apply']) {
+  for (const command of ['status', 'apply']) {
     const response = run([command, '--repo', repo, '--agent-dir', agentDir]);
     assert.equal(response.status, 0, `${command}: ${response.stderr}`);
     assert.equal(result(response).actions.some((item) => item.target === 'skills/hello'), false,
@@ -659,7 +835,7 @@ test('changed reporting names only the affected files of a multi-file resource',
   await fs.writeFile(path.join(source, 'a.md'), 'A repository edit\n');
   await fs.rm(path.join(source, 'b.md'));
   const expectedResourceAction = { status: 'update', plan: 'update', apply: 'updated' };
-  for (const command of ['status', 'plan', 'apply']) {
+  for (const command of ['status', 'apply']) {
     const response = run([command, '--repo', repo, '--agent-dir', agentDir]);
     assert.equal(response.status, 0, `${command}: ${response.stderr}`);
     const action = result(response).actions.find((item) => item.target === 'skills/hello');
@@ -671,9 +847,9 @@ test('changed reporting names only the affected files of a multi-file resource',
   }
 });
 
-test('status, plan, and apply omit unchanged settings fields and empty setting actions', async (t) => {
+test('status and apply omit unchanged settings fields and empty setting actions', async (t) => {
   const expectedAction = { status: 'update', plan: 'update', apply: 'updated' };
-  for (const command of ['status', 'plan', 'apply']) {
+  for (const command of ['status', 'apply']) {
     const { repo, agentDir, manifestPath } = await settingsFixture(t, [
       { path: '/theme', value: 'dark' },
       { path: '/defaultProvider', value: 'github-copilot' },
@@ -706,7 +882,7 @@ test('apply reports package install results in the single packages array without
     { type: 'npm', name: 'fixture-package', version: '1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' },
   ] }, null, 2)}\n`);
   const piEnv = await fakePi(t);
-  const applied = run(['apply', '--approve', '--repo', repo, '--agent-dir', agentDir], piEnv);
+  const applied = runRawWith(cli, ['apply', '--approve-installs', '--json', '--repo', repo, '--agent-dir', agentDir], piEnv);
   assert.equal(applied.status, 0, applied.stderr);
   const output = result(applied);
   assert.equal(Object.hasOwn(output, 'packageInstalls'), false, 'no separate packageInstalls array');
@@ -715,9 +891,9 @@ test('apply reports package install results in the single packages array without
   assert.deepEqual(output.packages, [{ package: 'npm:fixture-package', pin: 'npm:fixture-package@1.0.0', action: 'installed' }]);
 });
 
-test('status, plan, and apply output no longer carry the dependencyModel boilerplate', async (t) => {
+test('status and apply output no longer carry the dependencyModel boilerplate', async (t) => {
   const { repo, agentDir } = await fixture(t);
-  for (const command of ['status', 'plan', 'apply']) {
+  for (const command of ['status', 'apply']) {
     const response = run([command, '--repo', repo, '--agent-dir', agentDir]);
     assert.equal(response.status, 0, `${command}: ${response.stderr}`);
     assert.equal(Object.hasOwn(result(response), 'dependencyModel'), false, `${command} omits dependencyModel`);
@@ -907,7 +1083,7 @@ test('sync previews local-only settings changes and applies them to the manifest
   local.defaultProvider = 'openrouter';
   await fs.writeFile(localPath, `${JSON.stringify(local, null, 2)}\n`);
 
-  const preview = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
+  const preview = run(['sync', '--dry-run', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(preview.status, 0, preview.stderr);
   const plan = result(preview);
   assert.equal(plan.mode, 'preview');
@@ -916,7 +1092,7 @@ test('sync previews local-only settings changes and applies them to the manifest
   const previewManifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
   assert.equal(previewManifest.settings[0].fields.find((field) => field.path === '/theme').value, 'dark', 'preview must not write the manifest');
 
-  const applied = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  const applied = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(applied.status, 0, applied.stderr);
   const output = result(applied);
   assert.equal(output.mode, 'applied');
@@ -928,7 +1104,7 @@ test('sync previews local-only settings changes and applies them to the manifest
   assert.equal(manifest.settings[0].fields.find((field) => field.path === '/theme').value, 'light');
   assert.equal(manifest.settings[0].fields.find((field) => field.path === '/defaultProvider').value, 'openrouter');
 
-  const again = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  const again = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(again.status, 0, again.stderr);
   const idle = result(again);
   assert.deepEqual(idle.synced, []);
@@ -940,7 +1116,7 @@ test('sync previews local-only settings changes and applies them to the manifest
   const local2 = JSON.parse(await fs.readFile(localPath, 'utf8'));
   local2.theme = 'dark';
   await fs.writeFile(localPath, `${JSON.stringify(local2, null, 2)}\n`);
-  const second = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  const second = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(second.status, 0, second.stderr);
   const secondOutput = result(second);
   assert.deepEqual(secondOutput.synced.map((item) => item.path), ['/theme']);
@@ -965,7 +1141,7 @@ test('sync writes eligible fields but never overwrites fields changed in both pl
   manifest.settings[0].fields.find((field) => field.path === '/defaultThinkingLevel').value = 'low';
   await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
-  const applied = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  const applied = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(applied.status, 1, applied.stderr);
   const output = result(applied);
   assert.equal(output.ok, false);
@@ -988,7 +1164,7 @@ test('sync rejects non-portable and suspected-secret local values before writing
   await fs.writeFile(localPath, `${JSON.stringify(local, null, 2)}\n`);
 
   // The suspected secret blocks the whole write, so nothing is synced.
-  const blocked = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  const blocked = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(blocked.status, 1, blocked.stderr);
   assert.equal(result(blocked).errorCode, 'SYNC_BLOCKED');
   assert.match(result(blocked).error, /suspected credential material/);
@@ -1000,7 +1176,7 @@ test('sync rejects non-portable and suspected-secret local values before writing
   const portable = JSON.parse(await fs.readFile(localPath, 'utf8'));
   portable.theme = 'dark';
   await fs.writeFile(localPath, `${JSON.stringify(portable, null, 2)}\n`);
-  const rejected = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  const rejected = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(rejected.status, 1, rejected.stderr);
   const output = result(rejected);
   assert.equal(output.ok, false);
@@ -1015,7 +1191,7 @@ test('sync rejects non-portable and suspected-secret local values before writing
   // The placeholder itself is portable and syncs cleanly.
   portable.providers.local.apiKey = '__PLACEHOLDER__';
   await fs.writeFile(localPath, `${JSON.stringify(portable, null, 2)}\n`);
-  const ok = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  const ok = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(ok.status, 0, ok.stderr);
   assert.deepEqual(result(ok).synced.map((item) => item.path), ['/providers/local']);
   assert.equal(JSON.parse(await fs.readFile(manifestPath, 'utf8')).settings[0].fields.find((field) => field.path === '/providers/local').value.apiKey, '__PLACEHOLDER__');
@@ -1027,7 +1203,7 @@ test('sync reports locally removed managed fields for review without unmanaging 
   delete local.theme;
   await fs.writeFile(localPath, `${JSON.stringify(local, null, 2)}\n`);
 
-  const applied = run(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]);
+  const applied = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(applied.status, 1, applied.stderr);
   const output = result(applied);
   assert.equal(output.ok, false);
@@ -1041,7 +1217,7 @@ test('sync reports locally removed managed fields for review without unmanaging 
 
 test('sync requires an existing agent directory and never writes on preview', async (t) => {
   const { repo, agentDir, manifestPath, localPath } = await settingsFixture(t, [{ path: '/theme', value: 'dark' }]);
-  const missing = run(['sync', '--repo', repo, '--agent-dir', path.join(agentDir, 'nope')]);
+  const missing = run(['sync', '--dry-run', '--repo', repo, '--agent-dir', path.join(agentDir, 'nope')]);
   assert.equal(missing.status, 2);
   assert.match(result(missing).error, /agent directory does not exist/);
 
@@ -1049,17 +1225,17 @@ test('sync requires an existing agent directory and never writes on preview', as
   local.theme = 'light';
   await fs.writeFile(localPath, `${JSON.stringify(local, null, 2)}\n`);
   const manifestBefore = await fs.readFile(manifestPath, 'utf8');
-  const preview = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
+  const preview = run(['sync', '--dry-run', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(preview.status, 0, preview.stderr);
   assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
 });
 
-test('serializes concurrent sync --apply runs the way multiple Pi sessions would trigger them', async (t) => {
+test('serializes concurrent sync runs the way multiple Pi sessions would trigger them', async (t) => {
   const { repo, agentDir, manifestPath, localPath } = await settingsFixture(t, [{ path: '/theme', value: 'dark' }]);
   const local = JSON.parse(await fs.readFile(localPath, 'utf8'));
   local.theme = 'light';
   await fs.writeFile(localPath, `${JSON.stringify(local, null, 2)}\n`);
-  const args = ['sync', '--apply', '--repo', repo, '--agent-dir', agentDir];
+  const args = ['sync', '--repo', repo, '--agent-dir', agentDir];
   const [first, second] = await Promise.all([runAsync(args), runAsync(args)]);
   assert.equal(first.status, 0, first.stderr);
   assert.equal(second.status, 0, second.stderr);
@@ -1069,7 +1245,7 @@ test('serializes concurrent sync --apply runs the way multiple Pi sessions would
   assert.equal(a.synced.length + b.synced.length, 1, 'only one concurrent sync should write the field');
   const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
   assert.equal(manifest.settings[0].fields.find((field) => field.path === '/theme').value, 'light');
-  const idle = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
+  const idle = run(['sync', '--dry-run', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(idle.status, 0, idle.stderr);
   assert.match(result(idle).note, /Nothing to sync/);
 });
@@ -1080,7 +1256,7 @@ test('sync recovers from a torn settings read and fails clearly on genuinely inv
   // A file that stays invalid must still fail clearly: the transient-read
   // retry must not mask a real error, and nothing may be written.
   await fs.writeFile(localPath, '{ "theme": "light"');
-  const invalid = run(['sync', '--repo', repo, '--agent-dir', agentDir]);
+  const invalid = run(['sync', '--dry-run', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(invalid.status, 2);
   assert.match(result(invalid).error, /not valid JSON/);
   assert.equal(JSON.parse(await fs.readFile(manifestPath, 'utf8')).settings[0].fields[0].value, 'dark', 'failed sync must not write the manifest');
@@ -1103,7 +1279,7 @@ test('sync recovers from a torn settings read and fails clearly on genuinely inv
     return false;
   };
   const [repaired, didRepair] = await Promise.all([
-    runAsync(['sync', '--apply', '--repo', repo, '--agent-dir', agentDir]),
+    runAsync(['sync', '--repo', repo, '--agent-dir', agentDir]),
     repair(),
   ]);
   assert.ok(didRepair, 'the CLI read of the torn file should be observable via atime');
@@ -1114,7 +1290,7 @@ test('sync recovers from a torn settings read and fails clearly on genuinely inv
   assert.equal(JSON.parse(await fs.readFile(manifestPath, 'utf8')).settings[0].fields[0].value, 'light');
 });
 
-test('status and plan report the repository publish state for git setups', async (t) => {
+test('status reports the repository publish state for git setups', async (t) => {
   const { root, repo, bare } = await pushFixture(t);
   const agentDir = path.join(root, 'agent');
   await fs.mkdir(agentDir);
@@ -1127,7 +1303,7 @@ test('status and plan report the repository publish state for git setups', async
 
   // Clean at upstream: no dirt, no ahead, no behind.
   assert.deepEqual(statusOutput(run(['status', ...args])).repository, { dirty: false, ahead: 0, behind: 0 });
-  assert.deepEqual(statusOutput(run(['plan', ...args])).repository, { dirty: false, ahead: 0, behind: 0 });
+  assert.deepEqual(statusOutput(run(['status', ...args])).repository, { dirty: false, ahead: 0, behind: 0 });
 
   // Uncommitted manifest change: the tracked tree is dirty.
   await fs.appendFile(manifestPath, '\n');
@@ -1166,11 +1342,11 @@ test('status and plan report the repository publish state for git setups', async
   const { repo: plainRepo, agentDir: plainAgentDir } = await fixture(t);
   const nonGit = statusOutput(run(['status', '--repo', plainRepo, '--agent-dir', plainAgentDir]));
   assert.equal('repository' in nonGit, false);
-  assert.equal('repository' in statusOutput(run(['plan', '--repo', plainRepo, '--agent-dir', plainAgentDir])), false);
+  assert.equal('repository' in statusOutput(run(['status', '--repo', plainRepo, '--agent-dir', plainAgentDir])), false);
   assert.deepEqual(nonGit.summary, { localPending: 0, remotePending: 1, needsReview: 0, clean: false });
 });
 
-test('status and plan fetch the upstream before reporting, touching only git metadata', async (t) => {
+test('status fetches the upstream before reporting, touching only git metadata', async (t) => {
   const { root, repo, bare } = await pushFixture(t);
   const agentDir = path.join(root, 'agent');
   await fs.mkdir(agentDir);
@@ -1196,7 +1372,7 @@ test('status and plan fetch the upstream before reporting, touching only git met
   const indexBefore = gitAt(repo, ['ls-files', '--stage']);
 
   // status and plan each report the fresh behind count with no manual fetch.
-  for (const command of ['status', 'plan']) {
+  for (const command of ['status']) {
     const output = statusOutput(run([command, ...args]));
     assert.deepEqual(output.repository, { dirty: false, ahead: 0, behind: 1 }, command);
     assert.equal(gitAt(repo, ['rev-parse', 'origin/main']), remoteHead, `${command} moved the tracking ref`);
@@ -1209,7 +1385,7 @@ test('status and plan fetch the upstream before reporting, touching only git met
   assert.equal(gitAt(repo, ['status', '--porcelain']), '', 'working tree unchanged');
 });
 
-test('status and plan report an unavailable upstream instead of stale counts when the fetch fails', async (t) => {
+test('status reports an unavailable upstream instead of stale counts when the fetch fails', async (t) => {
   const { root, repo, bare } = await pushFixture(t);
   const agentDir = path.join(root, 'agent');
   await fs.mkdir(agentDir);
@@ -1229,7 +1405,7 @@ test('status and plan report an unavailable upstream instead of stale counts whe
   // The remote becomes unreachable, so every fetch from here on fails.
   gitAt(repo, ['remote', 'set-url', 'origin', path.join(root, 'gone.git')]);
 
-  for (const command of ['status', 'plan']) {
+  for (const command of ['status']) {
     const processResult = run([command, ...args]);
     assert.equal(processResult.status, 0, processResult.stderr);
     const output = result(processResult);
@@ -1260,7 +1436,7 @@ test('an unavailable upstream never reads as a verified-clean summary', async (t
   // remote: the summary must not claim a verified-clean remote state.
   gitAt(repo, ['remote', 'set-url', 'origin', path.join(root, 'gone.git')]);
 
-  for (const command of ['status', 'plan']) {
+  for (const command of ['status']) {
     const output = result(run([command, ...args]));
     assert.deepEqual(output.repository, { dirty: false, ahead: null, behind: null, upstream: 'unavailable' }, command);
     assert.deepEqual(output.summary, { localPending: 0, remotePending: 0, needsReview: 0, clean: false }, command);
@@ -1291,9 +1467,9 @@ test('status --no-fetch accepts last-known tracking refs without fetching', asyn
   assert.equal(gitAt(repo, ['rev-parse', 'origin/main']), trackingBefore, 'the tracking ref was not updated');
 
   // --no-fetch is only meaningful for the inspect commands.
-  const rejected = run(['prune', '--no-fetch', '--repo', repo, '--agent-dir', agentDir]);
+  const rejected = run(['remove', '--stale', '--no-fetch', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(rejected.status, 2);
-  assert.match(JSON.parse(rejected.stdout).error, /--no-fetch is only supported by status and plan/);
+  assert.match(JSON.parse(rejected.stdout).error, /--no-fetch is only supported by status/);
 });
 async function advanceUpstream(t, root, bare, marker) {
   const clone = path.join(root, `second-clone-${marker}`);
@@ -1317,7 +1493,7 @@ test('pull previews upstream changes without modifying the checkout', async (t) 
 
   // pull resolves --repo like the other repository commands and does not
   // require --agent-dir.
-  const processResult = run(['pull', '--repo', repo]);
+  const processResult = run(['pull', '--dry-run', '--repo', repo]);
   assert.equal(processResult.status, 0, processResult.stderr);
   const output = result(processResult);
   assert.equal(output.command, 'pull');
@@ -1333,7 +1509,7 @@ test('pull previews upstream changes without modifying the checkout', async (t) 
   assert.equal(output.dirty, false);
   assert.deepEqual(output.dirtyPaths, []);
   assert.deepEqual(output.changedPaths, ['resources/skills/hello/SKILL.md']);
-  assert.deepEqual(output.nextSteps, ['pi-sync plan', 'pi-sync apply']);
+  assert.deepEqual(output.nextSteps, ['pi-sync status', 'pi-sync apply']);
 
   // Preview is read-only apart from Git metadata: HEAD, the index, and the
   // working-tree contents are untouched, while the tracking ref learned the
@@ -1344,12 +1520,12 @@ test('pull previews upstream changes without modifying the checkout', async (t) 
   assert.equal(await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8'), worktreeBefore);
 });
 
-test('pull --apply fast-forwards a clean branch without merging or rewriting history', async (t) => {
+test('pull fast-forwards a clean branch without merging or rewriting history', async (t) => {
   const { root, repo, bare } = await pushFixture(t);
   const remoteHead = await advanceUpstream(t, root, bare, 'one');
   const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
 
-  const processResult = run(['pull', '--apply', '--repo', repo]);
+  const processResult = runRawWith(cli, ['pull', '--repo', repo, '--json']);
   assert.equal(processResult.status, 0, processResult.stderr);
   const output = result(processResult);
   assert.equal(output.mode, 'applied');
@@ -1359,7 +1535,7 @@ test('pull --apply fast-forwards a clean branch without merging or rewriting his
   assert.equal(output.fromCommit, headBefore);
   assert.equal(output.toCommit, remoteHead);
   assert.deepEqual(output.changedPaths, ['resources/skills/hello/SKILL.md']);
-  assert.deepEqual(output.nextSteps, ['pi-sync plan', 'pi-sync apply']);
+  assert.deepEqual(output.nextSteps, ['pi-sync status', 'pi-sync apply']);
 
   // The branch advanced by fast-forward only: it is at the fetched tip with
   // linear history (no merge commits, first-parent history intact).
@@ -1370,22 +1546,22 @@ test('pull --apply fast-forwards a clean branch without merging or rewriting his
   assert.equal(gitAt(repo, ['status', '--porcelain']), '');
 
   // A repeat apply is an idempotent no-op that still guides the workflow.
-  const again = result(run(['pull', '--apply', '--repo', repo]));
+  const again = result(run(['pull', '--repo', repo]));
   assert.equal(again.mode, 'applied');
   assert.equal(again.upToDate, true);
   assert.deepEqual(again.changedPaths, []);
   assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), remoteHead);
 });
 
-test('pull --apply rechecks upstream before mutating instead of applying a stale preview', async (t) => {
+test('pull rechecks upstream before mutating instead of applying a stale preview', async (t) => {
   const { root, repo, bare } = await pushFixture(t);
   await advanceUpstream(t, root, bare, 'one');
-  const preview = result(run(['pull', '--repo', repo]));
+  const preview = result(run(['pull', '--dry-run', '--repo', repo]));
   assert.equal(preview.behind, 1);
 
   // The upstream advances a second time after the preview was taken.
   const remoteHead = await advanceUpstream(t, root, bare, 'two');
-  const output = result(run(['pull', '--apply', '--repo', repo]));
+  const output = result(run(['pull', '--repo', repo]));
   assert.equal(output.mode, 'applied');
   assert.equal(output.toCommit, remoteHead, 'the fresh tip, not the previewed one, was applied');
   assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), remoteHead);
@@ -1397,7 +1573,7 @@ test('pull treats a local-ahead branch without upstream advancement as up to dat
   gitAt(repo, ['commit', '-am', 'local change']);
   const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
 
-  const preview = result(run(['pull', '--repo', repo]));
+  const preview = result(run(['pull', '--dry-run', '--repo', repo]));
   assert.equal(preview.mode, 'preview');
   assert.equal(preview.ahead, 1);
   assert.equal(preview.behind, 0);
@@ -1405,7 +1581,7 @@ test('pull treats a local-ahead branch without upstream advancement as up to dat
   assert.equal(preview.diverged, false);
   assert.match(preview.note, /pi-sync push/);
 
-  const output = result(run(['pull', '--apply', '--repo', repo]));
+  const output = result(run(['pull', '--repo', repo]));
   assert.equal(output.mode, 'applied');
   assert.equal(output.upToDate, true);
   assert.equal(output.ahead, 1);
@@ -1420,7 +1596,7 @@ test('pull refuses a diverged branch without losing local commits or edits', asy
   await advanceUpstream(t, root, bare, 'one');
 
   // The preview reports the divergence read-only.
-  const preview = result(run(['pull', '--repo', repo]));
+  const preview = result(run(['pull', '--dry-run', '--repo', repo]));
   assert.equal(preview.mode, 'preview');
   assert.equal(preview.ahead, 1);
   assert.equal(preview.behind, 1);
@@ -1428,7 +1604,7 @@ test('pull refuses a diverged branch without losing local commits or edits', asy
   assert.match(preview.note, /Reconcile/);
 
   // The apply refuses and leaves history and worktree intact.
-  const rejected = run(['pull', '--apply', '--repo', repo]);
+  const rejected = run(['pull', '--repo', repo]);
   assert.equal(rejected.status, 1);
   const output = JSON.parse(rejected.stdout);
   assert.equal(output.ok, false);
@@ -1436,7 +1612,7 @@ test('pull refuses a diverged branch without losing local commits or edits', asy
   assert.match(output.error, /diverged/);
   assert.equal(output.details.ahead, 1);
   assert.equal(output.details.behind, 1);
-  assert.deepEqual(output.details.nextSteps, ['pi-sync plan', 'pi-sync apply']);
+  assert.deepEqual(output.details.nextSteps, ['pi-sync status', 'pi-sync apply']);
   assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), localHead, 'HEAD was not moved');
   assert.equal(gitAt(repo, ['status', '--porcelain']), '', 'the local commit and worktree were preserved');
 });
@@ -1465,7 +1641,7 @@ async function failingGit(t, fail) {
   return { PATH: `${bin}${path.delimiter}${process.env.PATH}`, REAL_GIT: realGit, FAKE_GIT_FAIL: fail };
 }
 
-test('pull --apply restores staged, unstaged, and untracked local edits after a clean fast-forward', async (t) => {
+test('pull restores staged, unstaged, and untracked local edits after a clean fast-forward', async (t) => {
   const { root, repo, bare } = await pushFixture(t);
   const remoteHead = await advanceUpstream(t, root, bare, 'one');
   const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
@@ -1479,7 +1655,7 @@ test('pull --apply restores staged, unstaged, and untracked local edits after a 
   const statusBefore = gitAt(repo, ['status', '--porcelain']);
 
   // The preview reports the dirt read-only while still previewing upstream.
-  const preview = result(run(['pull', '--repo', repo]));
+  const preview = result(run(['pull', '--dry-run', '--repo', repo]));
   assert.equal(preview.mode, 'preview');
   assert.equal(preview.dirty, true);
   assert.deepEqual([...preview.dirtyPaths].sort(), ['pi-sync.json', 'resources/skills/hello/SKILL.md', 'scratch.txt']);
@@ -1487,7 +1663,7 @@ test('pull --apply restores staged, unstaged, and untracked local edits after a 
   assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), headBefore, 'preview does not move HEAD');
   assert.equal(gitAt(repo, ['status', '--porcelain']), statusBefore, 'preview leaves index and worktree untouched');
 
-  const processResult = run(['pull', '--apply', '--repo', repo]);
+  const processResult = run(['pull', '--repo', repo]);
   assert.equal(processResult.status, 0, processResult.stderr);
   const output = result(processResult);
   assert.equal(output.mode, 'applied');
@@ -1517,7 +1693,7 @@ test('pull --apply restores staged, unstaged, and untracked local edits after a 
   assert.equal(gitAt(repo, ['stash', 'list']), '');
 });
 
-test('pull --apply combines disjoint local and upstream edits with Git three-way behavior', async (t) => {
+test('pull combines disjoint local and upstream edits with Git three-way behavior', async (t) => {
   const { root, repo, bare } = await pushFixture(t);
   // Grow the base to two committed lines so the local edit (line 1) and the
   // upstream edit (an appended line) land on disjoint lines.
@@ -1529,7 +1705,7 @@ test('pull --apply combines disjoint local and upstream edits with Git three-way
   // The local edit modifies line 1; the upstream appended after line 2.
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Local heading\n# Body\n');
 
-  const processResult = run(['pull', '--apply', '--repo', repo]);
+  const processResult = run(['pull', '--repo', repo]);
   assert.equal(processResult.status, 0, processResult.stderr);
   const output = result(processResult);
   assert.equal(output.mode, 'applied');
@@ -1539,7 +1715,7 @@ test('pull --apply combines disjoint local and upstream edits with Git three-way
   assert.equal(skill, '# Local heading\n# Body\n# Remote update one\n');
 });
 
-test('pull --apply reports overlapping edits as conflicts and retains the recovery snapshot', async (t) => {
+test('pull reports overlapping edits as conflicts and retains the recovery snapshot', async (t) => {
   const { root, repo, bare } = await pushFixture(t);
   const clone = path.join(root, 'second-clone');
   gitAt(root, ['clone', bare, clone]);
@@ -1553,7 +1729,7 @@ test('pull --apply reports overlapping edits as conflicts and retains the recove
   // The local edit touches the same line as the upstream change.
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Local heading\n');
 
-  const rejected = run(['pull', '--apply', '--repo', repo]);
+  const rejected = run(['pull', '--repo', repo]);
   assert.equal(rejected.status, 1);
   const output = JSON.parse(rejected.stdout);
   assert.equal(output.ok, false);
@@ -1564,7 +1740,7 @@ test('pull --apply reports overlapping edits as conflicts and retains the recove
   assert.equal(output.details.snapshot.ref, 'stash@{0}');
   assert.match(output.details.snapshot.message, /^pi-sync: pull snapshot /);
   assert.ok(Array.isArray(output.details.recovery) && output.details.recovery.length > 0);
-  assert.deepEqual(output.details.nextSteps, ['pi-sync plan', 'pi-sync apply']);
+  assert.deepEqual(output.details.nextSteps, ['pi-sync status', 'pi-sync apply']);
 
   // Git's unresolved conflict state is left for the user, and the recovery
   // snapshot is retained (never silently discarded).
@@ -1577,7 +1753,7 @@ test('pull --apply reports overlapping edits as conflicts and retains the recove
   assert.equal(gitAt(repo, ['rev-parse', 'refs/stash']), output.details.snapshot.sha, 'the reported identifier resolves');
 });
 
-test('pull --apply never overwrites a local untracked file that the upstream adds', async (t) => {
+test('pull never overwrites a local untracked file that the upstream adds', async (t) => {
   const { root, repo, bare } = await pushFixture(t);
   const clone = path.join(root, 'second-clone');
   gitAt(root, ['clone', bare, clone]);
@@ -1592,7 +1768,7 @@ test('pull --apply never overwrites a local untracked file that the upstream add
   // A local untracked file at the path the upstream newly tracks.
   await fs.writeFile(path.join(repo, 'scratch.txt'), 'mine\n');
 
-  const rejected = run(['pull', '--apply', '--repo', repo]);
+  const rejected = run(['pull', '--repo', repo]);
   assert.equal(rejected.status, 1);
   const output = JSON.parse(rejected.stdout);
   assert.equal(output.ok, false);
@@ -1611,7 +1787,7 @@ test('pull --apply never overwrites a local untracked file that the upstream add
   assert.match(gitAt(repo, ['stash', 'list']), /pi-sync: pull snapshot/);
 });
 
-test('pull --apply restores the original working state when the fast-forward fails', async (t) => {
+test('pull restores the original working state when the fast-forward fails', async (t) => {
   const { root, repo, bare } = await pushFixture(t);
   await advanceUpstream(t, root, bare, 'one');
   const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
@@ -1623,7 +1799,7 @@ test('pull --apply restores the original working state when the fast-forward fai
   const statusBefore = gitAt(repo, ['status', '--porcelain']);
   const skillBefore = await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8');
 
-  const rejected = run(['pull', '--apply', '--repo', repo], await failingGit(t, 'merge'));
+  const rejected = run(['pull', '--repo', repo], await failingGit(t, 'merge'));
   assert.equal(rejected.status, 1);
   const output = JSON.parse(rejected.stdout);
   assert.equal(output.ok, false);
@@ -1640,13 +1816,13 @@ test('pull --apply restores the original working state when the fast-forward fai
   assert.equal(gitAt(repo, ['stash', 'list']), '', 'the snapshot was discarded after a clean restore');
 });
 
-test('pull --apply retains the recovery snapshot when the restoration fails', async (t) => {
+test('pull retains the recovery snapshot when the restoration fails', async (t) => {
   const { root, repo, bare } = await pushFixture(t);
   const remoteHead = await advanceUpstream(t, root, bare, 'one');
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Hello Local\n');
   await fs.writeFile(path.join(repo, 'scratch.txt'), 'untracked\n');
 
-  const rejected = run(['pull', '--apply', '--repo', repo], await failingGit(t, 'stash-apply'));
+  const rejected = run(['pull', '--repo', repo], await failingGit(t, 'stash-apply'));
   assert.equal(rejected.status, 1);
   const output = JSON.parse(rejected.stdout);
   assert.equal(output.ok, false);
@@ -1661,14 +1837,14 @@ test('pull --apply retains the recovery snapshot when the restoration fails', as
   assert.match(gitAt(repo, ['stash', 'list']), /pi-sync: pull snapshot/);
   assert.equal(gitAt(repo, ['show', `${sha}^3:scratch.txt`]), 'untracked', 'the local untracked content is recoverable (gitAt trims output)');
 });
-test('pull --apply reports the stashed changes and recovery identity when snapshot verification fails', async (t) => {
+test('pull reports the stashed changes and recovery identity when snapshot verification fails', async (t) => {
   const { root, repo, bare } = await pushFixture(t);
   const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
   await advanceUpstream(t, root, bare, 'one');
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Hello Local\n# Hello\n');
   await fs.writeFile(path.join(repo, 'scratch.txt'), 'untracked\n');
 
-  const rejected = run(['pull', '--apply', '--repo', repo], await failingGit(t, 'stash-verify'));
+  const rejected = run(['pull', '--repo', repo], await failingGit(t, 'stash-verify'));
   assert.equal(rejected.status, 1);
   const output = JSON.parse(rejected.stdout);
   assert.equal(output.ok, false);
@@ -1693,13 +1869,13 @@ test('pull --apply reports the stashed changes and recovery identity when snapsh
   assert.equal(gitAt(repo, ['show', `${snapshot.sha}^3:scratch.txt`]), 'untracked', 'the local content is recoverable from the stash (gitAt trims output)');
 });
 
-test('pull --apply retains and reports the recovery snapshot when the drop fails', async (t) => {
+test('pull retains and reports the recovery snapshot when the drop fails', async (t) => {
   const { root, repo, bare } = await pushFixture(t);
   const remoteHead = await advanceUpstream(t, root, bare, 'one');
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Hello Local\n# Hello\n');
   await fs.writeFile(path.join(repo, 'scratch.txt'), 'untracked\n');
 
-  const processResult = run(['pull', '--apply', '--repo', repo], await failingGit(t, 'stash-drop'));
+  const processResult = run(['pull', '--repo', repo], await failingGit(t, 'stash-drop'));
   assert.equal(processResult.status, 0, processResult.stderr);
   const output = result(processResult);
   assert.equal(output.ok, true);
@@ -1718,14 +1894,14 @@ test('pull --apply retains and reports the recovery snapshot when the drop fails
   assert.match(gitAt(repo, ['stash', 'list']), /pi-sync: pull snapshot/);
 });
 
-test('pull --apply is a no-op on an up-to-date branch even when the working tree is dirty', async (t) => {
+test('pull is a no-op on an up-to-date branch even when the working tree is dirty', async (t) => {
   const { root, repo } = await pushFixture(t);
   const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Hello Local\n');
   await fs.writeFile(path.join(repo, 'scratch.txt'), 'untracked\n');
   const statusBefore = gitAt(repo, ['status', '--porcelain']);
 
-  const processResult = run(['pull', '--apply', '--repo', repo]);
+  const processResult = run(['pull', '--repo', repo]);
   assert.equal(processResult.status, 0, processResult.stderr);
   const output = result(processResult);
   assert.equal(output.mode, 'applied');
@@ -1744,7 +1920,7 @@ test('pull refuses missing upstream, detached HEAD, and unsafe repository states
   const { root, repo, bare } = await pushFixture(t);
 
   gitAt(repo, ['checkout', '--detach']);
-  let rejected = run(['pull', '--repo', repo]);
+  let rejected = run(['pull', '--dry-run', '--repo', repo]);
   assert.equal(rejected.status, 1);
   let output = JSON.parse(rejected.stdout);
   assert.equal(output.errorCode, 'PULL_BLOCKED');
@@ -1752,7 +1928,7 @@ test('pull refuses missing upstream, detached HEAD, and unsafe repository states
   gitAt(repo, ['checkout', 'main']);
 
   gitAt(repo, ['branch', '--unset-upstream']);
-  rejected = run(['pull', '--repo', repo]);
+  rejected = run(['pull', '--dry-run', '--repo', repo]);
   assert.equal(rejected.status, 1);
   output = JSON.parse(rejected.stdout);
   assert.equal(output.errorCode, 'PULL_BLOCKED');
@@ -1761,13 +1937,13 @@ test('pull refuses missing upstream, detached HEAD, and unsafe repository states
 
   const plain = path.join(root, 'plain');
   await fs.mkdir(plain);
-  rejected = run(['pull', '--repo', plain]);
+  rejected = run(['pull', '--dry-run', '--repo', plain]);
   assert.equal(rejected.status, 1);
   output = JSON.parse(rejected.stdout);
   assert.equal(output.errorCode, 'PULL_BLOCKED');
   assert.match(output.error, /Git working tree/);
 
-  rejected = run(['pull', '--repo', path.join(repo, 'resources')]);
+  rejected = run(['pull', '--dry-run', '--repo', path.join(repo, 'resources')]);
   assert.equal(rejected.status, 1);
   output = JSON.parse(rejected.stdout);
   assert.equal(output.errorCode, 'PULL_BLOCKED');
@@ -1779,7 +1955,7 @@ test('pull refuses when the upstream fetch fails', async (t) => {
   const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
   gitAt(repo, ['remote', 'set-url', 'origin', path.join(root, 'does-not-exist.git')]);
 
-  const rejected = run(['pull', '--repo', repo]);
+  const rejected = run(['pull', '--dry-run', '--repo', repo]);
   assert.equal(rejected.status, 1);
   const output = JSON.parse(rejected.stdout);
   assert.equal(output.ok, false);
@@ -1791,18 +1967,18 @@ test('pull refuses when the upstream fetch fails', async (t) => {
 
 test('pull rejects unsupported flag combinations', async (t) => {
   const { repo } = await pushFixture(t);
-  let rejected = run(['pull', '--repo', repo, '--no-fetch']);
+  let rejected = run(['pull', '--dry-run', '--repo', repo, '--no-fetch']);
   assert.equal(rejected.status, 2);
-  assert.match(JSON.parse(rejected.stdout).error, /--no-fetch is only supported by status and plan/);
-  rejected = run(['pull', '--repo', repo, '--publish']);
+  assert.match(JSON.parse(rejected.stdout).error, /--no-fetch is only supported by status/);
+  rejected = runRawWith(cli, ['pull', '--repo', repo, '--publish', '--json']);
   assert.equal(rejected.status, 2);
-  assert.match(JSON.parse(rejected.stdout).error, /--publish is only supported by push/);
-  rejected = run(['pull', '--repo', repo, '--approve']);
+  assert.match(JSON.parse(rejected.stdout).error, /--publish is no longer supported/);
+  rejected = runRawWith(cli, ['pull', '--repo', repo, '--approve', '--json']);
   assert.equal(rejected.status, 2);
-  assert.match(JSON.parse(rejected.stdout).error, /--approve is only supported by/);
+  assert.match(JSON.parse(rejected.stdout).error, /--approve is no longer supported/);
 });
 
-test('status and plan carry the sync preview classification without writing or locking', async (t) => {
+test('status carries the sync preview classification without writing or locking', async (t) => {
   const { repo, agentDir, manifestPath, localPath } = await settingsFixture(t, [
     { path: '/theme', value: 'dark' },
     { path: '/defaultProvider', value: 'github-copilot' },
@@ -1822,7 +1998,7 @@ test('status and plan carry the sync preview classification without writing or l
   manifest.settings[0].fields.find((field) => field.path === '/defaultProvider').value = 'acme';
   await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
-  const preview = result(run(['sync', '--repo', repo, '--agent-dir', agentDir]));
+  const preview = result(run(['sync', '--dry-run', '--repo', repo, '--agent-dir', agentDir]));
   assert.equal(preview.syncable.length, 1);
   assert.equal(preview.conflicts.length, 1);
   assert.equal(preview.rejected.length, 1);
@@ -1835,7 +2011,7 @@ test('status and plan carry the sync preview classification without writing or l
     state: await fs.readFile(path.join(agentDir, '.pi-sync', 'state.json'), 'utf8'),
     local: await fs.readFile(localPath, 'utf8'),
   };
-  for (const command of ['status', 'plan']) {
+  for (const command of ['status']) {
     const processResult = run([command, '--repo', repo, '--agent-dir', agentDir]);
     // The conflicted field is an operational conflict: exit 1, as before.
     assert.equal(processResult.status, 1, processResult.stderr);
@@ -1873,7 +2049,7 @@ test('summary local pending combines syncable fields, repository dirt, and ahead
   assert.deepEqual(output.repository, { dirty: true, ahead: 1, behind: 0 });
   assert.deepEqual(output.sync.syncable.map((item) => item.path), ['/theme']);
   assert.deepEqual(output.summary, { localPending: 3, remotePending: 0, needsReview: 0, clean: false });
-  const plan = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  const plan = run(['status', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(plan.status, 0, plan.stderr);
   assert.deepEqual(result(plan).summary, output.summary);
 });
@@ -1967,7 +2143,7 @@ test('rejects source traversal before applying', async (t) => {
 test('add imports only the explicitly selected skill and updates the manifest', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const localSkill = path.join(agentDir, 'skills', 'local-only');
-  const added = run(['add', '--type', 'skill', '--source', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
+  const added = run(['add', '--target', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(added.status, 0, added.stderr);
   const output = result(added);
   assert.equal(output.action, 'added');
@@ -1979,38 +2155,38 @@ test('add imports only the explicitly selected skill and updates the manifest', 
   await assert.rejects(fs.access(path.join(repo, 'resources', 'skills', 'hello', 'local-only')));
 });
 
-test('add rejects unsupported types, collisions, and suspected credential material without importing', async (t) => {
+test('add rejects the removed type flag, invalid target roots, collisions, and suspected credential material without importing', async (t) => {
   const { repo, agentDir } = await fixture(t);
-  const unsupported = run(['add', '--type', 'theme', '--source', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
+  const unsupported = runRawWith(cli, ['add', '--type', 'theme', '--target', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir, '--json']);
   assert.equal(unsupported.status, 2);
-  assert.match(result(unsupported).error, /Unsupported resource type/);
+  assert.match(JSON.parse(unsupported.stdout).error, /Unknown option: --type/);
 
-  const wrongRoot = run(['add', '--type', 'extension', '--source', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
+  const wrongRoot = runRawWith(cli, ['add', '--target', 'unknown/local-only', '--repo', repo, '--agent-dir', agentDir, '--json']);
   assert.equal(wrongRoot.status, 2);
-  assert.match(result(wrongRoot).error, /Extension source must be a file or directory under extensions\//);
+  assert.match(JSON.parse(wrongRoot.stdout).error, /--target must identify a resource/);
 
   await fs.mkdir(path.join(repo, 'resources', 'skills', 'local-only'), { recursive: true });
-  const collision = run(['add', '--type', 'skill', '--source', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
+  const collision = run(['add', '--target', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(collision.status, 2);
   const collisionOutput = result(collision);
   assert.match(collisionOutput.error, /collision/i);
-  assert.equal(collisionOutput.apiVersion, 1);
+  assert.equal(collisionOutput.apiVersion, 2);
   assert.equal(collisionOutput.ok, false);
   assert.equal(collisionOutput.errorCode, 'RESOURCE_COLLISION');
-  assert.deepEqual(collisionOutput.details, { type: 'skill', source: 'skills/local-only', target: 'skills/local-only', repositorySource: 'resources/skills/local-only' });
+  assert.deepEqual(collisionOutput.details, { localPath: path.join(agentDir, 'skills', 'local-only'), repositoryPath: path.join(repo, 'resources', 'skills', 'local-only') });
   await fs.rm(path.join(repo, 'resources', 'skills', 'local-only'), { recursive: true });
 
   await fs.mkdir(path.join(agentDir, 'skills', 'local-only', 'credentials'), { recursive: true });
-  const credentialPath = run(['add', '--type', 'skill', '--source', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
+  const credentialPath = run(['add', '--target', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(credentialPath.status, 2);
   assert.match(result(credentialPath).reviewRequired[0].reason, /known credential-store path/);
   await fs.rm(path.join(agentDir, 'skills', 'local-only', 'credentials'), { recursive: true });
 
   await fs.writeFile(path.join(agentDir, 'skills', 'local-only', 'notes.md'), 'Example token: ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ\n');
-  const secret = run(['add', '--type', 'skill', '--source', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
+  const secret = run(['add', '--target', 'skills/local-only', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(secret.status, 2);
   const secretOutput = result(secret);
-  assert.equal(secretOutput.apiVersion, 1);
+  assert.equal(secretOutput.apiVersion, 2);
   assert.equal(secretOutput.ok, false);
   assert.equal(secretOutput.exitCode, 2);
   assert.deepEqual(secretOutput.details.reviewRequired, secretOutput.reviewRequired);
@@ -2022,7 +2198,7 @@ test('add rejects unsupported types, collisions, and suspected credential materi
   assert.equal(unchangedManifest.resources.length, 1);
 });
 
-test('reports stale resources without deleting them and prunes only on explicit confirmation', async (t) => {
+test('reports stale resources without deleting them and removes them with remove --stale', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const applied = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(applied.status, 0, applied.stderr);
@@ -2031,7 +2207,7 @@ test('reports stale resources without deleting them and prunes only on explicit 
   manifest.resources = [];
   await fs.writeFile(manifestPath, JSON.stringify(manifest));
 
-  const planned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  const planned = run(['status', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(planned.status, 0, planned.stderr);
   assert.deepEqual(result(planned).staleResources, [{ target: 'skills/hello', state: 'unchanged', installed: true, pruneAvailable: true }]);
   const ordinaryApply = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
@@ -2039,13 +2215,13 @@ test('reports stale resources without deleting them and prunes only on explicit 
   assert.equal(result(ordinaryApply).actions[0].action, 'stale');
   assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'hello', 'SKILL.md'), 'utf8'), '# Hello\n');
 
-  const preview = run(['prune', '--repo', repo, '--agent-dir', agentDir]);
+  const preview = run(['remove', '--stale', '--dry-run', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(preview.status, 0, preview.stderr);
   assert.equal(result(preview).mode, 'preview');
   assert.deepEqual(result(preview).staleResources[0], { target: 'skills/hello', action: 'would-prune', installed: true });
   await fs.access(path.join(agentDir, 'skills', 'hello', 'SKILL.md'));
 
-  const pruned = run(['prune', '--confirm', '--repo', repo, '--agent-dir', agentDir]);
+  const pruned = run(['remove', '--stale', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(pruned.status, 0, pruned.stderr);
   assert.equal(result(pruned).staleResources[0].action, 'pruned');
   await assert.rejects(fs.access(path.join(agentDir, 'skills', 'hello')));
@@ -2057,7 +2233,7 @@ test('reports stale resources without deleting them and prunes only on explicit 
   assert.equal(Object.hasOwn(state.resources, 'skills/hello'), false);
 });
 
-test('confirmed prune retains a stale parent target that overlaps a currently managed nested target', async (t) => {
+test('remove --stale retains a stale parent target that overlaps a currently managed nested target', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
@@ -2083,11 +2259,11 @@ test('confirmed prune retains a stale parent target that overlaps a currently ma
   assert.deepEqual(staleAction.overlaps, ['skills/foo/bar']);
   assert.equal(staleAction.pruneAvailable, false);
 
-  const preview = run(['prune', '--repo', repo, '--agent-dir', agentDir]);
+  const preview = run(['remove', '--stale', '--dry-run', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(preview.status, 1);
   assert.deepEqual(result(preview).staleResources, [{ target: 'skills/foo', action: 'retained-overlap',
     installed: true, overlaps: ['skills/foo/bar'] }]);
-  const confirmed = run(['prune', '--confirm', '--repo', repo, '--agent-dir', agentDir]);
+  const confirmed = run(['remove', '--stale', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(confirmed.status, 1);
   assert.deepEqual(result(confirmed).staleResources, [{ target: 'skills/foo', action: 'retained-overlap',
     installed: true, overlaps: ['skills/foo/bar'] }]);
@@ -2097,7 +2273,7 @@ test('confirmed prune retains a stale parent target that overlaps a currently ma
   assert.ok(state.resources['skills/foo/bar'], 'currently managed nested target remains state-managed');
 });
 
-test('confirmed prune retains case-variant stale/current nested targets on Windows filesystems', async (t) => {
+test('remove --stale retains case-variant stale/current nested targets on Windows filesystems', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
@@ -2120,11 +2296,11 @@ test('confirmed prune retains case-variant stale/current nested targets on Windo
   assert.deepEqual(output.staleResources, [{ target: 'skills/foo', state: 'overlaps-current', installed: true,
     pruneAvailable: false, overlaps: ['skills/FOO/child'] }]);
 
-  const preview = run(['prune', '--repo', repo, '--agent-dir', agentDir]);
+  const preview = run(['remove', '--stale', '--dry-run', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(preview.status, 1);
   assert.deepEqual(result(preview).staleResources, [{ target: 'skills/foo', action: 'retained-overlap',
     installed: true, overlaps: ['skills/FOO/child'] }]);
-  const confirmed = run(['prune', '--confirm', '--repo', repo, '--agent-dir', agentDir]);
+  const confirmed = run(['remove', '--stale', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(confirmed.status, 1);
   assert.deepEqual(result(confirmed).staleResources, [{ target: 'skills/foo', action: 'retained-overlap',
     installed: true, overlaps: ['skills/FOO/child'] }]);
@@ -2134,14 +2310,14 @@ test('confirmed prune retains case-variant stale/current nested targets on Windo
   assert.ok(state.resources['skills/FOO/child']);
 });
 
-test('prune preserves stale resources with local edits and reports why', async (t) => {
+test('remove --stale preserves stale resources with local edits and reports why', async (t) => {
   const { repo, agentDir } = await fixture(t);
   assert.equal(run(['apply', '--repo', repo, '--agent-dir', agentDir]).status, 0);
   const manifest = JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8'));
   manifest.resources = [];
   await fs.writeFile(path.join(repo, 'pi-sync.json'), JSON.stringify(manifest));
   await fs.writeFile(path.join(agentDir, 'skills', 'hello', 'SKILL.md'), '# Keep my local work\n');
-  const prune = run(['prune', '--confirm', '--repo', repo, '--agent-dir', agentDir]);
+  const prune = run(['remove', '--stale', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(prune.status, 1);
   assert.equal(result(prune).staleResources[0].action, 'retained-modified');
   assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'hello', 'SKILL.md'), 'utf8'), '# Keep my local work\n');
@@ -2292,7 +2468,7 @@ test('bootstrap fails closed when a downloaded archive mismatches the pinned dig
   const preload = path.join(root, 'fake-fetch.mjs');
   await fs.writeFile(preload, `import fs from 'node:fs/promises';\nglobalThis.fetch = async (url) => { if (!String(url).startsWith('https://github.com/cli/cli/releases/download/')) throw new Error('unexpected URL'); return new Response(await fs.readFile(process.env.FAKE_RELEASE_ARCHIVE), { status: 200 }); };\n`);
   const binDir = path.join(root, 'user-bin');
-  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', path.join(root, 'checkout'), '--agent-dir', path.join(root, 'agent'), '--bin-dir', binDir], {
+  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', path.join(root, 'checkout'), '--agent-dir', path.join(root, 'agent'), '--bin-dir', binDir], {
     PATH: gitBin, FAKE_SETUP_REPO: sourceRepo, FAKE_GIT_ACCESS: 'yes', FAKE_RELEASE_ARCHIVE: archivePath,
     NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
   });
@@ -2315,7 +2491,7 @@ test('bootstrap permission/path failure returns an actionable prerequisite hando
   await fs.copyFile(path.join(fakeTools.PATH.split(path.delimiter)[0], 'git'), path.join(gitBin, 'git'));
   const notDirectory = path.join(root, 'not-a-bin-directory');
   await fs.writeFile(notDirectory, 'keep this user file');
-  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', path.join(root, 'checkout'), '--agent-dir', path.join(root, 'agent'), '--bin-dir', notDirectory], {
+  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', path.join(root, 'checkout'), '--agent-dir', path.join(root, 'agent'), '--bin-dir', notDirectory], {
     PATH: gitBin, FAKE_GIT_ACCESS: 'no',
   });
   assert.equal(response.status, 1, `${response.stderr}\n${response.stdout}`);
@@ -2329,6 +2505,23 @@ test('bootstrap permission/path failure returns an actionable prerequisite hando
   assert.doesNotMatch(response.stdout, /\"command\":\s*\"sudo\"/);
 });
 
+test('push acts by default while --dry-run preserves the commit and remote refs', async (t) => {
+  const { repo, bare } = await pushFixture(t);
+  const managed = path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md');
+  await fs.writeFile(managed, '# Action-default push\n');
+  const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
+  const remoteBefore = gitAt(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0];
+  const preview = runRawWith(cli, ['push', '--dry-run', '--json', '--repo', repo]);
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.equal(JSON.parse(preview.stdout).mode, 'preview');
+  assert.equal(gitAt(repo, ['rev-parse', 'HEAD']), headBefore);
+  assert.equal(gitAt(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0], remoteBefore);
+  const published = runRawWith(cli, ['push', '--json', '--repo', repo]);
+  assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
+  assert.equal(JSON.parse(published.stdout).mode, 'published');
+  assert.notEqual(gitAt(repo, ['rev-parse', 'HEAD']), headBefore);
+  assert.notEqual(gitAt(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0], remoteBefore);
+});
 test('push preview and publish include only explicit managed, non-ignored paths and preserve unrelated staging', async (t) => {
   const { repo, bare } = await pushFixture(t);
   const ignoredFile = path.join(repo, 'resources', 'skills', 'hello', 'ignored.txt');
@@ -2343,7 +2536,7 @@ test('push preview and publish include only explicit managed, non-ignored paths 
   await fs.writeFile(path.join(repo, 'unrelated.txt'), 'unrelated content\n');
   gitAt(repo, ['add', '--', 'unrelated.txt']);
 
-  const preview = run(['push', '--repo', repo]);
+  const preview = run(['push', '--dry-run', '--repo', repo]);
   assert.equal(preview.status, 0, `${preview.stderr}\n${preview.stdout}`);
   const plan = result(preview);
   assert.equal(plan.mode, 'preview');
@@ -2354,10 +2547,10 @@ test('push preview and publish include only explicit managed, non-ignored paths 
   assert.doesNotMatch(plan.patch, /ignored content changed/);
   assert.match(gitAt(repo, ['diff', '--cached', '--name-only']), /^unrelated\.txt$/);
 
-  const published = run(['push', '--publish', '--repo', repo]);
+  const published = run(['push', '--repo', repo]);
   assert.equal(published.status, 0, published.stderr);
-  assert.match(published.stderr, /managed commit preview \(before publication\)/);
-  assert.match(published.stderr, /Edited skill/);
+  assert.equal(published.stderr, '', 'a successful bare push writes nothing to stderr');
+  assert.doesNotMatch(published.stdout, /Edited skill/, 'the published result carries no diff content');
   const output = result(published);
   assert.equal(output.mode, 'published');
   assert.equal(output.forcePush, false);
@@ -2373,13 +2566,13 @@ test('push publishes the managed EOL policy file and accepts ahead commits touch
   const { repo, bare } = await pushFixture(t);
   // Bootstrap-style adoption: the policy file appears untracked in the working tree.
   await fs.writeFile(path.join(repo, '.gitattributes'), '* text=auto eol=lf\n');
-  const preview = run(['push', '--repo', repo]);
+  const preview = run(['push', '--dry-run', '--repo', repo]);
   assert.equal(preview.status, 0, `${preview.stderr}\n${preview.stdout}`);
   const plan = result(preview);
   assert.deepEqual(plan.changes.map((item) => item.path), ['.gitattributes']);
   assert.equal(plan.commitRequired, true);
 
-  const published = run(['push', '--publish', '--repo', repo]);
+  const published = run(['push', '--repo', repo]);
   assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
   const output = result(published);
   assert.equal(output.mode, 'published');
@@ -2392,42 +2585,64 @@ test('push publishes the managed EOL policy file and accepts ahead commits touch
   await fs.writeFile(path.join(repo, '.gitattributes'), '* text=auto eol=lf\n# managed by pi-sync\n');
   gitAt(repo, ['add', '--', '.gitattributes']);
   gitAt(repo, ['commit', '-m', 'annotate policy']);
-  const republished = run(['push', '--publish', '--repo', repo]);
+  const republished = run(['push', '--repo', repo]);
   assert.equal(republished.status, 0, `${republished.stderr}\n${republished.stdout}`);
   const republishedOutput = result(republished);
   assert.equal(republishedOutput.mode, 'published');
   assert.deepEqual(republishedOutput.changes.map((item) => item.path), ['.gitattributes']);
 });
 
-test('published push output omits the patch text and reports a digest of the stderr preview', async (t) => {
-  const { repo } = await pushFixture(t);
-  await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Edited skill\n');
-  const published = run(['push', '--publish', '--repo', repo]);
-  assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
-  const output = result(published);
-  assert.equal(output.mode, 'published');
-  assert.equal(Object.hasOwn(output, 'patch'), false, 'publish JSON no longer embeds the patch text');
-  assert.match(output.patchSha256, /^[0-9a-f]{64}$/);
-  assert.ok(output.patchBytes > 0);
-  // The digest describes the exact patch text the stderr preview rendered:
-  // the text after the pre-publication preview header line.
-  const header = 'Pi Sync managed commit preview (before publication):\n';
-  const index = published.stderr.indexOf(header);
-  assert.ok(index >= 0, published.stderr);
-  const rendered = published.stderr.slice(index + header.length).replace(/\n$/, '');
-  assert.equal(output.patchSha256, createHash('sha256').update(rendered, 'utf8').digest('hex'));
-  assert.equal(output.patchBytes, Buffer.byteLength(rendered, 'utf8'));
-  // The stderr preview still carries the changed content; none of the patch
-  // content lines leak into the stdout JSON.
-  assert.match(published.stderr, /Edited skill/);
-  assert.doesNotMatch(published.stdout, /diff --git/);
-  assert.doesNotMatch(published.stdout, /Edited skill/);
-  assert.doesNotMatch(published.stdout, /# Hello/);
+test('published push reports the short confirmation with no diff or digest in every tier', async (t) => {
+  // JSON tier: the published result carries the confirmation content and no
+  // diff or digest fields; the dry-run preview keeps the full diff on stdout.
+  {
+    const { repo, bare } = await pushFixture(t);
+    await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Edited skill\n');
+    const preview = run(['push', '--dry-run', '--repo', repo]);
+    assert.equal(preview.status, 0, `${preview.stderr}\n${preview.stdout}`);
+    assert.equal(preview.stderr, '', 'the dry-run preview writes nothing to stderr');
+    const previewOutput = result(preview);
+    assert.equal(previewOutput.mode, 'preview');
+    assert.match(previewOutput.patch, /Edited skill/, 'the full managed diff is the preview decision payload on stdout');
+    const published = run(['push', '--repo', repo]);
+    assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
+    assert.equal(published.stderr, '', 'a successful bare push writes nothing to stderr');
+    const output = result(published);
+    assert.equal(output.mode, 'published');
+    assert.match(output.commit, /^[0-9a-f]{40}$/, 'the published commit is reported');
+    assert.equal(output.branch, 'main');
+    assert.equal(output.upstream, 'origin/main');
+    assert.deepEqual(output.changes.map((item) => item.path), ['resources/skills/hello/SKILL.md']);
+    assert.equal(Object.hasOwn(output, 'patch'), false, 'no patch text in the published result');
+    assert.equal(Object.hasOwn(output, 'patchSha256'), false, 'no digest field in the published result');
+    assert.equal(Object.hasOwn(output, 'patchBytes'), false, 'no digest field in the published result');
+    assert.doesNotMatch(published.stdout, /Edited skill/, 'no diff content in the published result');
+    // The published commit landed on the bare upstream.
+    const remote = spawnSync('git', ['--git-dir', bare, 'rev-parse', 'main'], { encoding: 'utf8' });
+    assert.equal(remote.status, 0, remote.stderr);
+    assert.equal(remote.stdout.trim(), output.commit);
+  }
+  // Text tier: the same short confirmation, one fact per line, no diff or digest.
+  {
+    const { repo } = await pushFixture(t);
+    await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Edited skill\n');
+    const published = runRawWith(cli, ['push', '--repo', repo]);
+    assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
+    assert.equal(published.stderr, '', 'the text-tier push writes nothing to stderr');
+    assert.match(published.stdout, /^ok$/m);
+    assert.match(published.stdout, /commit: [0-9a-f]{40}/, 'the text tier reports the published commit');
+    assert.match(published.stdout, /branch: main/);
+    assert.match(published.stdout, /upstream: origin\/main/);
+    assert.match(published.stdout, /path: resources\/skills\/hello\/SKILL\.md/, 'the text tier lists the changed managed path');
+    assert.doesNotMatch(published.stdout, /Edited skill/, 'no diff content in the text tier');
+    assert.doesNotMatch(published.stdout, /patchSha256/);
+    assert.doesNotMatch(published.stdout, /diff --git/);
+  }
 });
 
 test('publish with no managed changes reports an empty result without patch or digest fields', async (t) => {
   const { repo } = await pushFixture(t);
-  const published = run(['push', '--publish', '--repo', repo]);
+  const published = run(['push', '--repo', repo]);
   assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
   const output = result(published);
   assert.equal(output.mode, 'published');
@@ -2438,12 +2653,65 @@ test('publish with no managed changes reports an empty result without patch or d
   assert.equal(Object.hasOwn(output, 'patchBytes'), false);
   assert.equal(published.stderr, '');
 });
+test('bare update installing a mature pin followed by a bare push publishes the lockfile change', async (t) => {
+  const { root, repo, bare } = await pushFixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const lockPath = path.join(repo, 'pi-sync.lock.json');
+  // Declare the dependency at an older pin and commit it, so the follow-on
+  // push publishes only the lockfile change the update produces.
+  await fs.writeFile(manifestPath, JSON.stringify({ schemaVersion: 1,
+    resources: [{ type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' }],
+    dependencies: [{ type: 'npm', name: 'fixture-package' }],
+    policy: { minimumReleaseAgeDays: 7 } }, null, 2) + '\n');
+  await fs.writeFile(lockPath, JSON.stringify({ schemaVersion: 1, packages: [
+    { type: 'npm', name: 'fixture-package', version: '1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' },
+  ] }, null, 2) + '\n');
+  gitAt(repo, ['add', '--all']);
+  gitAt(repo, ['commit', '-m', 'declare dependency at initial pin']);
+  gitAt(repo, ['push', 'origin', 'main']);
+
+  // The agent directory already has the initial pin installed, so a bare
+  // update needs no first-time-install approval.
+  const agentDir = path.join(root, 'agent');
+  await fs.mkdir(path.join(agentDir, '.pi-sync'), { recursive: true });
+  await fs.writeFile(path.join(agentDir, '.pi-sync', 'packages.json'), JSON.stringify({ schemaVersion: 1, packages: { 'npm:fixture-package': '1.0.0' } }, null, 2) + '\n');
+
+  const piEnv = await fakePi(t);
+  const npmBin = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-fake-npm-'));
+  t.after(() => fs.rm(npmBin, { recursive: true, force: true }));
+  const npmScript = `#!${process.execPath}\nconst a=process.argv.slice(2);\nif(a[0]==='view'&&a[2]==='versions'&&a[3]==='--json'){console.log(JSON.stringify(['1.0.0','2.0.0']));process.exit(0);}\nif(a[0]==='view'&&a[2]==='time'&&a[3]==='--json'){console.log(JSON.stringify({'1.0.0':'2020-01-01T00:00:00.000Z','2.0.0':'2020-06-01T00:00:00.000Z'}));process.exit(0);}\nprocess.exit(2);\n`;
+  await fs.writeFile(path.join(npmBin, 'npm'), npmScript, { mode: 0o755 });
+  const env = { PATH: `${npmBin}${path.delimiter}${piEnv.PATH}` };
+
+  const updated = run(['update', '--repo', repo, '--agent-dir', agentDir], env);
+  assert.equal(updated.status, 0, `${updated.stderr}\n${updated.stdout}`);
+  assert.equal(updated.stderr, '', 'update writes nothing to stderr in normal operation');
+  const updateOutput = result(updated);
+  assert.equal(updateOutput.mode, 'applied');
+  assert.deepEqual(JSON.parse(await fs.readFile(lockPath, 'utf8')).packages,
+    [{ type: 'npm', name: 'fixture-package', version: '2.0.0', releasedAt: '2020-06-01T00:00:00.000Z' }]);
+
+  const published = run(['push', '--repo', repo]);
+  assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
+  assert.equal(published.stderr, '', 'the follow-on bare push writes nothing to stderr');
+  const pushed = result(published);
+  assert.equal(pushed.mode, 'published');
+  assert.deepEqual(pushed.changes.map((item) => item.path), ['pi-sync.lock.json']);
+  assert.equal(Object.hasOwn(pushed, 'patch'), false);
+  assert.equal(Object.hasOwn(pushed, 'patchSha256'), false);
+  assert.equal(Object.hasOwn(pushed, 'patchBytes'), false);
+  assert.doesNotMatch(published.stdout, /2\.0\.0/, 'the published result carries no diff content');
+  const remoteLock = spawnSync('git', ['--git-dir', bare, 'show', 'main:pi-sync.lock.json'], { encoding: 'utf8' });
+  assert.equal(remoteLock.status, 0, remoteLock.stderr);
+  assert.deepEqual(JSON.parse(remoteLock.stdout).packages,
+    [{ type: 'npm', name: 'fixture-package', version: '2.0.0', releasedAt: '2020-06-01T00:00:00.000Z' }]);
+});
 test('push --message reports the effective subject in preview and creates the commit with it', async (t) => {
   const { repo } = await pushFixture(t);
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Edited skill\n');
   const message = 'Refresh the hello skill for the deploy guide';
 
-  const preview = run(['push', '--message', message, '--repo', repo]);
+  const preview = run(['push', '--dry-run', '--message', message, '--repo', repo]);
   assert.equal(preview.status, 0, `${preview.stderr}\n${preview.stdout}`);
   const plan = result(preview);
   assert.equal(plan.mode, 'preview');
@@ -2452,7 +2720,7 @@ test('push --message reports the effective subject in preview and creates the co
   // The preview authorizes nothing: no commit exists and nothing was published.
   assert.equal(gitAt(repo, ['rev-list', '--count', '@{upstream}..HEAD']), '0');
 
-  const published = run(['push', '--publish', '--message', message, '--repo', repo]);
+  const published = run(['push', '--message', message, '--repo', repo]);
   assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
   const output = result(published);
   assert.equal(output.mode, 'published');
@@ -2465,13 +2733,13 @@ test('push without --message keeps the default subject and reports it as the eff
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Edited skill\n');
   const defaultSubject = 'pi-sync: publish managed setup';
 
-  const preview = run(['push', '--repo', repo]);
+  const preview = run(['push', '--dry-run', '--repo', repo]);
   assert.equal(preview.status, 0, `${preview.stderr}\n${preview.stdout}`);
   const plan = result(preview);
   assert.equal(plan.commitRequired, true);
   assert.equal(plan.commitMessage, defaultSubject, 'the default subject remains the effective message');
 
-  const published = run(['push', '--publish', '--repo', repo]);
+  const published = run(['push', '--repo', repo]);
   assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
   const output = result(published);
   assert.equal(output.commitMessage, defaultSubject);
@@ -2482,12 +2750,12 @@ test('push --message has no effect when no new managed-only commit is created', 
   const { repo } = await pushFixture(t);
   // Publishing with nothing to commit: no commit is created and the message
   // must not appear in the output at all.
-  const idle = run(['push', '--publish', '--message', 'Should not appear', '--repo', repo]);
+  const idle = run(['push', '--message', 'Should not appear', '--repo', repo]);
   assert.equal(idle.status, 0, `${idle.stderr}\n${idle.stdout}`);
   const idleOutput = result(idle);
   assert.equal(idleOutput.commit, null);
   assert.equal(Object.hasOwn(idleOutput, 'commitMessage'), false);
-  const idlePreview = run(['push', '--message', 'Should not appear', '--repo', repo]);
+  const idlePreview = run(['push', '--dry-run', '--message', 'Should not appear', '--repo', repo]);
   assert.equal(idlePreview.status, 0, `${idlePreview.stderr}\n${idlePreview.stdout}`);
   assert.equal(result(idlePreview).commitRequired, false);
   assert.equal(Object.hasOwn(result(idlePreview), 'commitMessage'), false);
@@ -2497,7 +2765,7 @@ test('push --message has no effect when no new managed-only commit is created', 
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Committed edit\n');
   gitAt(repo, ['add', '--', 'resources/skills/hello']);
   gitAt(repo, ['commit', '-m', 'an existing local commit']);
-  const published = run(['push', '--publish', '--message', 'Should not appear', '--repo', repo]);
+  const published = run(['push', '--message', 'Should not appear', '--repo', repo]);
   assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
   const output = result(published);
   assert.equal(output.mode, 'published');
@@ -2513,7 +2781,7 @@ test('push --message passes the subject as a process argument, not shell-interpo
   t.after(() => fs.rm(markerDir, { recursive: true, force: true }));
   const marker = path.join(markerDir, 'executed');
   const message = `subject with "quotes", $(touch ${marker}), and ; semicolons`;
-  const published = run(['push', '--publish', '--message', message, '--repo', repo]);
+  const published = run(['push', '--message', message, '--repo', repo]);
   assert.equal(published.status, 0, `${published.stderr}\n${published.stdout}`);
   assert.equal(gitAt(repo, ['log', '-1', '--format=%s']), message, 'shell metacharacters are not interpreted');
   assert.equal(result(published).commitMessage, message);
@@ -2525,22 +2793,22 @@ test('push --message rejects empty and whitespace-only subjects and unsupported 
   const agentDir = path.join(root, 'agent');
   await fs.mkdir(agentDir, { recursive: true });
 
-  const empty = run(['push', '--message', '', '--repo', repo]);
+  const empty = run(['push', '--dry-run', '--message', '', '--repo', repo]);
   assert.equal(empty.status, 2, empty.stderr);
   assert.equal(result(empty).errorCode, 'VALIDATION_ERROR');
   assert.match(result(empty).error, /--message requires a value/);
 
-  const blank = run(['push', '--message', '   ', '--repo', repo]);
+  const blank = run(['push', '--dry-run', '--message', '   ', '--repo', repo]);
   assert.equal(blank.status, 2, blank.stderr);
   assert.match(result(blank).error, /--message must not be empty/);
 
   const unrelated = run(['status', '--message', 'a subject', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(unrelated.status, 2, unrelated.stderr);
-  assert.match(result(unrelated).error, /--message is only supported by push and update --apply --push/);
+  assert.match(result(unrelated).error, /--message is only supported by push/);
 
-  const updateNoPush = run(['update', '--apply', '--message', 'a subject', '--repo', repo, '--agent-dir', agentDir]);
+  const updateNoPush = run(['update', '--message', 'a subject', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(updateNoPush.status, 2, updateNoPush.stderr);
-  assert.match(result(updateNoPush).error, /update --message requires --apply --push/);
+  assert.match(result(updateNoPush).error, /--message is only supported by push/);
 
   // No repository state changed by any rejected run.
   assert.equal(gitAt(repo, ['status', '--porcelain']), '');
@@ -2551,7 +2819,7 @@ test('push stops for suspected credential content in a managed resource', async 
   const skill = path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md');
   const credential = 'ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ';
   await fs.writeFile(skill, `example token: ${credential}\n`);
-  const response = run(['push', '--repo', repo]);
+  const response = run(['push', '--dry-run', '--repo', repo]);
   assert.equal(response.status, 1);
   const output = result(response);
   assert.equal(output.errorCode, 'PUSH_BLOCKED');
@@ -2570,7 +2838,7 @@ test('push blocks a likely token in a manifest setting before commit or publicat
   const headBefore = gitAt(repo, ['rev-parse', 'HEAD']);
   const remoteBefore = gitAt(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0];
 
-  const response = run(['push', '--publish', '--repo', repo]);
+  const response = run(['push', '--repo', repo]);
   assert.equal(response.status, 1);
   const output = result(response);
   assert.equal(output.errorCode, 'PUSH_BLOCKED');
@@ -2590,7 +2858,7 @@ test('push allows the safe placeholder in a manifest credential-like setting', a
   manifest.settings = [{ target: 'models.json', fields: [{ path: '/providers/local', value: { baseUrl: 'http://localhost:11434/v1', apiKey: '__PLACEHOLDER__' } }] }];
   await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
-  const response = run(['push', '--publish', '--repo', repo]);
+  const response = run(['push', '--repo', repo]);
   assert.equal(response.status, 0, response.stderr);
   const output = result(response);
   assert.equal(output.mode, 'published');
@@ -2606,7 +2874,7 @@ test('push refuses unrelated local commits and remote advancement without losing
   gitAt(repo, ['add', '--', 'unrelated-commit.txt']);
   gitAt(repo, ['commit', '-m', 'unrelated local work']);
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Keep local managed edit\n');
-  const ahead = run(['push', '--publish', '--repo', repo]);
+  const ahead = run(['push', '--repo', repo]);
   assert.equal(ahead.status, 1);
   assert.equal(result(ahead).errorCode, 'PUSH_BLOCKED');
   assert.equal(await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8'), '# Keep local managed edit\n');
@@ -2626,7 +2894,7 @@ test('push refuses unrelated local commits and remote advancement without losing
   gitAt(remoteClone, ['commit', '-m', 'remote advancement']);
   gitAt(remoteClone, ['push', 'origin', 'main']);
   await fs.writeFile(path.join(other, 'resources', 'skills', 'hello', 'SKILL.md'), '# Local edit after remote advance\n');
-  const diverged = run(['push', '--publish', '--repo', other]);
+  const diverged = run(['push', '--repo', other]);
   assert.equal(diverged.status, 1);
   assert.match(result(diverged).error, /upstream has advanced/);
   assert.equal(await fs.readFile(path.join(other, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8'), '# Local edit after remote advance\n');
@@ -2639,7 +2907,7 @@ test('rejected fast-forward push preserves the local managed commit and unrelate
   gitAt(repo, ['add', '--', 'unrelated.txt']);
   const hook = path.join(bare, 'hooks', 'pre-receive');
   await fs.writeFile(hook, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
-  const rejected = run(['push', '--publish', '--repo', repo]);
+  const rejected = run(['push', '--repo', repo]);
   assert.equal(rejected.status, 1);
   const output = result(rejected);
   assert.equal(output.errorCode, 'PUSH_BLOCKED');
@@ -2649,73 +2917,11 @@ test('rejected fast-forward push preserves the local managed commit and unrelate
   assert.equal(gitAt(repo, ['diff', '--cached', '--name-only']), 'unrelated.txt');
 });
 
-test('update --apply --push publishes the approved exact pin change through managed-only push', async (t) => {
-  const { repo, bare, root } = await pushFixture(t);
-  const manifestPath = path.join(repo, 'pi-sync.json');
-  await fs.writeFile(manifestPath, JSON.stringify({ schemaVersion: 1,
-    resources: [{ type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' }],
-    dependencies: [{ type: 'npm', name: 'fixture-package' }] }, null, 2) + '\n');
-  await fs.writeFile(path.join(repo, 'pi-sync.lock.json'), JSON.stringify({ schemaVersion: 1, packages: [
-    { type: 'npm', name: 'fixture-package', version: '1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' },
-  ] }, null, 2) + '\n');
-  gitAt(repo, ['add', '--all']);
-  gitAt(repo, ['commit', '-m', 'declare pinned package']);
-  gitAt(repo, ['push', 'origin', 'main']);
-
-  const bin = path.join(root, 'fake-bin');
-  await fs.mkdir(bin);
-  await fs.writeFile(path.join(bin, 'npm'), `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args[0] === 'view' && args[2] === 'versions') console.log(JSON.stringify(['1.0.0','1.1.0']));\nelse if (args[0] === 'view' && args[2] === 'time') console.log(JSON.stringify({'1.0.0':'2020-01-01T00:00:00.000Z','1.1.0':'2020-02-01T00:00:00.000Z'}));\nelse process.exit(2);\n`, { mode: 0o755 });
-  await fs.writeFile(path.join(bin, 'pi'), `#!${process.execPath}\nprocess.exit(0);\n`, { mode: 0o755 });
-  const agentDir = path.join(root, 'agent');
-  const invalid = run(['update', '--push', '--repo', repo, '--agent-dir', agentDir], { PATH: `${bin}${path.delimiter}${process.env.PATH}` });
-  assert.equal(invalid.status, 2);
-  assert.match(result(invalid).error, /requires --apply/);
-
-  const updated = run(['update', '--apply', '--push', '--approve', '--repo', repo, '--agent-dir', agentDir], {
-    PATH: `${bin}${path.delimiter}${process.env.PATH}`,
-  });
-  assert.equal(updated.status, 0, `${updated.stderr}\n${updated.stdout}`);
-  assert.match(updated.stderr, /managed commit preview \(before publication\)/);
-  const output = result(updated);
-  assert.equal(output.push.mode, 'published');
-  assert.deepEqual(output.push.changes.map((item) => item.path), ['pi-sync.lock.json']);
-  const lock = JSON.parse(spawnSync('git', ['--git-dir', bare, 'show', 'main:pi-sync.lock.json'], { encoding: 'utf8' }).stdout);
-  assert.equal(lock.packages[0].version, '1.1.0');
-  assert.deepEqual(gitAt(repo, ['show', '--format=', '--name-only', 'HEAD']).split(/\r?\n/).filter(Boolean), ['pi-sync.lock.json']);
+test('update --push is rejected; publishing requires a separate push command', () => {
+  const response = runRawWith(cli, ['update', '--push', '--json']);
+  assert.equal(response.status, 2);
+  assert.match(result(response).error, /update --push is no longer supported/);
 });
-test('update --apply --push --message forwards the subject to the managed-only commit', async (t) => {
-  const { repo, bare, root } = await pushFixture(t);
-  const manifestPath = path.join(repo, 'pi-sync.json');
-  await fs.writeFile(manifestPath, JSON.stringify({ schemaVersion: 1,
-    resources: [{ type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' }],
-    dependencies: [{ type: 'npm', name: 'fixture-package' }] }, null, 2) + '\n');
-  await fs.writeFile(path.join(repo, 'pi-sync.lock.json'), JSON.stringify({ schemaVersion: 1, packages: [
-    { type: 'npm', name: 'fixture-package', version: '1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' },
-  ] }, null, 2) + '\n');
-  gitAt(repo, ['add', '--all']);
-  gitAt(repo, ['commit', '-m', 'declare pinned package']);
-  gitAt(repo, ['push', 'origin', 'main']);
-
-  const bin = path.join(root, 'fake-bin');
-  await fs.mkdir(bin);
-  await fs.writeFile(path.join(bin, 'npm'), `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args[0] === 'view' && args[2] === 'versions') console.log(JSON.stringify(['1.0.0','1.1.0']));\nelse if (args[0] === 'view' && args[2] === 'time') console.log(JSON.stringify({'1.0.0':'2020-01-01T00:00:00.000Z','1.1.0':'2020-02-01T00:00:00.000Z'}));\nelse process.exit(2);\n`, { mode: 0o755 });
-  await fs.writeFile(path.join(bin, 'pi'), `#!${process.execPath}\nprocess.exit(0);\n`, { mode: 0o755 });
-  const agentDir = path.join(root, 'agent');
-
-  const message = 'Bump fixture-package to 1.1.0';
-  const updated = run(['update', '--apply', '--push', '--approve', '--message', message, '--repo', repo, '--agent-dir', agentDir], {
-    PATH: `${bin}${path.delimiter}${process.env.PATH}`,
-  });
-  assert.equal(updated.status, 0, `${updated.stderr}\n${updated.stdout}`);
-  const output = result(updated);
-  assert.equal(output.push.mode, 'published');
-  assert.deepEqual(output.push.changes.map((item) => item.path), ['pi-sync.lock.json']);
-  assert.equal(output.push.commitMessage, message, 'the forwarded message appears in the embedded push output');
-  assert.equal(gitAt(repo, ['log', '-1', '--format=%s']), message, 'the forwarded message is the committed subject');
-  const lock = JSON.parse(spawnSync('git', ['--git-dir', bare, 'show', 'main:pi-sync.lock.json'], { encoding: 'utf8' }).stdout);
-  assert.equal(lock.packages[0].version, '1.1.0');
-});
-
 test('manifest rejects arbitrary or unsupported prerequisite declarations before apply', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
@@ -2793,7 +2999,7 @@ const EXTENDED_ADDS = [
 
 function addAllExtended(repo, agentDir) {
   for (const [type, source] of EXTENDED_ADDS) {
-    const response = run(['add', '--type', type, '--source', source, '--repo', repo, '--agent-dir', agentDir]);
+    const response = run(['add', '--target', source, '--repo', repo, '--agent-dir', agentDir]);
     assert.equal(response.status, 0, `${type} ${source}: ${response.stderr}\n${response.stdout}`);
   }
 }
@@ -2801,7 +3007,7 @@ function addAllExtended(repo, agentDir) {
 test('add imports prompts, agents, roles, and file and directory extension forms with manifest updates', async (t) => {
   const { repo, agentDir } = await extendedFixture(t);
   for (const [type, source] of EXTENDED_ADDS) {
-    const response = run(['add', '--type', type, '--source', source, '--repo', repo, '--agent-dir', agentDir]);
+    const response = run(['add', '--target', source, '--repo', repo, '--agent-dir', agentDir]);
     assert.equal(response.status, 0, `${type} ${source}: ${response.stderr}\n${response.stdout}`);
     const output = result(response);
     assert.equal(output.action, 'added');
@@ -2856,7 +3062,7 @@ test('apply installs new-type resources, is idempotent, and leaves unmanaged con
   assert.deepEqual(result(second).actions, []);
 
   // Unmanaged content under the same roots is invisible to plan/status and untouched by apply.
-  const planned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  const planned = run(['status', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(planned.status, 0, planned.stderr);
   assert.deepEqual(result(planned).actions, []);
   assert.equal(result(planned).conflicts.length, 0);
@@ -2868,7 +3074,7 @@ test('apply installs new-type resources, is idempotent, and leaves unmanaged con
 test('prompt, agent, and role resources reconcile with the same three-way semantics as skills', async (t) => {
   const { repo, agentDir } = await extendedFixture(t);
   for (const [type, source] of [['prompt', 'prompts/deploy.md'], ['agent', 'agents/reviewer.md'], ['role', 'roles/moderator.md']]) {
-    const response = run(['add', '--type', type, '--source', source, '--repo', repo, '--agent-dir', agentDir]);
+    const response = run(['add', '--target', source, '--repo', repo, '--agent-dir', agentDir]);
     assert.equal(response.status, 0, response.stderr);
   }
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
@@ -2906,7 +3112,7 @@ test('add imports workflow scripts and rejects non-.js or nested workflow source
   await fs.writeFile(path.join(agentDir, 'workflows', 'octopus-loop.js'), 'export async function run() {}\n');
   await fs.writeFile(path.join(agentDir, 'workflows', 'notes.txt'), 'not a workflow\n');
 
-  const response = run(['add', '--type', 'workflow', '--source', 'workflows/octopus-loop.js', '--repo', repo, '--agent-dir', agentDir]);
+  const response = run(['add', '--target', 'workflows/octopus-loop.js', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(response.status, 0, `${response.stderr}\n${response.stdout}`);
   const output = result(response);
   assert.equal(output.action, 'added');
@@ -2921,13 +3127,13 @@ test('add imports workflow scripts and rejects non-.js or nested workflow source
 
   // A non-.js file and a nested path are validation rejections that write nothing.
   for (const source of ['workflows/notes.txt', 'workflows/inner/deep.js']) {
-    const rejected = run(['add', '--type', 'workflow', '--source', source, '--repo', repo, '--agent-dir', agentDir]);
+    const rejected = run(['add', '--target', source, '--repo', repo, '--agent-dir', agentDir]);
     assert.equal(rejected.status, 2, `${source}: ${rejected.stderr}\n${rejected.stdout}`);
   }
   assert.equal(JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8')).resources.length, 1);
 });
 
-test('register registers repository-present workflow scripts, and --list and --all discover them', async (t) => {
+test('add registers repository-present workflow scripts, and --list and --all discover them', async (t) => {
   const { repo, agentDir } = await fixture(t);
   await fs.mkdir(path.join(repo, 'resources', 'workflows'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'workflows', 'octopus-loop.js'), 'export async function run() {}\n');
@@ -2936,18 +3142,18 @@ test('register registers repository-present workflow scripts, and --list and --a
   await fs.mkdir(path.join(repo, 'resources', 'workflows', 'inner'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'workflows', 'inner', 'deep.js'), 'export const deep = true;\n');
 
-  const listed = run(['register', '--list', '--type', 'workflow', '--repo', repo]);
+  const listed = run(['add', '--list', '--repo', repo]);
   assert.equal(listed.status, 0, listed.stderr);
   assert.deepEqual(result(listed).unregistered, [
     { type: 'workflow', source: 'resources/workflows/octopus-loop.js', target: 'workflows/octopus-loop.js' },
   ]);
 
-  const response = run(['register', '--type', 'workflow', '--source', 'resources/workflows/octopus-loop.js', '--repo', repo]);
+  const response = run(['add', '--target', 'workflows/octopus-loop.js', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(response.status, 0, response.stderr);
   const output = result(response);
-  assert.equal(output.action, 'registered');
+  assert.equal(output.action, 'declared');
   assert.equal(output.type, 'workflow');
-  assert.equal(output.source, 'resources/workflows/octopus-loop.js');
+  assert.equal(output.source, 'workflows/octopus-loop.js');
   assert.equal(output.target, 'workflows/octopus-loop.js');
   const manifest = JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8'));
   assert.deepEqual(manifest.resources.at(-1), { type: 'workflow', source: 'resources/workflows/octopus-loop.js', target: 'workflows/octopus-loop.js' });
@@ -2955,12 +3161,12 @@ test('register registers repository-present workflow scripts, and --list and --a
   await assert.rejects(fs.access(path.join(agentDir, 'workflows')));
 
   // Re-registering the exact declaration is an idempotent no-op.
-  const again = run(['register', '--type', 'workflow', '--source', 'resources/workflows/octopus-loop.js', '--repo', repo]);
-  assert.equal(result(again).action, 'already-registered');
+  const again = run(['add', '--target', 'workflows/octopus-loop.js', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(result(again).action, 'already-added');
 
   // --all batch-registers the remaining candidate of the narrowed type.
   await fs.writeFile(path.join(repo, 'resources', 'workflows', 'second.js'), 'export async function second() {}\n');
-  const batched = run(['register', '--all', '--type', 'workflow', '--repo', repo]);
+  const batched = run(['add', '--all', '--repo', repo]);
   assert.equal(batched.status, 0, batched.stderr);
   const batchedOutput = result(batched);
   assert.equal(batchedOutput.action, 'registered');
@@ -2969,11 +3175,11 @@ test('register registers repository-present workflow scripts, and --list and --a
   assert.deepEqual(finalManifest.resources.map((item) => item.type), ['skill', 'workflow', 'workflow']);
 });
 
-test('apply installs workflow scripts, and remove and prune handle them like the other file types', async (t) => {
+test('apply installs workflow scripts, and remove --keep-local and remove --stale handle them like the other file types', async (t) => {
   const { repo, agentDir } = await extendedFixture(t);
   await fs.mkdir(path.join(agentDir, 'workflows'), { recursive: true });
   await fs.writeFile(path.join(agentDir, 'workflows', 'octopus-loop.js'), 'export async function run() {}\n');
-  assert.equal(run(['add', '--type', 'workflow', '--source', 'workflows/octopus-loop.js', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  assert.equal(run(['add', '--target', 'workflows/octopus-loop.js', '--repo', repo, '--agent-dir', agentDir]).status, 0);
 
   // Remove the local original so apply performs a real install.
   await fs.rm(path.join(agentDir, 'workflows', 'octopus-loop.js'));
@@ -2984,18 +3190,20 @@ test('apply installs workflow scripts, and remove and prune handle them like the
   assert.equal(await fs.readFile(path.join(agentDir, 'workflows', 'octopus-loop.js'), 'utf8'), 'export async function run() {}\n');
 
   // plan and status report nothing pending once applied.
-  for (const command of ['plan', 'status']) {
+  for (const command of ['status']) {
     const clean = run([command, '--repo', repo, '--agent-dir', agentDir]);
     assert.equal(clean.status, 0, clean.stderr);
     assert.deepEqual(result(clean).actions, []);
   }
 
-  // Removal is repository-only: manifest entry and repository content are gone,
-  // the local installation is unchanged, and the resource is reported stale.
-  const removed = run(['remove', '--type', 'workflow', '--target', 'workflows/octopus-loop.js', '--repo', repo, '--agent-dir', agentDir]);
+  // Removal with --keep-local is repository-only: manifest entry and
+  // repository content are gone, the local installation is unchanged, and the
+  // resource is reported stale.
+  const removed = run(['remove', '--target', 'workflows/octopus-loop.js', '--keep-local', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(removed.status, 0, removed.stderr);
   const removedOutput = result(removed);
   assert.deepEqual(removedOutput.removed, { type: 'workflow', source: 'resources/workflows/octopus-loop.js', target: 'workflows/octopus-loop.js' });
+  assert.equal(removedOutput.local.action, 'unchanged');
   await assert.rejects(fs.access(path.join(repo, 'resources', 'workflows', 'octopus-loop.js')));
   assert.equal(await fs.readFile(path.join(agentDir, 'workflows', 'octopus-loop.js'), 'utf8'), 'export async function run() {}\n');
 
@@ -3005,8 +3213,8 @@ test('apply installs workflow scripts, and remove and prune handle them like the
   assert.deepEqual(staleOutput.staleResources.map((item) => item.target), ['workflows/octopus-loop.js']);
   assert.equal(staleOutput.actions.find((item) => item.target === 'workflows/octopus-loop.js').action, 'stale');
 
-  // A confirmed prune removes the local file copy.
-  const pruned = run(['prune', '--confirm', '--repo', repo, '--agent-dir', agentDir]);
+  // remove --stale removes the local file copy.
+  const pruned = run(['remove', '--stale', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(pruned.status, 0, pruned.stderr);
   assert.deepEqual(result(pruned).staleResources.map((item) => item.target), ['workflows/octopus-loop.js']);
   await assert.rejects(fs.access(path.join(agentDir, 'workflows', 'octopus-loop.js')));
@@ -3014,7 +3222,7 @@ test('apply installs workflow scripts, and remove and prune handle them like the
 
 test('multi-file extension directories are managed end to end with the same three-way semantics', async (t) => {
   const { repo, agentDir } = await extendedFixture(t);
-  const response = run(['add', '--type', 'extension', '--source', 'extensions/github-copilot-usage', '--repo', repo, '--agent-dir', agentDir]);
+  const response = run(['add', '--target', 'extensions/github-copilot-usage', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(response.status, 0, response.stderr);
   assert.equal(result(response).repositorySource, 'resources/extensions/github-copilot-usage');
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
@@ -3052,7 +3260,7 @@ test('multi-file extension directories are managed end to end with the same thre
 
 test('a package update rewrite of a managed extension config file is reported, never silently overwritten', async (t) => {
   const { repo, agentDir } = await extendedFixture(t);
-  const response = run(['add', '--type', 'extension', '--source', 'extensions/subagent/config.json', '--repo', repo, '--agent-dir', agentDir]);
+  const response = run(['add', '--target', 'extensions/subagent/config.json', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(response.status, 0, response.stderr);
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(first.status, 0, first.stderr);
@@ -3086,45 +3294,45 @@ test('new-type add guards reject symlinks, traversal, collisions, secrets, and p
 
   // Symlinked file source is rejected.
   await fs.symlink(path.join(agentDir, 'prompts', 'deploy.md'), path.join(agentDir, 'prompts', 'linked.md'));
-  const symlink = run(['add', '--type', 'prompt', '--source', 'prompts/linked.md', '--repo', repo, '--agent-dir', agentDir]);
+  const symlink = run(['add', '--target', 'prompts/linked.md', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(symlink.status, 2, symlink.stderr);
   assert.match(result(symlink).error, /symbolic link/i);
   await assert.rejects(fs.access(path.join(repo, 'resources', 'prompts', 'linked.md')));
   await fs.rm(path.join(agentDir, 'prompts', 'linked.md'));
 
   // Path traversal is rejected before any import.
-  const traversal = run(['add', '--type', 'prompt', '--source', 'prompts/../../outside.md', '--repo', repo, '--agent-dir', agentDir]);
+  const traversal = run(['add', '--target', 'prompts/../../outside.md', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(traversal.status, 2);
   assert.match(result(traversal).error, /.. path segments/);
 
   // A source outside the type root is rejected.
-  const wrongRoot = run(['add', '--type', 'extension', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  const wrongRoot = run(['add', '--target', 'unknown/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(wrongRoot.status, 2);
-  assert.match(result(wrongRoot).error, /Extension source must be a file or directory under extensions\//);
+  assert.match(result(wrongRoot).error, /--target must identify a resource/);
 
   // A non-.md file is rejected for prompt types.
-  const wrongShape = run(['add', '--type', 'agent', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  const wrongShape = run(['add', '--target', 'agents/reviewer.txt', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(wrongShape.status, 2);
-  assert.match(result(wrongShape).error, /Agent source must be a \.md file directly under agents\//);
+  assert.match(result(wrongShape).error, /Agent target must be a \.md file directly under agents\//);
 
-  // Re-adding an already declared source is a collision.
-  assert.equal(run(['add', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]).status, 0);
-  const collision = run(['add', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
-  assert.equal(collision.status, 2);
-  assert.equal(result(collision).errorCode, 'RESOURCE_COLLISION');
+  // Re-adding an already-declared exact source and target is an idempotent no-op.
+  const initial = run(['add', '--target', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(initial.status, 0, initial.stderr);
+  const repeated = run(['add', '--target', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(repeated.status, 0, repeated.stderr);
+  assert.equal(result(repeated).action, 'already-added');
 
-  // A repository path that exists but is not declared is a collision.
+  // Repository-only content is declared without a local copy or import.
   await fs.mkdir(path.join(repo, 'resources', 'agents'), { recursive: true });
-  await fs.writeFile(path.join(repo, 'resources', 'agents', 'reviewer.md'), '# Existing\n');
-  const repoCollision = run(['add', '--type', 'agent', '--source', 'agents/reviewer.md', '--repo', repo, '--agent-dir', agentDir]);
-  assert.equal(repoCollision.status, 2);
-  assert.equal(result(repoCollision).errorCode, 'RESOURCE_COLLISION');
-  assert.match(result(repoCollision).error, /setup repository path already exists/);
-  await fs.rm(path.join(repo, 'resources', 'agents'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'agents', 'new-agent.md'), '# Existing\n');
+  const repositoryOnly = run(['add', '--target', 'agents/new-agent.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(repositoryOnly.status, 0, repositoryOnly.stderr);
+  assert.equal(result(repositoryOnly).action, 'declared');
+  await assert.rejects(fs.access(path.join(agentDir, 'agents', 'new-agent.md')));
 
   // Likely secret material stops the import before anything is copied.
   await fs.writeFile(path.join(agentDir, 'extensions', 'subagent', 'config.json'), 'apiKey = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"\n');
-  const secret = run(['add', '--type', 'extension', '--source', 'extensions/subagent/config.json', '--repo', repo, '--agent-dir', agentDir]);
+  const secret = run(['add', '--target', 'extensions/subagent/config.json', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(secret.status, 2);
   const secretOutput = result(secret);
   assert.equal(secretOutput.errorCode, 'SECRET_REVIEW_REQUIRED');
@@ -3136,31 +3344,31 @@ test('new-type add guards reject symlinks, traversal, collisions, secrets, and p
   // Package-installed code (npm tree) is never imported into the repository.
   await fs.mkdir(path.join(agentDir, 'extensions', 'github-copilot-usage', 'node_modules', 'pinned'), { recursive: true });
   await fs.writeFile(path.join(agentDir, 'extensions', 'github-copilot-usage', 'node_modules', 'pinned', 'index.js'), 'module.exports = 1;\n');
-  const packageCode = run(['add', '--type', 'extension', '--source', 'extensions/github-copilot-usage', '--repo', repo, '--agent-dir', agentDir]);
+  const packageCode = run(['add', '--target', 'extensions/github-copilot-usage', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(packageCode.status, 2);
   assert.match(result(packageCode).error, /node_modules/);
   await assert.rejects(fs.access(path.join(repo, 'resources', 'extensions', 'github-copilot-usage')));
   await fs.rm(path.join(agentDir, 'extensions', 'github-copilot-usage', 'node_modules'), { recursive: true });
 });
 
-test('register declares a repository-present resource and never touches the local installation', async (t) => {
+test('add declares a repository-present resource and never touches the local installation', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Repository prompt\n');
 
   // --agent-dir is not required: register operates on the repository only.
-  const registered = run(['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--repo', repo]);
+  const registered = run(['add', '--target', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(registered.status, 0, registered.stderr);
   const output = result(registered);
-  assert.equal(output.apiVersion, 1);
-  assert.equal(output.command, 'register');
+  assert.equal(output.apiVersion, 2);
+  assert.equal(output.command, 'add');
   assert.equal(output.ok, true);
   assert.equal(output.exitCode, 0);
   assert.equal(output.type, 'prompt');
-  assert.equal(output.source, 'resources/prompts/deploy.md');
+  assert.equal(output.source, 'prompts/deploy.md');
   assert.equal(output.target, 'prompts/deploy.md');
-  assert.equal(output.action, 'registered');
+  assert.equal(output.action, 'declared');
   const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
   assert.deepEqual(manifest.resources.at(-1), { type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' });
 
@@ -3171,13 +3379,44 @@ test('register declares a repository-present resource and never touches the loca
   // --agent-dir is not used even when supplied: a missing directory is not created.
   const missingAgentDir = path.join(path.dirname(agentDir), 'no-such-agent');
   await fs.writeFile(path.join(repo, 'resources', 'prompts', 'second.md'), '# Second prompt\n');
-  const withAgentFlag = run(['register', '--type', 'prompt', '--source', 'resources/prompts/second.md', '--repo', repo, '--agent-dir', missingAgentDir]);
+  const withAgentFlag = run(['add', '--target', 'prompts/second.md', '--repo', repo, '--agent-dir', missingAgentDir]);
   assert.equal(withAgentFlag.status, 0, withAgentFlag.stderr);
-  assert.equal(result(withAgentFlag).action, 'registered');
+  assert.equal(result(withAgentFlag).action, 'declared');
   await assert.rejects(fs.access(missingAgentDir));
 });
 
-test('register works for every resource type with repository-present content', async (t) => {
+test('add declares identical repository and local content without copying and rejects differing copies', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  const localPath = path.join(agentDir, 'prompts', 'deploy.md');
+  const repositoryPath = path.join(repo, 'resources', 'prompts', 'deploy.md');
+  await fs.mkdir(path.dirname(localPath), { recursive: true });
+  await fs.mkdir(path.dirname(repositoryPath), { recursive: true });
+  await fs.writeFile(localPath, '# Same content\n');
+  await fs.writeFile(repositoryPath, '# Same content\n');
+
+  const first = run(['add', '--target', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(first.status, 0, first.stderr);
+  const output = result(first);
+  assert.equal(output.action, 'declared');
+  assert.match(output.note, /repository and local content match/i);
+  assert.equal(await fs.readFile(localPath, 'utf8'), '# Same content\n');
+  assert.equal(await fs.readFile(repositoryPath, 'utf8'), '# Same content\n');
+
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  await fs.writeFile(localPath, '# Different content\n');
+  const collision = run(['add', '--target', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(collision.status, 2, collision.stderr);
+  const failure = result(collision);
+  assert.equal(failure.errorCode, 'RESOURCE_COLLISION');
+  assert.ok(failure.error.includes(localPath));
+  assert.ok(failure.error.includes(repositoryPath));
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+  assert.equal(await fs.readFile(localPath, 'utf8'), '# Different content\n');
+  assert.equal(await fs.readFile(repositoryPath, 'utf8'), '# Same content\n');
+});
+
+test('add works for every resource type with repository-present content', async (t) => {
   const { repo, agentDir } = await fixture(t);
   await fs.mkdir(path.join(repo, 'resources', 'skills', 'alpha'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'alpha', 'SKILL.md'), '# Alpha\n');
@@ -3199,12 +3438,12 @@ test('register works for every resource type with repository-present content', a
     ['role', 'resources/roles/moderator.md', 'roles/moderator.md'],
   ];
   for (const [type, source, target] of registrations) {
-    const response = run(['register', '--type', type, '--source', source, '--repo', repo]);
+    const response = run(['add', '--target', target, '--repo', repo]);
     assert.equal(response.status, 0, `${type} ${source}: ${response.stderr}\n${response.stdout}`);
     const output = result(response);
-    assert.equal(output.action, 'registered');
+    assert.equal(output.action, 'declared');
     assert.equal(output.type, type);
-    assert.equal(output.source, source);
+    assert.equal(output.source, target);
     assert.equal(output.target, target);
   }
   const manifest = JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8'));
@@ -3215,32 +3454,32 @@ test('register works for every resource type with repository-present content', a
   }
 });
 
-test('register is idempotent for an exact source and target match', async (t) => {
+test('add is idempotent for an exact source and target match', async (t) => {
   const { repo } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Repository prompt\n');
-  const first = run(['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--repo', repo]);
+  const first = run(['add', '--target', 'prompts/deploy.md', '--repo', repo]);
   assert.equal(first.status, 0, first.stderr);
-  assert.equal(result(first).action, 'registered');
+  assert.equal(result(first).action, 'declared');
   const manifestBefore = await fs.readFile(manifestPath, 'utf8');
 
-  const second = run(['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--repo', repo]);
+  const second = run(['add', '--target', 'prompts/deploy.md', '--repo', repo]);
   assert.equal(second.status, 0, second.stderr);
   const output = result(second);
-  assert.equal(output.apiVersion, 1);
-  assert.equal(output.command, 'register');
+  assert.equal(output.apiVersion, 2);
+  assert.equal(output.command, 'add');
   assert.equal(output.ok, true);
   assert.equal(output.exitCode, 0);
   assert.equal(output.type, 'prompt');
-  assert.equal(output.source, 'resources/prompts/deploy.md');
+  assert.equal(output.source, 'prompts/deploy.md');
   assert.equal(output.target, 'prompts/deploy.md');
-  assert.equal(output.action, 'already-registered');
+  assert.equal(output.action, 'already-added');
   assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore, 'the manifest is unchanged by the no-op');
 });
 
-test('register reports RESOURCE_COLLISION for any other overlap and writes nothing', async (t) => {
-  const { repo } = await fixture(t);
+test('add reports RESOURCE_COLLISION for any other overlap and writes nothing', async (t) => {
+  const { repo, agentDir } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const writeManifest = (resources) => fs.writeFile(manifestPath, JSON.stringify({ schemaVersion: 1, resources, dependencies: [] }));
 
@@ -3248,18 +3487,18 @@ test('register reports RESOURCE_COLLISION for any other overlap and writes nothi
   await fs.mkdir(path.join(repo, 'resources', 'skills', 'renamed'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'renamed', 'SKILL.md'), '# Renamed\n');
   await writeManifest([{ type: 'skill', source: 'resources/skills/renamed', target: 'skills/hello' }]);
-  let collision = run(['register', '--type', 'skill', '--source', 'resources/skills/hello', '--repo', repo]);
+  let collision = run(['add', '--target', 'skills/hello', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(collision.status, 2, collision.stderr);
   let output = result(collision);
   assert.equal(output.ok, false);
   assert.equal(output.exitCode, 2);
   assert.equal(output.errorCode, 'RESOURCE_COLLISION');
   assert.match(output.error, /collision/i);
-  assert.deepEqual(output.details, { type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' });
+  assert.deepEqual(output.details, { type: 'skill', source: 'skills/hello', target: 'skills/hello', repositorySource: 'resources/skills/hello' });
 
   // The source is declared under a different target.
   await writeManifest([{ type: 'skill', source: 'resources/skills/hello', target: 'skills/renamed' }]);
-  collision = run(['register', '--type', 'skill', '--source', 'resources/skills/hello', '--repo', repo]);
+  collision = run(['add', '--target', 'skills/hello', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(collision.status, 2, collision.stderr);
   assert.equal(result(collision).errorCode, 'RESOURCE_COLLISION');
 
@@ -3267,18 +3506,18 @@ test('register reports RESOURCE_COLLISION for any other overlap and writes nothi
   await fs.mkdir(path.join(repo, 'resources', 'extensions', 'subagent'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'extensions', 'subagent', 'config.json'), `${JSON.stringify({ model: 'local-model' }, null, 2)}\n`);
   await writeManifest([{ type: 'extension', source: 'resources/extensions/subagent', target: 'extensions/subagent' }]);
-  collision = run(['register', '--type', 'extension', '--source', 'resources/extensions/subagent/config.json', '--repo', repo]);
+  collision = run(['add', '--target', 'extensions/subagent/config.json', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(collision.status, 2, collision.stderr);
   output = result(collision);
   assert.equal(output.errorCode, 'RESOURCE_COLLISION');
-  assert.deepEqual(output.details, { type: 'extension', source: 'resources/extensions/subagent/config.json', target: 'extensions/subagent/config.json' });
+  assert.deepEqual(output.details, { type: 'extension', source: 'extensions/subagent/config.json', target: 'extensions/subagent/config.json', repositorySource: 'resources/extensions/subagent/config.json' });
 
   // Nothing was written: the manifest keeps its single entry.
   const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
   assert.equal(manifest.resources.length, 1);
 });
 
-test('register fails validation for missing sources, wrong roots, unsupported types, and missing options', async (t) => {
+test('add validates resource targets, requires one mode, and rejects removed selectors', async (t) => {
   const { repo } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const manifestBefore = await fs.readFile(manifestPath, 'utf8');
@@ -3286,17 +3525,16 @@ test('register fails validation for missing sources, wrong roots, unsupported ty
   await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Repository prompt\n');
 
   const failures = [
-    { args: ['register', '--type', 'prompt', '--source', 'resources/prompts/absent.md', '--repo', repo], message: /Resource source does not exist/ },
-    { args: ['register', '--type', 'prompt', '--source', 'resources/skills/hello', '--repo', repo], message: /Prompt source must be a \.md file directly under resources\/prompts\// },
-    { args: ['register', '--type', 'skill', '--source', 'resources/prompts/deploy.md', '--repo', repo], message: /Skill source must be a direct child directory of resources\/skills\// },
-    { args: ['register', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo], message: /Prompt source must be a \.md file directly under resources\/prompts\// },
-    { args: ['register', '--type', 'theme', '--source', 'resources/prompts/deploy.md', '--repo', repo], message: /Unsupported resource type/ },
-    { args: ['register', '--type', 'dependency', '--source', 'npm:example', '--repo', repo], message: /Unsupported resource type/ },
-    { args: ['register', '--type', 'prompt', '--repo', repo], message: /register requires explicit --type and --source/ },
-    { args: ['register', '--source', 'resources/prompts/deploy.md', '--repo', repo], message: /register requires explicit --type and --source/ },
+    { args: ['add', '--target', 'prompts/absent.md', '--repo', repo], message: /does not exist in the setup repository or local installation/ },
+    { args: ['add', '--target', 'prompts/nested/deploy.md', '--repo', repo], message: /Prompt target must be a \.md file directly under prompts\// },
+    { args: ['add', '--target', 'unknown/example.md', '--repo', repo], message: /--target must identify a resource/ },
+    { args: ['add', '--target', 'resources/prompts/deploy.md', '--repo', repo], message: /--target must identify a resource/ },
+    { args: ['add', '--repo', repo], message: /add requires --target/ },
+    { args: ['add', '--type', 'prompt', '--target', 'prompts/deploy.md', '--repo', repo], message: /Unknown option: --type/ },
+    { args: ['add', '--target', 'prompts/deploy.md', '--source', 'npm:example', '--repo', repo], message: /either --target.*--source/ },
   ];
   for (const { args, message } of failures) {
-    const response = run(args);
+    const response = runRawWith(cli, [...args, '--json']);
     assert.equal(response.status, 2, `${args.join(' ')}: ${response.stderr}\n${response.stdout}`);
     const output = result(response);
     assert.equal(output.ok, false);
@@ -3305,8 +3543,7 @@ test('register fails validation for missing sources, wrong roots, unsupported ty
   }
   assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
 });
-
-test('register stops on suspected secret material without registering or echoing the value', async (t) => {
+test('add stops on suspected secret material without registering or echoing the value', async (t) => {
   const { repo } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const manifestBefore = await fs.readFile(manifestPath, 'utf8');
@@ -3315,11 +3552,11 @@ test('register stops on suspected secret material without registering or echoing
   await fs.mkdir(path.join(repo, 'resources', 'skills', 'leaky'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'leaky', 'SKILL.md'), '# Leaky\n');
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'leaky', 'credentials.json'), `${JSON.stringify({ token: 'placeholder' }, null, 2)}\n`);
-  const credential = run(['register', '--type', 'skill', '--source', 'resources/skills/leaky', '--repo', repo]);
+  const credential = run(['add', '--target', 'skills/leaky', '--repo', repo]);
   assert.equal(credential.status, 2, credential.stderr);
   const credentialOutput = result(credential);
-  assert.equal(credentialOutput.apiVersion, 1);
-  assert.equal(credentialOutput.command, 'register');
+  assert.equal(credentialOutput.apiVersion, 2);
+  assert.equal(credentialOutput.command, 'add');
   assert.equal(credentialOutput.ok, false);
   assert.equal(credentialOutput.exitCode, 2);
   assert.equal(credentialOutput.errorCode, 'SECRET_REVIEW_REQUIRED');
@@ -3331,7 +3568,7 @@ test('register stops on suspected secret material without registering or echoing
   // Likely secret value in a repository prompt.
   await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'prompts', 'leak.md'), 'token: ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ\n');
-  const secret = run(['register', '--type', 'prompt', '--source', 'resources/prompts/leak.md', '--repo', repo]);
+  const secret = run(['add', '--target', 'prompts/leak.md', '--repo', repo]);
   assert.equal(secret.status, 2, secret.stderr);
   const secretOutput = result(secret);
   assert.equal(secretOutput.errorCode, 'SECRET_REVIEW_REQUIRED');
@@ -3343,7 +3580,7 @@ test('register stops on suspected secret material without registering or echoing
   await fs.mkdir(path.join(repo, 'resources', 'skills', 'leaky-key'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'leaky-key', 'SKILL.md'), '# Key\n');
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'leaky-key', 'id_rsa'), 'not a real key\n');
-  const sensitive = run(['register', '--type', 'skill', '--source', 'resources/skills/leaky-key', '--repo', repo]);
+  const sensitive = run(['add', '--target', 'skills/leaky-key', '--repo', repo]);
   assert.equal(sensitive.status, 2, sensitive.stderr);
   assert.match(result(sensitive).reviewRequired[0].reason, /sensitive filename/);
 
@@ -3351,7 +3588,7 @@ test('register stops on suspected secret material without registering or echoing
   assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
 });
 
-test('register rejects symlinks and node_modules in repository content', async (t) => {
+test('add rejects symlinks and node_modules in repository content', async (t) => {
   const { repo } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const manifestBefore = await fs.readFile(manifestPath, 'utf8');
@@ -3360,7 +3597,7 @@ test('register rejects symlinks and node_modules in repository content', async (
 
   // A symlinked file source is rejected.
   await fs.symlink(path.join(repo, 'outside.md'), path.join(repo, 'resources', 'prompts', 'linked.md'));
-  let response = run(['register', '--type', 'prompt', '--source', 'resources/prompts/linked.md', '--repo', repo]);
+  let response = run(['add', '--target', 'prompts/linked.md', '--repo', repo]);
   assert.equal(response.status, 2, response.stderr);
   assert.match(result(response).error, /Symbolic links are not supported/);
   await fs.rm(path.join(repo, 'resources', 'prompts', 'linked.md'));
@@ -3369,15 +3606,15 @@ test('register rejects symlinks and node_modules in repository content', async (
   await fs.mkdir(path.join(repo, 'elsewhere', 'real'), { recursive: true });
   await fs.writeFile(path.join(repo, 'elsewhere', 'real', 'SKILL.md'), '# Real\n');
   await fs.symlink(path.join(repo, 'elsewhere', 'real'), path.join(repo, 'resources', 'skills', 'linked-skill'));
-  response = run(['register', '--type', 'skill', '--source', 'resources/skills/linked-skill', '--repo', repo]);
+  response = run(['add', '--target', 'skills/linked-skill', '--repo', repo]);
   assert.equal(response.status, 2, response.stderr);
-  assert.match(result(response).error, /symbolic-link/i);
+  assert.match(result(response).error, /symbolic links?/i);
   await fs.rm(path.join(repo, 'resources', 'skills', 'linked-skill'));
 
   // A symbolic link inside the resource is rejected.
   await fs.mkdir(path.join(repo, 'resources', 'skills', 'inner-link'), { recursive: true });
   await fs.symlink(path.join(repo, 'outside.md'), path.join(repo, 'resources', 'skills', 'inner-link', 'linked.md'));
-  response = run(['register', '--type', 'skill', '--source', 'resources/skills/inner-link', '--repo', repo]);
+  response = run(['add', '--target', 'skills/inner-link', '--repo', repo]);
   assert.equal(response.status, 2, response.stderr);
   assert.match(result(response).error, /Symbolic links are not supported/);
   await fs.rm(path.join(repo, 'resources', 'skills', 'inner-link'), { recursive: true });
@@ -3385,14 +3622,14 @@ test('register rejects symlinks and node_modules in repository content', async (
   // Package-installed code is rejected.
   await fs.mkdir(path.join(repo, 'resources', 'skills', 'with-packages', 'node_modules', 'pinned'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'with-packages', 'node_modules', 'pinned', 'index.js'), 'module.exports = 1;\n');
-  response = run(['register', '--type', 'skill', '--source', 'resources/skills/with-packages', '--repo', repo]);
+  response = run(['add', '--target', 'skills/with-packages', '--repo', repo]);
   assert.equal(response.status, 2, response.stderr);
   assert.match(result(response).error, /node_modules/);
 
   assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
 });
 
-test('register never commits or pushes: only the manifest changes in the working tree', async (t) => {
+test('add never commits or pushes: only the manifest changes in the working tree', async (t) => {
   const { repo, bare } = await pushFixture(t);
   await fs.mkdir(path.join(repo, 'resources', 'agents'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'agents', 'reviewer.md'), '# Reviewer agent\n');
@@ -3400,9 +3637,9 @@ test('register never commits or pushes: only the manifest changes in the working
   const logBefore = gitAt(repo, ['log', '--oneline']);
   const remoteHeadBefore = gitAt(bare, ['rev-parse', 'HEAD']);
 
-  const response = run(['register', '--type', 'agent', '--source', 'resources/agents/reviewer.md', '--repo', repo]);
+  const response = run(['add', '--target', 'agents/reviewer.md', '--repo', repo]);
   assert.equal(response.status, 0, response.stderr);
-  assert.equal(result(response).action, 'registered');
+  assert.equal(result(response).action, 'declared');
 
   // No commit or push: the working tree holds only the manifest edit and the
   // untracked resource, and local and remote history are unchanged.
@@ -3415,7 +3652,7 @@ test('register never commits or pushes: only the manifest changes in the working
   assert.equal(gitAt(bare, ['rev-parse', 'HEAD']), remoteHeadBefore);
 });
 
-test('register validates the repository up front and changes nothing on failure', async (t) => {
+test('add validates the repository up front and changes nothing on failure', async (t) => {
   const { repo } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const lockPath = path.join(repo, 'pi-sync.lock.json');
@@ -3425,7 +3662,7 @@ test('register validates the repository up front and changes nothing on failure'
 
   // A manifest that is not valid JSON fails before register does anything.
   await fs.writeFile(manifestPath, '{ not json');
-  let response = run(['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--repo', repo]);
+  let response = run(['add', '--target', 'prompts/deploy.md', '--repo', repo]);
   assert.equal(response.status, 2, response.stderr);
   let output = result(response);
   assert.equal(output.ok, false);
@@ -3436,14 +3673,14 @@ test('register validates the repository up front and changes nothing on failure'
 
   // A missing lockfile fails the repository validation up front.
   await fs.rm(lockPath);
-  response = run(['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--repo', repo]);
+  response = run(['add', '--target', 'prompts/deploy.md', '--repo', repo]);
   assert.equal(response.status, 2, response.stderr);
   assert.match(result(response).error, /Missing lockfile/);
   await fs.writeFile(lockPath, JSON.stringify({ schemaVersion: 1, packages: [] }));
 
   // A declared resource whose repository content is missing fails before registration.
   await fs.rm(path.join(repo, 'resources', 'skills', 'hello'), { recursive: true });
-  response = run(['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--repo', repo]);
+  response = run(['add', '--target', 'prompts/deploy.md', '--repo', repo]);
   assert.equal(response.status, 2, response.stderr);
   output = result(response);
   assert.equal(output.errorCode, 'VALIDATION_ERROR');
@@ -3453,7 +3690,7 @@ test('register validates the repository up front and changes nothing on failure'
   assert.equal(await fs.readFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), 'utf8'), '# Repository prompt\n');
 });
 
-test('register --list and --all fail on an invalid repository manifest without modifying repository state', async (t) => {
+test('add --list and --all fail on an invalid repository manifest without modifying repository state', async (t) => {
   const { repo } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const manifestBefore = await fs.readFile(manifestPath, 'utf8');
@@ -3478,11 +3715,11 @@ test('register --list and --all fail on an invalid repository manifest without m
   for (const mode of ['--list', '--all']) {
     for (const [invalid, message] of invalidManifests) {
       await fs.writeFile(manifestPath, invalid);
-      const response = run(['register', mode, '--repo', repo]);
+      const response = run(['add', mode, '--repo', repo]);
       assert.equal(response.status, 2, `${mode}: ${response.stderr}\n${response.stdout}`);
       const output = result(response);
-      assert.equal(output.apiVersion, 1);
-      assert.equal(output.command, 'register');
+      assert.equal(output.apiVersion, 2);
+      assert.equal(output.command, 'add');
       assert.equal(output.ok, false);
       assert.equal(output.exitCode, 2);
       assert.equal(output.errorCode, 'VALIDATION_ERROR');
@@ -3497,7 +3734,7 @@ test('register --list and --all fail on an invalid repository manifest without m
   await fs.writeFile(manifestPath, manifestBefore);
 });
 
-test('register --list reports exactly the unregistered resources and changes nothing', async (t) => {
+test('add --list reports exactly the unregistered resources and changes nothing', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const manifestBefore = await fs.readFile(manifestPath, 'utf8');
@@ -3535,11 +3772,11 @@ test('register --list reports exactly the unregistered resources and changes not
   const resourcesDir = path.join(repo, 'resources');
   const treeBefore = (await treeOf(resourcesDir)).sort();
 
-  const response = run(['register', '--list', '--repo', repo]);
+  const response = run(['add', '--list', '--repo', repo]);
   assert.equal(response.status, 0, response.stderr);
   const output = result(response);
-  assert.equal(output.apiVersion, 1);
-  assert.equal(output.command, 'register');
+  assert.equal(output.apiVersion, 2);
+  assert.equal(output.command, 'add');
   assert.equal(output.ok, true);
   assert.equal(output.exitCode, 0);
   assert.deepEqual(output.unregistered, [
@@ -3558,40 +3795,34 @@ test('register --list reports exactly the unregistered resources and changes not
   assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'local-only', 'SKILL.md'), 'utf8'), '# Local\n');
 });
 
-test('register --list and --all honor --type narrowing and tolerate missing type roots', async (t) => {
+test('add --list and --all scan every inferred type root; --type is rejected', async (t) => {
   const { repo } = await fixture(t);
   await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Deploy prompt\n');
   await fs.mkdir(path.join(repo, 'resources', 'agents'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'agents', 'reviewer.md'), '# Reviewer agent\n');
 
-  // --type narrows the roots scanned in both modes.
-  let response = run(['register', '--list', '--type', 'prompt', '--repo', repo]);
+  const response = run(['add', '--list', '--repo', repo]);
   assert.equal(response.status, 0, response.stderr);
-  assert.deepEqual(result(response).unregistered, [{ type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' }]);
+  assert.deepEqual(result(response).unregistered, [
+    { type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' },
+    { type: 'agent', source: 'resources/agents/reviewer.md', target: 'agents/reviewer.md' },
+  ]);
+  const typed = runRawWith(cli, ['add', '--list', '--type', 'prompt', '--repo', repo, '--json']);
+  assert.equal(typed.status, 2);
 
-  // A type root that exists but has no unregistered resources is empty.
-  response = run(['register', '--list', '--type', 'skill', '--repo', repo]);
-  assert.equal(response.status, 0, response.stderr);
-  assert.deepEqual(result(response).unregistered, []);
-
-  // A type root that does not exist is empty, not an error.
-  response = run(['register', '--list', '--type', 'role', '--repo', repo]);
-  assert.equal(response.status, 0, response.stderr);
-  assert.deepEqual(result(response).unregistered, []);
-
-  // --all with --type registers only that type's candidates.
-  response = run(['register', '--all', '--type', 'agent', '--repo', repo]);
-  assert.equal(response.status, 0, response.stderr);
-  const output = result(response);
-  assert.equal(output.action, 'registered');
-  assert.deepEqual(output.registered, [{ type: 'agent', source: 'resources/agents/reviewer.md', target: 'agents/reviewer.md' }]);
+  const all = run(['add', '--all', '--repo', repo]);
+  assert.equal(all.status, 0, all.stderr);
+  assert.equal(result(all).action, 'registered');
+  assert.deepEqual(result(all).registered, [
+    { type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' },
+    { type: 'agent', source: 'resources/agents/reviewer.md', target: 'agents/reviewer.md' },
+  ]);
   const manifest = JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8'));
-  assert.equal(manifest.resources.length, 2);
-  assert.deepEqual(manifest.resources[1], { type: 'agent', source: 'resources/agents/reviewer.md', target: 'agents/reviewer.md' });
+  assert.equal(manifest.resources.length, 3);
 });
 
-test('register --all registers every unregistered resource in a single manifest write', async (t) => {
+test('add --all registers every unregistered resource in a single manifest write', async (t) => {
   const { repo, agentDir } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   await fs.mkdir(path.join(repo, 'resources', 'skills', 'alpha'), { recursive: true });
@@ -3606,11 +3837,11 @@ test('register --all registers every unregistered resource in a single manifest 
   await fs.mkdir(path.join(repo, 'resources', 'roles'), { recursive: true });
   await fs.writeFile(path.join(repo, 'resources', 'roles', 'moderator.md'), '# Moderator role\n');
 
-  const response = run(['register', '--all', '--repo', repo]);
+  const response = run(['add', '--all', '--repo', repo]);
   assert.equal(response.status, 0, response.stderr);
   const output = result(response);
-  assert.equal(output.apiVersion, 1);
-  assert.equal(output.command, 'register');
+  assert.equal(output.apiVersion, 2);
+  assert.equal(output.command, 'add');
   assert.equal(output.ok, true);
   assert.equal(output.exitCode, 0);
   assert.equal(output.action, 'registered');
@@ -3639,15 +3870,15 @@ test('register --all registers every unregistered resource in a single manifest 
   assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'local-only', 'SKILL.md'), 'utf8'), '# Local\n');
 });
 
-test('register --all is a no-op up-to-date when there are no candidates', async (t) => {
+test('add --all is a no-op up-to-date when there are no candidates', async (t) => {
   const { repo } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const manifestBefore = await fs.readFile(manifestPath, 'utf8');
-  const response = run(['register', '--all', '--repo', repo]);
+  const response = run(['add', '--all', '--repo', repo]);
   assert.equal(response.status, 0, response.stderr);
   const output = result(response);
-  assert.equal(output.apiVersion, 1);
-  assert.equal(output.command, 'register');
+  assert.equal(output.apiVersion, 2);
+  assert.equal(output.command, 'add');
   assert.equal(output.ok, true);
   assert.equal(output.exitCode, 0);
   assert.equal(output.action, 'up-to-date');
@@ -3655,7 +3886,7 @@ test('register --all is a no-op up-to-date when there are no candidates', async 
   assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore, 'the manifest is unchanged by the no-op');
 });
 
-test('register --all secret-scans every candidate and registers nothing on any finding', async (t) => {
+test('add --all secret-scans every candidate and registers nothing on any finding', async (t) => {
   const { repo } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const manifestBefore = await fs.readFile(manifestPath, 'utf8');
@@ -3667,11 +3898,11 @@ test('register --all secret-scans every candidate and registers nothing on any f
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'leaky', 'SKILL.md'), '# Leaky\n');
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'leaky', 'credentials.json'), `${JSON.stringify({ token: 'placeholder' }, null, 2)}\n`);
 
-  const response = run(['register', '--all', '--repo', repo]);
+  const response = run(['add', '--all', '--repo', repo]);
   assert.equal(response.status, 2, response.stderr);
   const output = result(response);
-  assert.equal(output.apiVersion, 1);
-  assert.equal(output.command, 'register');
+  assert.equal(output.apiVersion, 2);
+  assert.equal(output.command, 'add');
   assert.equal(output.ok, false);
   assert.equal(output.exitCode, 2);
   assert.equal(output.errorCode, 'SECRET_REVIEW_REQUIRED');
@@ -3686,7 +3917,7 @@ test('register --all secret-scans every candidate and registers nothing on any f
   assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
 });
 
-test('register --all performs a collision pre-flight and registers nothing', async (t) => {
+test('add --all performs a collision pre-flight and registers nothing', async (t) => {
   const { repo } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const writeManifest = (resources) => fs.writeFile(manifestPath, JSON.stringify({ schemaVersion: 1, resources, dependencies: [] }));
@@ -3696,11 +3927,11 @@ test('register --all performs a collision pre-flight and registers nothing', asy
   // A candidate whose target is declared under a different source collides.
   await writeManifest([{ type: 'skill', source: 'resources/skills/renamed', target: 'skills/hello' }]);
   let manifestText = await fs.readFile(manifestPath, 'utf8');
-  let response = run(['register', '--all', '--repo', repo]);
+  let response = run(['add', '--all', '--repo', repo]);
   assert.equal(response.status, 2, response.stderr);
   let output = result(response);
-  assert.equal(output.apiVersion, 1);
-  assert.equal(output.command, 'register');
+  assert.equal(output.apiVersion, 2);
+  assert.equal(output.command, 'add');
   assert.equal(output.ok, false);
   assert.equal(output.exitCode, 2);
   assert.equal(output.errorCode, 'RESOURCE_COLLISION');
@@ -3732,7 +3963,7 @@ test('register --all performs a collision pre-flight and registers nothing', asy
     await fs.writeFile(path.join(repo, 'resources', 'extensions', 'foo'), 'module.exports = 1;\n');
     await writeManifest([]);
     manifestText = await fs.readFile(manifestPath, 'utf8');
-    response = run(['register', '--all', '--repo', repo]);
+    response = run(['add', '--all', '--repo', repo]);
     assert.equal(response.status, 2, response.stderr);
     output = result(response);
     assert.equal(output.errorCode, 'RESOURCE_COLLISION');
@@ -3746,7 +3977,7 @@ test('register --all performs a collision pre-flight and registers nothing', asy
   }
 });
 
-test('register --all reports RESOURCE_COLLISION for a candidate whose source is declared under a different target', async (t) => {
+test('add --all reports RESOURCE_COLLISION for a candidate whose source is declared under a different target', async (t) => {
   const { repo } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   // The candidate's source is already declared, under a different target.
@@ -3763,7 +3994,7 @@ test('register --all reports RESOURCE_COLLISION for a candidate whose source is 
   const manifestBefore = await fs.readFile(manifestPath, 'utf8');
 
   // --list reports the candidate under its inferred source and derived target.
-  const list = run(['register', '--list', '--repo', repo]);
+  const list = run(['add', '--list', '--repo', repo]);
   assert.equal(list.status, 0, list.stderr);
   const listOutput = result(list);
   assert.equal(listOutput.ok, true);
@@ -3773,11 +4004,11 @@ test('register --all reports RESOURCE_COLLISION for a candidate whose source is 
   ]);
 
   // --all refuses the batch: the candidate's source is already declared.
-  const batch = run(['register', '--all', '--repo', repo]);
+  const batch = run(['add', '--all', '--repo', repo]);
   assert.equal(batch.status, 2, batch.stderr);
   const output = result(batch);
-  assert.equal(output.apiVersion, 1);
-  assert.equal(output.command, 'register');
+  assert.equal(output.apiVersion, 2);
+  assert.equal(output.command, 'add');
   assert.equal(output.ok, false);
   assert.equal(output.exitCode, 2);
   assert.equal(output.errorCode, 'RESOURCE_COLLISION');
@@ -3791,7 +4022,7 @@ test('register --all reports RESOURCE_COLLISION for a candidate whose source is 
   assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore, 'the manifest is byte-identical after the collision');
 });
 
-test('register --all validates repository content for every candidate before writing', async (t) => {
+test('add --all validates repository content for every candidate before writing', async (t) => {
   const { repo } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const manifestBefore = await fs.readFile(manifestPath, 'utf8');
@@ -3803,11 +4034,11 @@ test('register --all validates repository content for every candidate before wri
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'with-packages', 'node_modules', 'pinned', 'index.js'), 'module.exports = 1;\n');
   await fs.writeFile(path.join(repo, 'resources', 'skills', 'with-packages', 'SKILL.md'), '# With packages\n');
 
-  const response = run(['register', '--all', '--repo', repo]);
+  const response = run(['add', '--all', '--repo', repo]);
   assert.equal(response.status, 2, response.stderr);
   const output = result(response);
-  assert.equal(output.apiVersion, 1);
-  assert.equal(output.command, 'register');
+  assert.equal(output.apiVersion, 2);
+  assert.equal(output.command, 'add');
   assert.equal(output.ok, false);
   assert.equal(output.exitCode, 2);
   assert.equal(output.errorCode, 'VALIDATION_ERROR');
@@ -3816,7 +4047,7 @@ test('register --all validates repository content for every candidate before wri
   assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
 });
 
-test('register mode exclusivity: exactly one of --source, --list, or --all', async (t) => {
+test('add mode exclusivity: exactly one of --source, --list, or --all', async (t) => {
   const { repo } = await fixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const manifestBefore = await fs.readFile(manifestPath, 'utf8');
@@ -3824,12 +4055,12 @@ test('register mode exclusivity: exactly one of --source, --list, or --all', asy
   await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Deploy prompt\n');
 
   const failures = [
-    { args: ['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--list', '--repo', repo], message: /--source cannot be combined/ },
-    { args: ['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--all', '--repo', repo], message: /--source cannot be combined/ },
-    { args: ['register', '--list', '--all', '--repo', repo], message: /--list and --all are mutually exclusive/ },
-    { args: ['register', '--list', '--all', '--source', 'resources/prompts/deploy.md', '--repo', repo], message: /--list and --all are mutually exclusive/ },
-    { args: ['register', '--type', 'theme', '--list', '--repo', repo], message: /Unsupported resource type/ },
-    { args: ['register', '--type', 'prompt', '--repo', repo], message: /register requires explicit --type and --source/ },
+    { args: ['add', '--target', 'prompts/deploy.md', '--list', '--repo', repo], message: /--target cannot be combined/ },
+    { args: ['add', '--target', 'prompts/deploy.md', '--all', '--repo', repo], message: /--target cannot be combined/ },
+    { args: ['add', '--list', '--all', '--repo', repo], message: /--list and --all are mutually exclusive/ },
+    { args: ['add', '--list', '--all', '--source', 'resources/prompts/deploy.md', '--repo', repo], message: /--list and --all are mutually exclusive/ },
+    { args: ['add', '--type', 'theme', '--list', '--repo', repo], message: /Unknown option: --type/ },
+    { args: ['add', '--repo', repo], message: /add requires --target/ },
   ];
   for (const { args, message } of failures) {
     const response = run(args);
@@ -3842,15 +4073,15 @@ test('register mode exclusivity: exactly one of --source, --list, or --all', asy
   }
   assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
 
-  // --list and --all are register-only options.
-  for (const args of [['status', '--list', '--repo', repo], ['plan', '--all', '--repo', repo]]) {
+  // --list and --all are add-only options.
+  for (const args of [['status', '--list', '--repo', repo], ['status', '--all', '--repo', repo]]) {
     const response = run(args);
     assert.equal(response.status, 2, response.stderr);
-    assert.match(result(response).error, /only supported by register/);
+    assert.match(result(response).error, /only supported by add/);
   }
 });
 
-test('register reports an accurate concurrency diagnostic when the manifest changes during the write', async (t) => {
+test('add reports an accurate concurrency diagnostic when the manifest changes during the write', async (t) => {
   const { repo } = await fixture(t);
   const root = path.dirname(repo);
   const manifestPath = path.join(repo, 'pi-sync.json');
@@ -3872,7 +4103,7 @@ test('register reports an accurate concurrency diagnostic when the manifest chan
   // so the concurrent change lands exactly in that window without racing it.
   const marker = path.join(root, 'hold-before-compare');
   await fs.writeFile(marker, '');
-  const args = ['register', '--type', 'prompt', '--source', 'resources/prompts/deploy.md', '--repo', repo];
+  const args = ['add', '--target', 'prompts/deploy.md', '--repo', repo];
   const pending = runAsync(args, { PI_SYNC_TEST_HOLD_BEFORE_COMPARE: marker });
   // Bounded wait for the atomic writer's temp file: its appearance means the
   // write has entered and is held in the comparison window.
@@ -3893,15 +4124,15 @@ test('register reports an accurate concurrency diagnostic when the manifest chan
   const response = await pending;
   assert.equal(response.status, 2, response.stderr || response.stdout);
   const output = result(response);
-  assert.equal(output.apiVersion, 1);
-  assert.equal(output.command, 'register');
+  assert.equal(output.apiVersion, 2);
+  assert.equal(output.command, 'add');
   assert.equal(output.ok, false);
   assert.equal(output.exitCode, 2);
   assert.equal(output.errorCode, 'VALIDATION_ERROR');
   // The diagnostic names the operation that was actually in flight, keeps
   // the retry guidance, and no longer mislabels the register write as a
   // remove.
-  assert.match(output.error, /pi-sync\.json changed during register/);
+  assert.match(output.error, /pi-sync\.json changed during add/);
   assert.doesNotMatch(output.error, /during remove/);
   assert.match(output.error, /retry without overwriting concurrent changes/);
   // The concurrent content is intact: the held write was refused before its
@@ -3913,13 +4144,147 @@ test('register reports an accurate concurrency diagnostic when the manifest chan
   // succeeds and keeps the concurrent entry.
   const retry = run(args);
   assert.equal(retry.status, 0, retry.stderr || retry.stdout);
-  assert.equal(result(retry).action, 'registered');
+  assert.equal(result(retry).action, 'declared');
   const finalManifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
   assert.deepEqual(finalManifest.resources, [
     { type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' },
     { type: 'prompt', source: 'resources/prompts/concurrent.md', target: 'prompts/concurrent.md' },
     { type: 'prompt', source: 'resources/prompts/deploy.md', target: 'prompts/deploy.md' },
   ]);
+});
+
+test('add --target --dry-run previews the declaration or import outcome without writing', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+
+  // Repository copy present only: the preview reports a declaration.
+  await fs.mkdir(path.join(repo, 'resources', 'prompts'), { recursive: true });
+  await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Repository prompt\n');
+  const declare = runRawWith(cli, ['add', '--target', 'prompts/deploy.md', '--dry-run', '--repo', repo, '--agent-dir', agentDir, '--json']);
+  assert.equal(declare.status, 0, declare.stderr);
+  const declareOut = result(declare);
+  assert.equal(declareOut.command, 'add');
+  assert.equal(declareOut.ok, true);
+  assert.equal(declareOut.exitCode, 0);
+  assert.equal(declareOut.mode, 'preview');
+  assert.equal(declareOut.action, 'declared');
+  assert.equal(declareOut.type, 'prompt');
+  assert.equal(declareOut.target, 'prompts/deploy.md');
+  assert.equal(declareOut.repositorySource, 'resources/prompts/deploy.md');
+  // The preview declares without copying: the local installation is untouched.
+  await assert.rejects(fs.access(path.join(agentDir, 'prompts')));
+
+  // Local copy present only: the preview reports an import.
+  const importRes = runRawWith(cli, ['add', '--target', 'skills/local-only', '--dry-run', '--repo', repo, '--agent-dir', agentDir, '--json']);
+  assert.equal(importRes.status, 0, importRes.stderr);
+  const importOut = result(importRes);
+  assert.equal(importOut.mode, 'preview');
+  assert.equal(importOut.action, 'added');
+  // The preview imports without copying: the repository is untouched.
+  await assert.rejects(fs.access(path.join(repo, 'resources', 'skills', 'local-only')));
+
+  // Both copies present and identical: the preview declares and notes the match.
+  const localPath = path.join(agentDir, 'prompts', 'deploy.md');
+  await fs.mkdir(path.dirname(localPath), { recursive: true });
+  await fs.writeFile(localPath, '# Repository prompt\n');
+  const match = result(runRawWith(cli, ['add', '--target', 'prompts/deploy.md', '--dry-run', '--repo', repo, '--agent-dir', agentDir, '--json']));
+  assert.equal(match.action, 'declared');
+  assert.equal(match.mode, 'preview');
+  assert.match(match.note, /repository and local content match/i);
+  // Re-adding an already-declared exact source+target stays an idempotent no-op in preview too.
+  const already = result(runRawWith(cli, ['add', '--target', 'skills/hello', '--dry-run', '--repo', repo, '--agent-dir', agentDir, '--json']));
+  assert.equal(already.exitCode, 0);
+  assert.equal(already.action, 'already-added');
+  assert.equal(already.mode, 'preview');
+
+  // Nothing was written by any preview: the manifest is byte-identical.
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+});
+
+test('add --target --dry-run reports collisions and validation errors without writing', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+
+  // Both copies present and differing: a collision that fails closed, naming both paths.
+  const localPath = path.join(agentDir, 'prompts', 'deploy.md');
+  const repositoryPath = path.join(repo, 'resources', 'prompts', 'deploy.md');
+  await fs.mkdir(path.dirname(localPath), { recursive: true });
+  await fs.mkdir(path.dirname(repositoryPath), { recursive: true });
+  await fs.writeFile(localPath, '# Local\n');
+  await fs.writeFile(repositoryPath, '# Repository\n');
+  const collision = runRawWith(cli, ['add', '--target', 'prompts/deploy.md', '--dry-run', '--repo', repo, '--agent-dir', agentDir, '--json']);
+  assert.equal(collision.status, 2, collision.stderr);
+  const collisionOut = result(collision);
+  assert.equal(collisionOut.ok, false);
+  assert.equal(collisionOut.errorCode, 'RESOURCE_COLLISION');
+  assert.ok(collisionOut.error.includes(localPath));
+  assert.ok(collisionOut.error.includes(repositoryPath));
+  await fs.rm(path.join(agentDir, 'prompts'), { recursive: true });
+  await fs.rm(path.join(repo, 'resources', 'prompts'), { recursive: true });
+
+  // Neither copy present: a validation error.
+  const missing = runRawWith(cli, ['add', '--target', 'prompts/absent.md', '--dry-run', '--repo', repo, '--agent-dir', agentDir, '--json']);
+  assert.equal(missing.status, 2, missing.stderr);
+  assert.match(result(missing).error, /does not exist in the setup repository or local installation/);
+
+  // Suspected secret material: reported with nothing written.
+  const secretPath = path.join(agentDir, 'skills', 'local-only', 'notes.md');
+  await fs.writeFile(secretPath, 'Example token: ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ\n');
+  const secret = runRawWith(cli, ['add', '--target', 'skills/local-only', '--dry-run', '--repo', repo, '--agent-dir', agentDir, '--json']);
+  assert.equal(secret.status, 2, secret.stderr);
+  const secretOut = result(secret);
+  assert.equal(secretOut.errorCode, 'SECRET_REVIEW_REQUIRED');
+  assert.equal(secretOut.reviewRequired[0].path, 'skills/local-only/notes.md');
+  await fs.rm(secretPath);
+
+  // Nothing was written by any error preview: manifest unchanged, no import.
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+  await assert.rejects(fs.access(path.join(repo, 'resources', 'skills', 'local-only')));
+});
+
+test('add --source --dry-run previews the dependency declaration without writing', async (t) => {
+  const { repo } = await fixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const lockPath = path.join(repo, 'pi-sync.lock.json');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+
+  // A dependency not yet declared: the preview reports an addition.
+  const declare = runRawWith(cli, ['add', '--source', 'npm:example-package', '--dry-run', '--repo', repo, '--json']);
+  assert.equal(declare.status, 0, declare.stderr);
+  const output = result(declare);
+  assert.equal(output.command, 'add');
+  assert.equal(output.ok, true);
+  assert.equal(output.mode, 'preview');
+  assert.equal(output.action, 'added');
+  assert.equal(output.type, 'dependency');
+  assert.deepEqual(output.dependency, { type: 'npm', name: 'example-package' });
+  // The preview declares without writing: the manifest is unchanged.
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
+
+  // An already-declared dependency is a collision in preview too.
+  await fs.writeFile(manifestPath, JSON.stringify({ schemaVersion: 1, resources: [], dependencies: [{ type: 'npm', name: 'example-package' }] }));
+  await fs.writeFile(lockPath, JSON.stringify({ schemaVersion: 1, packages: [{ type: 'npm', name: 'example-package', version: '1.2.3', releasedAt: '2024-01-01T00:00:00.000Z' }] }));
+  const collision = runRawWith(cli, ['add', '--source', 'npm:example-package', '--dry-run', '--repo', repo, '--json']);
+  assert.equal(collision.status, 2, collision.stderr);
+  assert.equal(result(collision).errorCode, 'DEPENDENCY_COLLISION');
+  // Still nothing was written.
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), JSON.stringify({ schemaVersion: 1, resources: [], dependencies: [{ type: 'npm', name: 'example-package' }] }));
+});
+
+test('add --list and add --all reject --dry-run because discovery is read-only', async (t) => {
+  const { repo } = await fixture(t);
+  const list = runRawWith(cli, ['add', '--list', '--dry-run', '--repo', repo, '--json']);
+  assert.equal(list.status, 2, list.stdout);
+  assert.match(JSON.parse(list.stdout).error, /not supported with --list/);
+  const all = runRawWith(cli, ['add', '--all', '--dry-run', '--repo', repo, '--json']);
+  assert.equal(all.status, 2, all.stdout);
+  assert.match(JSON.parse(all.stdout).error, /not supported with --all/);
+  // A bare --dry-run with no selector still fails on the missing selector.
+  const bare = runRawWith(cli, ['add', '--dry-run', '--repo', repo, '--json']);
+  assert.equal(bare.status, 2, bare.stdout);
+  assert.match(JSON.parse(bare.stdout).error, /add requires --target/);
 });
 
 test('declared targets that already exist unmanaged are reported as collisions and never overwritten', async (t) => {
@@ -3961,7 +4326,7 @@ test('declared targets that already exist unmanaged are reported as collisions a
   assert.equal(stillDirectory.isDirectory(), true);
 });
 
-test('stale new-type resources are reported and prune removes managed file resources', async (t) => {
+test('stale new-type resources are reported and remove --stale removes managed file resources', async (t) => {
   const { repo, agentDir } = await extendedFixture(t);
   addAllExtended(repo, agentDir);
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
@@ -3986,13 +4351,13 @@ test('stale new-type resources are reported and prune removes managed file resou
   assert.equal(await fs.readFile(path.join(agentDir, 'extensions', 'subagent', 'config.json'), 'utf8'), `${JSON.stringify({ model: 'local-model', maxAgents: 3 }, null, 2)}\n`);
 
   // Preview does not delete.
-  const preview = run(['prune', '--repo', repo, '--agent-dir', agentDir]);
+  const preview = run(['remove', '--stale', '--dry-run', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(preview.status, 0, preview.stderr);
   assert.deepEqual(result(preview).staleResources.map((item) => item.action).sort(), ['would-prune', 'would-prune']);
   await fs.access(path.join(agentDir, 'prompts', 'deploy.md'));
 
   // Confirmed prune removes the local file copies and their state entries.
-  const pruned = run(['prune', '--confirm', '--repo', repo, '--agent-dir', agentDir]);
+  const pruned = run(['remove', '--stale', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(pruned.status, 0, pruned.stderr);
   assert.deepEqual(result(pruned).staleResources.map((item) => item.target).sort(), ['extensions/subagent/config.json', 'prompts/deploy.md']);
   await assert.rejects(fs.access(path.join(agentDir, 'prompts', 'deploy.md')));
@@ -4008,7 +4373,7 @@ test('stale new-type resources are reported and prune removes managed file resou
   const manifest3 = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
   manifest3.resources = manifest3.resources.filter((item) => item.target !== 'extensions/github-copilot-usage');
   await fs.writeFile(manifestPath, JSON.stringify(manifest3));
-  const prunedDir = run(['prune', '--confirm', '--repo', repo, '--agent-dir', agentDir]);
+  const prunedDir = run(['remove', '--stale', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(prunedDir.status, 0, prunedDir.stderr);
   const pruneDirOutput = result(prunedDir);
   assert.equal(pruneDirOutput.staleResources[0].target, 'extensions/github-copilot-usage');
@@ -4029,7 +4394,7 @@ test('stale new-type resources are reported and prune removes managed file resou
   manifest2.resources = manifest2.resources.filter((item) => item.target !== 'agents/reviewer.md');
   await fs.writeFile(manifestPath, JSON.stringify(manifest2));
   await fs.writeFile(path.join(agentDir, 'agents', 'reviewer.md'), '# Keep my local agent\n');
-  const retained = run(['prune', '--confirm', '--repo', repo, '--agent-dir', agentDir]);
+  const retained = run(['remove', '--stale', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(retained.status, 1, retained.stderr);
   assert.equal(result(retained).staleResources[0].action, 'retained-modified');
   assert.equal(await fs.readFile(path.join(agentDir, 'agents', 'reviewer.md'), 'utf8'), '# Keep my local agent\n');
@@ -4120,7 +4485,7 @@ test('manifest validation fails closed for wrong-type roots, missing sources, an
 
 test('a managed file target replaced by a directory conflicts at apply without crashing or changing the target', async (t) => {
   const { repo, agentDir } = await extendedFixture(t);
-  const added = run(['add', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  const added = run(['add', '--target', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(added.status, 0, added.stderr);
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(first.status, 0, first.stderr);
@@ -4137,7 +4502,7 @@ test('a managed file target replaced by a directory conflicts at apply without c
   await fs.chmod(path.join(target, 'deploy.md'), baselineFile.mode);
   await fs.writeFile(path.join(repo, 'resources', 'prompts', 'deploy.md'), '# Repository prompt edit\n');
 
-  const planned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  const planned = run(['status', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(planned.status, 1, planned.stderr);
   assert.equal(result(planned).actions[0].action, 'conflict');
   assert.match(result(planned).actions[0].reason, /changed type/);
@@ -4174,7 +4539,7 @@ test('a managed extension directory replaced by a file conflicts at apply withou
   const sourceDir = path.join(agentDir, 'extensions', 'tool');
   await fs.mkdir(sourceDir, { recursive: true });
   await fs.writeFile(path.join(sourceDir, 'tool'), 'export const tool = 1;\n');
-  const added = run(['add', '--type', 'extension', '--source', 'extensions/tool', '--repo', repo, '--agent-dir', agentDir]);
+  const added = run(['add', '--target', 'extensions/tool', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(added.status, 0, added.stderr);
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(first.status, 0, first.stderr);
@@ -4191,7 +4556,7 @@ test('a managed extension directory replaced by a file conflicts at apply withou
   await fs.chmod(target, baselineFile.mode);
   await fs.rm(path.join(repo, 'resources', 'extensions', 'tool', 'tool'));
 
-  const planned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  const planned = run(['status', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(planned.status, 1, planned.stderr);
   const plannedAction = result(planned).actions[0];
   assert.equal(plannedAction.action, 'conflict');
@@ -4213,7 +4578,7 @@ test('a managed extension directory replaced by a file conflicts at apply withou
 
 test('file resource installs keep the repository file mode under a restrictive umask and stay idempotent', async (t) => {
   const { repo, agentDir } = await extendedFixture(t);
-  const added = run(['add', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  const added = run(['add', '--target', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(added.status, 0, added.stderr);
   const target = path.join(agentDir, 'prompts', 'deploy.md');
   await fs.rm(target);
@@ -4234,7 +4599,7 @@ test('file resource installs keep the repository file mode under a restrictive u
 
 test('a failed file apply restores the previous file through rollback and keeps the baseline', async (t) => {
   const { repo, agentDir } = await extendedFixture(t);
-  const added = run(['add', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  const added = run(['add', '--target', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(added.status, 0, added.stderr);
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(first.status, 0, first.stderr);
@@ -4266,12 +4631,12 @@ test('a failed file apply restores the previous file through rollback and keeps 
   assert.equal(await fs.readFile(target, 'utf8'), '# Repository prompt edit\n');
 });
 
-test('remove deletes managed resources and dependencies from the repository without touching the local installation', async (t) => {
+test('remove --keep-local deletes managed resources and dependencies from the repository without touching the local installation', async (t) => {
   const { root, repo, agentDir } = await extendedFixture(t);
   const skillDir = path.join(agentDir, 'skills', 'hello');
   await fs.mkdir(skillDir, { recursive: true });
   await fs.writeFile(path.join(skillDir, 'SKILL.md'), '# Hello\n');
-  assert.equal(run(['add', '--type', 'skill', '--source', 'skills/hello', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  assert.equal(run(['add', '--target', 'skills/hello', '--repo', repo, '--agent-dir', agentDir]).status, 0);
   addAllExtended(repo, agentDir);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const lockPath = path.join(repo, 'pi-sync.lock.json');
@@ -4284,7 +4649,7 @@ test('remove deletes managed resources and dependencies from the repository with
   ] }, null, 2)}\n`);
   const piEnv = await fakePi(t);
   const log = path.join(root, 'pi-calls.log');
-  const applied = run(['apply', '--approve', '--repo', repo, '--agent-dir', agentDir], { ...piEnv, PI_CALL_LOG: log });
+  const applied = run(['apply', '--approve-installs', '--repo', repo, '--agent-dir', agentDir], { ...piEnv, PI_CALL_LOG: log });
   assert.equal(applied.status, 0, `${applied.stderr}\n${applied.stdout}`);
   assert.equal((await piCalls(log)).filter((call) => call.startsWith('install')).length, 2, 'both packages installed locally before removal');
 
@@ -4297,22 +4662,22 @@ test('remove deletes managed resources and dependencies from the repository with
     ['role', 'roles/moderator.md'],
   ];
   for (const [type, target] of removals) {
-    const response = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', type, '--target', target], piEnv);
+    const response = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--target', target, '--keep-local'], piEnv);
     assert.equal(response.status, 0, `${type} ${target}: ${response.stderr}\n${response.stdout}`);
     const output = result(response);
-    assert.equal(output.apiVersion, 1);
+    assert.equal(output.apiVersion, 2);
     assert.equal(output.command, 'remove');
     assert.equal(output.ok, true);
     assert.equal(output.exitCode, 0);
     assert.deepEqual(output.removed, { type, source: `resources/${target}`, target });
-    assert.equal(output.stale.target, target);
-    assert.equal(output.stale.localInstallation, 'unchanged');
+    assert.equal(output.local.target, target);
+    assert.equal(output.local.action, 'unchanged');
     // Repository content and manifest entry are gone.
     await assert.rejects(fs.access(path.join(repo, 'resources', ...target.split('/'))));
     const current = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
     assert.equal(current.resources.some((item) => item.target === target), false);
     // The local installation is never modified and nothing is queued: the
-    // baseline stays in the local state for the stale report and prune flow.
+    // baseline stays in the local state for the stale report and remove --stale flow.
     const state = JSON.parse(await fs.readFile(path.join(agentDir, '.pi-sync', 'state.json'), 'utf8'));
     assert.ok(state.resources[target], `baseline for ${target} is retained`);
   }
@@ -4320,13 +4685,13 @@ test('remove deletes managed resources and dependencies from the repository with
   assert.equal(await fs.readFile(path.join(agentDir, 'extensions', 'github-copilot-usage', 'index.ts'), 'utf8'), 'export const usage = true;\n');
   assert.equal(await fs.readFile(path.join(agentDir, 'prompts', 'deploy.md'), 'utf8'), '# Deploy prompt\n');
 
-  const npmRemoved = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'npm:fixture-package'], piEnv);
+  const npmRemoved = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--source', 'npm:fixture-package'], piEnv);
   assert.equal(npmRemoved.status, 0, npmRemoved.stderr);
   const npmOutput = result(npmRemoved);
   assert.deepEqual(npmOutput.removed.dependency, { type: 'npm', name: 'fixture-package' });
   assert.equal(npmOutput.removed.pin.version, '1.0.0');
   assert.equal(npmOutput.localInstallation, 'unchanged');
-  const githubRemoved = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'github:acme/pi-extension'], piEnv);
+  const githubRemoved = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--source', 'github:acme/pi-extension'], piEnv);
   assert.equal(githubRemoved.status, 0, githubRemoved.stderr);
   assert.deepEqual(result(githubRemoved).removed.dependency, { type: 'github', repository: 'acme/pi-extension' });
   const finalManifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
@@ -4342,7 +4707,7 @@ test('remove validates before changing anything and leaves the repository unchan
   const skillDir = path.join(agentDir, 'skills', 'hello');
   await fs.mkdir(skillDir, { recursive: true });
   await fs.writeFile(path.join(skillDir, 'SKILL.md'), '# Hello\n');
-  assert.equal(run(['add', '--type', 'skill', '--source', 'skills/hello', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  assert.equal(run(['add', '--target', 'skills/hello', '--repo', repo, '--agent-dir', agentDir]).status, 0);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const lockPath = path.join(repo, 'pi-sync.lock.json');
   const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
@@ -4356,14 +4721,13 @@ test('remove validates before changing anything and leaves the repository unchan
   const contentBefore = await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8');
 
   const failures = [
-    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', 'skills/absent'], errorCode: 'REMOVE_TARGET_NOT_FOUND' },
-    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'prompt', '--target', 'skills/hello'], errorCode: 'REMOVE_TYPE_MISMATCH' },
-    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'npm:absent'], errorCode: 'REMOVE_DEPENDENCY_NOT_FOUND' },
+    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--target', 'skills/absent'], errorCode: 'REMOVE_TARGET_NOT_FOUND' },
+    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--source', 'npm:absent'], errorCode: 'REMOVE_DEPENDENCY_NOT_FOUND' },
     { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'theme', '--target', 'skills/hello'], errorCode: 'VALIDATION_ERROR' },
-    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill'] },
-    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency'] },
-    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', 'skills/hello', '--uninstall'], errorCode: 'VALIDATION_ERROR' },
-    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', '../escape'], errorCode: 'VALIDATION_ERROR' },
+    { args: ['remove', '--repo', repo, '--agent-dir', agentDir] },
+    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--target', 'skills/hello', '--source', 'npm:fixture-package'] },
+    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--target', 'skills/hello', '--uninstall'], errorCode: 'VALIDATION_ERROR' },
+    { args: ['remove', '--repo', repo, '--agent-dir', agentDir, '--target', '../escape'], errorCode: 'VALIDATION_ERROR' },
   ];
   for (const { args, errorCode } of failures) {
     const response = run(args);
@@ -4379,26 +4743,97 @@ test('remove validates before changing anything and leaves the repository unchan
 
   // A repository that does not validate stops remove before any change.
   await fs.writeFile(lockPath, `${JSON.stringify({ schemaVersion: 1, packages: [] }, null, 2)}\n`);
-  const invalid = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', 'skills/hello']);
+  const invalid = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--target', 'skills/hello']);
   assert.equal(invalid.status, 2, invalid.stderr);
   assert.equal(result(invalid).errorCode, 'VALIDATION_ERROR');
   assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
   assert.equal(await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8'), contentBefore);
+});
+test('remove --target previews the removal set with --dry-run without mutating anything', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  assert.equal(run(['apply', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  await fs.writeFile(path.join(agentDir, 'skills', 'hello', 'SKILL.md'), '# Diverged\n');
+  const manifestBefore = await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8');
+  const contentBefore = await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8');
+
+  const preview = run(['remove', '--target', 'skills/hello', '--dry-run', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(preview.status, 0, preview.stderr);
+  const output = result(preview);
+  assert.equal(output.command, 'remove');
+  assert.equal(output.mode, 'preview');
+  assert.deepEqual(output.removed, { type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' });
+  assert.equal(output.local.target, 'skills/hello');
+  assert.equal(output.local.action, 'preserved');
+  assert.match(output.local.reason, /diverged/);
+  assert.equal(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8'), manifestBefore);
+  assert.equal(await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8'), contentBefore);
+  assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'hello', 'SKILL.md'), 'utf8'), '# Diverged\n');
+  const state = JSON.parse(await fs.readFile(path.join(agentDir, '.pi-sync', 'state.json'), 'utf8'));
+  assert.ok(state.resources['skills/hello'], 'baseline is untouched by the preview');
+});
+
+test('remove --target fully removes the manifest entry, repository content, and local installation with a backup', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  assert.equal(run(['apply', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+
+  const preview = run(['remove', '--target', 'skills/hello', '--dry-run', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.equal(result(preview).local.action, 'would-remove');
+
+  const removed = run(['remove', '--target', 'skills/hello', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(removed.status, 0, removed.stderr);
+  const output = result(removed);
+  assert.equal(output.command, 'remove');
+  assert.equal(output.mode, 'applied');
+  assert.deepEqual(output.removed, { type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' });
+  assert.equal(output.local.target, 'skills/hello');
+  assert.equal(output.local.action, 'removed');
+  await assert.rejects(fs.access(path.join(agentDir, 'skills', 'hello')));
+  await assert.rejects(fs.access(path.join(repo, 'resources', 'skills', 'hello')));
+  assert.ok(!JSON.parse(await fs.readFile(manifestPath, 'utf8')).resources.some((item) => item.target === 'skills/hello'));
+  const backupRoot = path.join(agentDir, '.pi-sync', 'backups');
+  const backupStamp = (await fs.readdir(backupRoot)).at(-1);
+  assert.equal(await fs.readFile(path.join(backupRoot, backupStamp, 'skills', 'hello', 'SKILL.md'), 'utf8'), '# Hello\n');
+  const state = JSON.parse(await fs.readFile(path.join(agentDir, '.pi-sync', 'state.json'), 'utf8'));
+  assert.equal(Object.hasOwn(state.resources, 'skills/hello'), false);
+});
+
+test('remove --target preserves a diverged local copy and reports it while the repository removal proceeds', async (t) => {
+  const { repo, agentDir } = await fixture(t);
+  assert.equal(run(['apply', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  await fs.writeFile(path.join(agentDir, 'skills', 'hello', 'SKILL.md'), '# Keep my local work\n');
+
+  const removed = run(['remove', '--target', 'skills/hello', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(removed.status, 0, removed.stderr);
+  const output = result(removed);
+  assert.deepEqual(output.removed, { type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' });
+  assert.equal(output.local.target, 'skills/hello');
+  assert.equal(output.local.action, 'preserved');
+  assert.match(output.local.reason, /diverged/);
+  // The manifest entry and repository content are still removed.
+  await assert.rejects(fs.access(path.join(repo, 'resources', 'skills', 'hello')));
+  assert.equal(JSON.parse(await fs.readFile(path.join(repo, 'pi-sync.json'), 'utf8')).resources.length, 0);
+  // The local copy stays intact and is reported stale.
+  assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'hello', 'SKILL.md'), 'utf8'), '# Keep my local work\n');
+  const status = run(['status', '--no-fetch', '--repo', repo, '--agent-dir', agentDir]);
+  assert.equal(status.status, 0, status.stderr);
+  assert.deepEqual(result(status).staleResources, [{ target: 'skills/hello', state: 'modified', installed: true, pruneAvailable: true }]);
 });
 
 test('push publishes removal commits that delete previously managed paths', async (t) => {
   // Working-tree removal: remove, preview, and publish through managed push.
   const { repo, bare, root } = await pushFixture(t);
   const agentDir = path.join(root, 'agent');
-  const removed = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', 'skills/hello']);
+  const removed = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--target', 'skills/hello']);
   assert.equal(removed.status, 0, removed.stderr);
-  const preview = run(['push', '--repo', repo]);
+  const preview = run(['push', '--dry-run', '--repo', repo]);
   assert.equal(preview.status, 0, preview.stderr);
   const plan = result(preview);
   assert.equal(plan.mode, 'preview');
   assert.deepEqual(plan.changes.map((item) => [item.status, item.path]).sort(), [['D', 'resources/skills/hello/SKILL.md'], ['M', 'pi-sync.json']]);
   assert.equal(plan.commitRequired, true);
-  const published = run(['push', '--publish', '--repo', repo]);
+  const published = run(['push', '--repo', repo]);
   assert.equal(published.status, 0, published.stderr);
   const output = result(published);
   assert.equal(output.mode, 'published');
@@ -4418,7 +4853,7 @@ test('push publishes removal commits that delete previously managed paths', asyn
   gitAt(repo2, ['rm', '--quiet', '-r', '--', 'resources/skills/hello']);
   gitAt(repo2, ['add', '--', 'pi-sync.json']);
   gitAt(repo2, ['commit', '-m', 'roll back skill']);
-  const ahead = run(['push', '--publish', '--repo', repo2]);
+  const ahead = run(['push', '--repo', repo2]);
   assert.equal(ahead.status, 0, `${ahead.stderr}\n${ahead.stdout}`);
   const aheadOutput = result(ahead);
   assert.equal(aheadOutput.mode, 'published');
@@ -4440,7 +4875,7 @@ test('push rejects unrelated ahead commits, including ones mixed with a removal 
   gitAt(repo, ['add', '--', 'notes.txt']);
   gitAt(repo, ['commit', '-m', 'unrelated note']);
   const before = gitAt(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0];
-  const rejected = run(['push', '--publish', '--repo', repo]);
+  const rejected = run(['push', '--repo', repo]);
   assert.equal(rejected.status, 1, rejected.stderr);
   const output = result(rejected);
   assert.equal(output.errorCode, 'PUSH_BLOCKED');
@@ -4455,7 +4890,7 @@ test('push rejects unrelated ahead commits, including ones mixed with a removal 
   const sneaky = await pushFixture(t);
   await fs.writeFile(path.join(sneaky.repo, 'pi-sync.json'), `${JSON.stringify({ schemaVersion: 1, resources: [], dependencies: [] }, null, 2)}\n`);
   await fs.writeFile(path.join(sneaky.repo, 'resources', 'skills', 'hello', 'SKILL.md'), '# Sneaky re-add\n');
-  const blocked = run(['push', '--publish', '--repo', sneaky.repo]);
+  const blocked = run(['push', '--repo', sneaky.repo]);
   assert.equal(blocked.status, 1, blocked.stderr);
   assert.equal(result(blocked).errorCode, 'PUSH_BLOCKED');
   assert.deepEqual(result(blocked).details.unrelatedPaths, ['resources/skills/hello/SKILL.md']);
@@ -4475,13 +4910,13 @@ test('remove --uninstall uninstalls the dependency explicitly and reports failur
   const pinsFile = path.join(agentDir, '.pi-sync', 'packages.json');
   const okPi = await fakePi(t);
   const okLog = path.join(root, 'pi-ok.log');
-  const applied = run(['apply', '--approve', '--repo', repo, '--agent-dir', agentDir], { ...okPi, PI_CALL_LOG: okLog });
+  const applied = run(['apply', '--approve-installs', '--repo', repo, '--agent-dir', agentDir], { ...okPi, PI_CALL_LOG: okLog });
   assert.equal(applied.status, 0, applied.stderr);
   const pinsBefore = JSON.parse(await fs.readFile(pinsFile, 'utf8'));
   assert.equal(pinsBefore.packages['npm:fixture-package'], '1.0.0');
 
   const okLogBefore = await fs.readFile(okLog, 'utf8');
-  const removed = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'npm:fixture-package', '--uninstall'],
+  const removed = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--source', 'npm:fixture-package', '--uninstall'],
     { ...okPi, PI_CALL_LOG: okLog });
   assert.equal(removed.status, 0, `${removed.stderr}\n${removed.stdout}`);
   const output = result(removed);
@@ -4503,11 +4938,11 @@ test('remove --uninstall uninstalls the dependency explicitly and reports failur
   manifest2.dependencies = [{ type: 'npm', name: 'fixture-package' }];
   await fs.writeFile(manifestPath, `${JSON.stringify(manifest2, null, 2)}\n`);
   await fs.writeFile(lockPath, `${JSON.stringify({ schemaVersion: 1, packages: [pin] }, null, 2)}\n`);
-  const reinstalled = run(['apply', '--approve', '--repo', repo, '--agent-dir', agentDir], { ...okPi, PI_CALL_LOG: okLog });  assert.equal(reinstalled.status, 0, reinstalled.stderr);
+  const reinstalled = run(['apply', '--approve-installs', '--repo', repo, '--agent-dir', agentDir], { ...okPi, PI_CALL_LOG: okLog });  assert.equal(reinstalled.status, 0, reinstalled.stderr);
   const failPi = await fakePi(t, { fail: true });
   const failLog = path.join(root, 'pi-fail.log');
   await fs.writeFile(failLog, '');
-  const failed = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'npm:fixture-package', '--uninstall'],
+  const failed = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--source', 'npm:fixture-package', '--uninstall'],
     { ...failPi, PI_CALL_LOG: failLog });
   assert.equal(failed.status, 1, failed.stderr);
   const failure = result(failed);
@@ -4529,10 +4964,10 @@ test('remove --uninstall uninstalls the dependency explicitly and reports failur
   await fs.writeFile(lockPath, `${JSON.stringify({ schemaVersion: 1, packages: [
     { type: 'github', repository: 'acme/pi-extension', commit: githubCommit, tag: 'v1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' },
   ] }, null, 2)}\n`);
-  const githubApplied = run(['apply', '--approve', '--repo', repo, '--agent-dir', agentDir], { ...okPi, PI_CALL_LOG: okLog });
+  const githubApplied = run(['apply', '--approve-installs', '--repo', repo, '--agent-dir', agentDir], { ...okPi, PI_CALL_LOG: okLog });
   assert.equal(githubApplied.status, 0, githubApplied.stderr);
   const okLogBefore2 = await fs.readFile(okLog, 'utf8');
-  const githubRemoved = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'github:acme/pi-extension', '--uninstall'],
+  const githubRemoved = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--source', 'github:acme/pi-extension', '--uninstall'],
     { ...okPi, PI_CALL_LOG: okLog });
   assert.equal(githubRemoved.status, 0, `${githubRemoved.stderr}\n${githubRemoved.stdout}`);
   const githubOutput = result(githubRemoved);
@@ -4545,23 +4980,23 @@ test('remove --uninstall uninstalls the dependency explicitly and reports failur
   assert.equal(pinsGithub.packages['github:acme/pi-extension'], undefined, 'local pin bookkeeping cleared after a GitHub uninstall');
 });
 
-test('the full remove, stale, and prune sequence works end to end after publication', async (t) => {
+test('the full remove, stale, and remove --stale sequence works end to end after publication', async (t) => {
   const { repo, bare, root } = await pushFixture(t);
   const agentDir = path.join(root, 'agent');
   const applied = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(applied.status, 0, applied.stderr);
   const manifestPath = path.join(repo, 'pi-sync.json');
 
-  const removed = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', 'skills/hello']);
+  const removed = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--target', 'skills/hello', '--keep-local']);
   assert.equal(removed.status, 0, removed.stderr);
-  const published = run(['push', '--publish', '--repo', repo]);
+  const published = run(['push', '--repo', repo]);
   assert.equal(published.status, 0, published.stderr);
   assert.equal(result(published).mode, 'published');
   const remoteFiles = spawnSync('git', ['--git-dir', bare, 'ls-tree', '-r', '--name-only', 'main'], { encoding: 'utf8' });
   assert.deepEqual(remoteFiles.stdout.trim().split(/\r?\n/).sort(), ['.gitignore', 'pi-sync.json', 'pi-sync.lock.json']);
 
   // status/plan/apply report the removed resource as stale; apply never deletes it.
-  for (const command of ['status', 'plan', 'apply']) {
+  for (const command of ['status', 'apply']) {
     const response = run([command, '--repo', repo, '--agent-dir', agentDir]);
     assert.equal(response.status, 0, `${command}: ${response.stderr}`);
     const output = result(response);
@@ -4575,20 +5010,20 @@ test('the full remove, stale, and prune sequence works end to end after publicat
   const redeclared = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
   redeclared.resources = [{ type: 'skill', source: 'resources/skills/hello', target: 'skills/hello' }];
   await fs.writeFile(manifestPath, `${JSON.stringify(redeclared, null, 2)}\n`);
-  const replanned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  const replanned = run(['status', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(replanned.status, 0, replanned.stderr);
   assert.deepEqual(result(replanned).staleResources, []);
   // Remove it again for the explicit local removal.
-  const removedAgain = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', 'skills/hello']);
+  const removedAgain = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--target', 'skills/hello', '--keep-local']);
   assert.equal(removedAgain.status, 0, removedAgain.stderr);
 
   // Prune preview does not delete; confirmed prune removes with a backup and
   // clears the local state entry.
-  const preview = run(['prune', '--repo', repo, '--agent-dir', agentDir]);
+  const preview = run(['remove', '--stale', '--dry-run', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(preview.status, 0, preview.stderr);
   assert.deepEqual(result(preview).staleResources, [{ target: 'skills/hello', action: 'would-prune', installed: true }]);
   await fs.access(path.join(agentDir, 'skills', 'hello', 'SKILL.md'));
-  const pruned = run(['prune', '--confirm', '--repo', repo, '--agent-dir', agentDir]);
+  const pruned = run(['remove', '--stale', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(pruned.status, 0, pruned.stderr);
   assert.deepEqual(result(pruned).staleResources, [{ target: 'skills/hello', action: 'pruned', installed: false }]);
   await assert.rejects(fs.access(path.join(agentDir, 'skills', 'hello')));
@@ -4601,7 +5036,7 @@ test('the full remove, stale, and prune sequence works end to end after publicat
 
 test('a tracked file target replaced by a same-content same-mode directory reports the kind mismatch without a repository change', async (t) => {
   const { repo, agentDir } = await extendedFixture(t);
-  const added = run(['add', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  const added = run(['add', '--target', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(added.status, 0, added.stderr);
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(first.status, 0, first.stderr);
@@ -4617,7 +5052,7 @@ test('a tracked file target replaced by a same-content same-mode directory repor
   await fs.writeFile(path.join(target, 'deploy.md'), '# Deploy prompt\n');
   await fs.chmod(path.join(target, 'deploy.md'), baselineFile.mode);
 
-  const planned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  const planned = run(['status', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(planned.status, 1, planned.stderr);
   const plannedAction = result(planned).actions[0];
   assert.equal(plannedAction.action, 'conflict');
@@ -4647,7 +5082,7 @@ test('a tracked extension directory replaced by a same-content same-mode file re
   const sourceDir = path.join(agentDir, 'extensions', 'tool');
   await fs.mkdir(sourceDir, { recursive: true });
   await fs.writeFile(path.join(sourceDir, 'tool'), 'export const tool = 1;\n');
-  const added = run(['add', '--type', 'extension', '--source', 'extensions/tool', '--repo', repo, '--agent-dir', agentDir]);
+  const added = run(['add', '--target', 'extensions/tool', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(added.status, 0, added.stderr);
   const first = run(['apply', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(first.status, 0, first.stderr);
@@ -4662,7 +5097,7 @@ test('a tracked extension directory replaced by a same-content same-mode file re
   await fs.writeFile(target, Buffer.from(baselineFile.content, 'base64'));
   await fs.chmod(target, baselineFile.mode);
 
-  const planned = run(['plan', '--repo', repo, '--agent-dir', agentDir]);
+  const planned = run(['status', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(planned.status, 1, planned.stderr);
   const plannedAction = result(planned).actions[0];
   assert.equal(plannedAction.action, 'conflict');
@@ -4692,7 +5127,7 @@ test('remove of a declared dependency without a lock pin reports the structured 
   const skillDir = path.join(agentDir, 'skills', 'hello');
   await fs.mkdir(skillDir, { recursive: true });
   await fs.writeFile(path.join(skillDir, 'SKILL.md'), '# Hello\n');
-  assert.equal(run(['add', '--type', 'skill', '--source', 'skills/hello', '--repo', repo, '--agent-dir', agentDir]).status, 0);
+  assert.equal(run(['add', '--target', 'skills/hello', '--repo', repo, '--agent-dir', agentDir]).status, 0);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const lockPath = path.join(repo, 'pi-sync.lock.json');
   // Declare the dependency without a lock pin: the repository no longer
@@ -4704,7 +5139,7 @@ test('remove of a declared dependency without a lock pin reports the structured 
   const lockBefore = await fs.readFile(lockPath, 'utf8');
   const contentBefore = await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8');
 
-  const response = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'npm:fixture-package']);
+  const response = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--source', 'npm:fixture-package']);
   assert.equal(response.status, 2, response.stderr);
   const output = result(response);
   assert.equal(output.ok, false);
@@ -4716,13 +5151,57 @@ test('remove of a declared dependency without a lock pin reports the structured 
 
   // Resource removal in the same repository keeps its strict repository
   // validation and still fails with the generic validation error.
-  const resourceRemove = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'skill', '--target', 'skills/hello']);
+  const resourceRemove = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--target', 'skills/hello']);
   assert.equal(resourceRemove.status, 2, resourceRemove.stderr);
   assert.equal(result(resourceRemove).errorCode, 'VALIDATION_ERROR');
   assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore);
   assert.equal(await fs.readFile(path.join(repo, 'resources', 'skills', 'hello', 'SKILL.md'), 'utf8'), contentBefore);
 });
 
+test('remove --source --dry-run previews dependency removal without uninstalling or writing', async (t) => {
+  const { root, repo, agentDir } = await extendedFixture(t);
+  const manifestPath = path.join(repo, 'pi-sync.json');
+  const lockPath = path.join(repo, 'pi-sync.lock.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.dependencies = [{ type: 'npm', name: 'fixture-package' }];
+  await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  const pin = { type: 'npm', name: 'fixture-package', version: '1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' };
+  await fs.writeFile(lockPath, `${JSON.stringify({ schemaVersion: 1, packages: [pin] }, null, 2)}\n`);
+  const okPi = await fakePi(t);
+  const log = path.join(root, 'pi-calls.log');
+  const pinsFile = path.join(agentDir, '.pi-sync', 'packages.json');
+  const applied = run(['apply', '--approve-installs', '--repo', repo, '--agent-dir', agentDir], { ...okPi, PI_CALL_LOG: log });
+  assert.equal(applied.status, 0, applied.stderr);
+  const pinsBefore = await fs.readFile(pinsFile, 'utf8');
+  const manifestBefore = await fs.readFile(manifestPath, 'utf8');
+  const lockBefore = await fs.readFile(lockPath, 'utf8');
+
+  const preview = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--source', 'npm:fixture-package', '--dry-run'], { ...okPi, PI_CALL_LOG: log });
+  assert.equal(preview.status, 0, `${preview.stderr}\n${preview.stdout}`);
+  const output = result(preview);
+  assert.equal(output.ok, true);
+  assert.equal(output.mode, 'preview');
+  assert.equal(output.localInstallation, 'unchanged');
+  assert.deepEqual(output.removed.dependency, { type: 'npm', name: 'fixture-package' });
+  assert.equal(output.removed.pin.version, '1.0.0');
+  assert.match(output.note, /^Dry run: .*would be removed, leaving it installed locally; nothing was changed\.$/);
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore, 'manifest byte-identical');
+  assert.equal(await fs.readFile(lockPath, 'utf8'), lockBefore, 'lockfile byte-identical');
+  assert.equal(await fs.readFile(pinsFile, 'utf8'), pinsBefore, 'pin bookkeeping byte-identical');
+  assert.deepEqual(await piCalls(log), ['install npm:fixture-package@1.0.0'], 'no uninstall ran');
+
+  // The --uninstall preview reports would-uninstall, still without any effect.
+  const uninstallPreview = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--source', 'npm:fixture-package', '--uninstall', '--dry-run'], { ...okPi, PI_CALL_LOG: log });
+  assert.equal(uninstallPreview.status, 0, `${uninstallPreview.stderr}\n${uninstallPreview.stdout}`);
+  const uninstallOutput = result(uninstallPreview);
+  assert.equal(uninstallOutput.mode, 'preview');
+  assert.equal(uninstallOutput.localInstallation, 'would-uninstall');
+  assert.match(uninstallOutput.note, /and the package uninstalled; nothing was changed\./);
+  assert.equal(await fs.readFile(manifestPath, 'utf8'), manifestBefore, 'manifest still byte-identical');
+  assert.equal(await fs.readFile(lockPath, 'utf8'), lockBefore, 'lockfile still byte-identical');
+  assert.equal(await fs.readFile(pinsFile, 'utf8'), pinsBefore, 'the package stays installed');
+  assert.deepEqual(await piCalls(log), ['install npm:fixture-package@1.0.0'], 'still no uninstall ran');
+});
 test('remove --uninstall with a corrupted local pin file fails before any side effect', async (t) => {
   const { root, repo, agentDir } = await extendedFixture(t);
   const manifestPath = path.join(repo, 'pi-sync.json');
@@ -4735,7 +5214,7 @@ test('remove --uninstall with a corrupted local pin file fails before any side e
   const pinsFile = path.join(agentDir, '.pi-sync', 'packages.json');
   const okPi = await fakePi(t);
   const log = path.join(root, 'pi-calls.log');
-  const applied = run(['apply', '--approve', '--repo', repo, '--agent-dir', agentDir], { ...okPi, PI_CALL_LOG: log });
+  const applied = run(['apply', '--approve-installs', '--repo', repo, '--agent-dir', agentDir], { ...okPi, PI_CALL_LOG: log });
   assert.equal(applied.status, 0, applied.stderr);
 
   // Corrupt the local pin bookkeeping after a successful install.
@@ -4744,7 +5223,7 @@ test('remove --uninstall with a corrupted local pin file fails before any side e
   const lockBefore = await fs.readFile(lockPath, 'utf8');
   const pinsBefore = await fs.readFile(pinsFile, 'utf8');
 
-  const response = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'npm:fixture-package', '--uninstall'],
+  const response = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--source', 'npm:fixture-package', '--uninstall'],
     { ...okPi, PI_CALL_LOG: log });
   assert.equal(response.status, 2, response.stderr);
   const output = result(response);
@@ -4761,7 +5240,7 @@ test('remove --uninstall with a corrupted local pin file fails before any side e
 
   // A valid pin file keeps the successful uninstall flow working.
   await fs.writeFile(pinsFile, `${JSON.stringify({ schemaVersion: 1, packages: { 'npm:fixture-package': '1.0.0' } }, null, 2)}\n`);
-  const retried = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'dependency', '--source', 'npm:fixture-package', '--uninstall'],
+  const retried = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--source', 'npm:fixture-package', '--uninstall'],
     { ...okPi, PI_CALL_LOG: log });
   assert.equal(retried.status, 0, retried.stderr);
   assert.equal(result(retried).localInstallation, 'uninstalled');
@@ -4772,7 +5251,7 @@ test('remove --uninstall with a corrupted local pin file fails before any side e
 
 test('remove restores the manifest atomically when the content deletion fails', async (t) => {
   const { repo, agentDir } = await extendedFixture(t);
-  const added = run(['add', '--type', 'prompt', '--source', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
+  const added = run(['add', '--target', 'prompts/deploy.md', '--repo', repo, '--agent-dir', agentDir]);
   assert.equal(added.status, 0, added.stderr);
   const manifestPath = path.join(repo, 'pi-sync.json');
   const lockPath = path.join(repo, 'pi-sync.lock.json');
@@ -4786,7 +5265,7 @@ test('remove restores the manifest atomically when the content deletion fails', 
   await fs.chmod(sourceParent, 0o500);
   let response;
   try {
-    response = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--type', 'prompt', '--target', 'prompts/deploy.md']);
+    response = run(['remove', '--repo', repo, '--agent-dir', agentDir, '--target', 'prompts/deploy.md']);
   } finally {
     await fs.chmod(sourceParent, 0o755);
   }
@@ -4817,7 +5296,7 @@ test('push rejects an ahead commit that leaves the repository in an invalid stat
   gitAt(repo, ['commit', '-m', 'restore the content']);
 
   const remoteBefore = gitAt(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0];
-  const rejected = run(['push', '--publish', '--repo', repo]);
+  const rejected = run(['push', '--repo', repo]);
   assert.equal(rejected.status, 1, rejected.stderr);
   const output = result(rejected);
   assert.equal(output.errorCode, 'PUSH_BLOCKED');
@@ -4834,7 +5313,7 @@ test('push rejects an ahead commit that leaves the repository in an invalid stat
   // the broken commit rewrites it with the valid content.
   gitAt(repo, ['reset', '--soft', 'HEAD~1']);
   gitAt(repo, ['commit', '--amend', '--no-edit']);
-  const republished = run(['push', '--publish', '--repo', repo]);
+  const republished = run(['push', '--repo', repo]);
   assert.equal(republished.status, 0, republished.stderr);
   assert.equal(result(republished).ok, true);
   assert.equal(gitAt(repo, ['rev-list', '--count', '@{upstream}..HEAD']), '0', 'repaired commits published');
@@ -4849,7 +5328,7 @@ test('push publishes a valid ahead commit that edits a directory resource source
   gitAt(repo, ['add', '--', 'resources/skills/hello']);
   gitAt(repo, ['commit', '-m', 'edit the skill']);
 
-  const response = run(['push', '--publish', '--repo', repo]);
+  const response = run(['push', '--repo', repo]);
   assert.equal(response.status, 0, response.stderr);
   assert.equal(result(response).ok, true);
   assert.equal(gitAt(repo, ['rev-list', '--count', '@{upstream}..HEAD']), '0');
@@ -4918,14 +5397,12 @@ test('omitted --repo without PI_SYNC_REPO_DIR defaults to ~/.pi-sync/setup under
   assert.equal(output.actions[0].target, 'skills/home-skill');
 });
 
-test('bootstrap still rejects --repo in favor of --repo-dir', () => {
-  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', 'unused', '--repo-dir', path.join(os.tmpdir(), 'never')], repoDefaultEnv());
+test('bootstrap rejects --repo-dir and accepts the unified --repo flag', () => {
+  const response = runRawWith(cli, ['bootstrap', '--repo-dir', path.join(os.tmpdir(), 'never'), '--json'], repoDefaultEnv());
   assert.equal(response.status, 2, `${response.stderr}\n${response.stdout}`);
-  const output = result(response);
-  assert.equal(output.ok, false);
-  assert.equal(output.error, 'bootstrap uses --repo-dir, not --repo');
+  assert.match(JSON.parse(response.stdout).error, /Unknown option: --repo-dir/);
 });
-test('bootstrap --approve resumes a first run blocked on first-install approval from the existing setup repository', async (t) => {
+test('bootstrap --approve-installs resumes a first run blocked on first-install approval from the existing setup repository', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-approve-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const sourceRepo = path.join(root, 'remote-fixture');
@@ -4952,7 +5429,7 @@ test('bootstrap --approve resumes a first run blocked on first-install approval 
   };
   const agentDir = path.join(root, 'agent');
   const setupDir = path.join(root, 'private-checkout');
-  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir];
 
   const first = run(args, env);
   assert.equal(first.status, 1, `${first.stderr}\n${first.stdout}`);
@@ -4962,7 +5439,7 @@ test('bootstrap --approve resumes a first run blocked on first-install approval 
   assert.equal(firstOutput.apply.errorCode, 'APPROVAL_REQUIRED');
   assert.deepEqual(await piCalls(env.PI_CALL_LOG), []);
 
-  const resumed = run([...args, '--approve'], env);
+  const resumed = run([...args, '--approve-installs'], env);
   assert.equal(resumed.status, 0, `${resumed.stderr}\n${resumed.stdout}`);
   const resumedOutput = result(resumed);
   assert.equal(resumedOutput.ok, true);
@@ -4979,7 +5456,7 @@ test('bootstrap rerun without --repo-url infers the repository URL from the chec
   const agentDir = path.join(root, 'agent');
   const setupDir = path.join(root, 'private-checkout');
 
-  const first = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir], { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  const first = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir], { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
   assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
   const firstOutput = result(first);
   assert.equal(firstOutput.repoUrl, 'https://github.com/acme/private-setup.git');
@@ -4990,7 +5467,7 @@ test('bootstrap rerun without --repo-url infers the repository URL from the chec
   gitAt(setupDir, ['init', '--initial-branch=main']);
   gitAt(setupDir, ['remote', 'add', 'origin', 'https://github.com/acme/private-setup.git']);
 
-  const resumed = run(['bootstrap', '--repo-dir', setupDir, '--agent-dir', agentDir], { ...repoDefaultEnv() });
+  const resumed = run(['bootstrap', '--repo', setupDir, '--agent-dir', agentDir], { ...repoDefaultEnv() });
   assert.equal(resumed.status, 0, `${resumed.stderr}\n${resumed.stdout}`);
   const output = result(resumed);
   assert.equal(output.ok, true);
@@ -5004,7 +5481,7 @@ test('bootstrap first-time fetch without --repo-url fails with a usage error nam
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const setupDir = path.join(root, 'never-fetched');
 
-  const response = run(['bootstrap', '--repo-dir', setupDir, '--agent-dir', path.join(root, 'agent')], { ...repoDefaultEnv() });
+  const response = run(['bootstrap', '--repo', setupDir, '--agent-dir', path.join(root, 'agent')], { ...repoDefaultEnv() });
   assert.equal(response.status, 2, `${response.stderr}\n${response.stdout}`);
   const output = result(response);
   assert.equal(output.ok, false);
@@ -5021,13 +5498,13 @@ test('bootstrap without --repo-url fails closed when the checkout origin remote 
   const agentDir = path.join(root, 'agent');
   const setupDir = path.join(root, 'private-checkout');
 
-  const first = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir], { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  const first = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir], { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
   assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
   gitAt(setupDir, ['init', '--initial-branch=main']);
 
   // A non-GitHub origin URL fails validation and is never trusted.
   gitAt(setupDir, ['remote', 'add', 'origin', 'https://example.com/not-github.git']);
-  const badOrigin = run(['bootstrap', '--repo-dir', setupDir, '--agent-dir', agentDir], { ...repoDefaultEnv() });
+  const badOrigin = run(['bootstrap', '--repo', setupDir, '--agent-dir', agentDir], { ...repoDefaultEnv() });
   assert.equal(badOrigin.status, 1, `${badOrigin.stderr}\n${badOrigin.stdout}`);
   const badOriginOutput = result(badOrigin);
   assert.equal(badOriginOutput.ok, false);
@@ -5036,7 +5513,7 @@ test('bootstrap without --repo-url fails closed when the checkout origin remote 
 
   // No origin remote at all fails the same way.
   gitAt(setupDir, ['remote', 'remove', 'origin']);
-  const noOrigin = run(['bootstrap', '--repo-dir', setupDir, '--agent-dir', agentDir], { ...repoDefaultEnv() });
+  const noOrigin = run(['bootstrap', '--repo', setupDir, '--agent-dir', agentDir], { ...repoDefaultEnv() });
   assert.equal(noOrigin.status, 1, `${noOrigin.stderr}\n${noOrigin.stdout}`);
   const noOriginOutput = result(noOrigin);
   assert.equal(noOriginOutput.ok, false);
@@ -5052,12 +5529,12 @@ test('bootstrap explicit --repo-url wins over a differing origin remote and repo
   const agentDir = path.join(root, 'agent');
   const setupDir = path.join(root, 'private-checkout');
 
-  const first = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir], { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  const first = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir], { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
   assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
   gitAt(setupDir, ['init', '--initial-branch=main']);
   gitAt(setupDir, ['remote', 'add', 'origin', 'https://github.com/acme/other-setup.git']);
 
-  const resumed = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir], { ...repoDefaultEnv() });
+  const resumed = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir], { ...repoDefaultEnv() });
   assert.equal(resumed.status, 0, `${resumed.stderr}\n${resumed.stdout}`);
   const output = result(resumed);
   assert.equal(output.ok, true);
@@ -5073,7 +5550,7 @@ test('bootstrap rerun resumes from an existing valid setup repository and applie
   const fakeTools = await fakeGitHubTools(t, sourceRepo);
   const agentDir = path.join(root, 'agent');
   const setupDir = path.join(root, 'private-checkout');
-  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir];
 
   const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
   assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
@@ -5098,6 +5575,92 @@ test('bootstrap rerun resumes from an existing valid setup repository and applie
   assert.equal(await fs.readFile(path.join(agentDir, 'skills', 'resume-skill', 'SKILL.md'), 'utf8'), '# Resumed\n', 'the new repository resource is applied on resume');
 });
 
+// Recursive read-only snapshot: relative path -> file content (Buffer).
+// Symlinks and special entries are recorded by name only.
+async function snapshotTree(directory) {
+  const entries = new Map();
+  async function walk(dir, prefix) {
+    for (const entry of (await fs.readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      const full = path.join(dir, entry.name);
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) await walk(full, rel);
+      else if (entry.isFile()) entries.set(rel, await fs.readFile(full));
+      else entries.set(rel, `special:${entry.name}`);
+    }
+  }
+  await walk(directory, '');
+  return entries;
+}
+
+async function stagingCopies() {
+  return (await fs.readdir(os.tmpdir())).filter((entry) => entry.startsWith('.pi-sync-bootstrap-')).sort();
+}
+
+test('bootstrap --dry-run resumes from an existing valid setup repository without refetching or mutating', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-dry-run-resume-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir];
+
+  const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+  const setupBefore = await snapshotTree(setupDir);
+  const agentBefore = await snapshotTree(agentDir);
+  const stagingBefore = await stagingCopies();
+
+  // Resume branch: the existing checkout is copied to a temp staging dir and
+  // planned against the copy, then the preview returns before rename/apply.
+  const preview = run([...args, '--dry-run'], { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(preview.status, 0, `${preview.stderr}\n${preview.stdout}`);
+  const output = result(preview);
+  assert.equal(output.ok, true);
+  assert.equal(output.mode, 'preview');
+  assert.equal(output.authenticationMethod, null, 'a resumed preview never refetches the repository');
+  assert.equal(output.plan.ok, true);
+  assert.equal(output.plan.command, 'status');
+  assert.deepEqual(await snapshotTree(setupDir), setupBefore, 'the real setup repository is byte-identical after the preview');
+  assert.deepEqual(await snapshotTree(agentDir), agentBefore, 'the local installation is untouched by the preview');
+  assert.deepEqual(await stagingCopies(), stagingBefore, 'the staging copy is cleaned up after the preview');
+});
+
+test('bootstrap --dry-run removes the staging copy before rethrowing a copy failure', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-dry-run-cp-fail-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir];
+
+  const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+  const setupBefore = await snapshotTree(setupDir);
+  const agentBefore = await snapshotTree(agentDir);
+  const stagingBefore = await stagingCopies();
+
+  // An undeclared unreadable file passes validateRepository (which only reads
+  // the manifest and declared sources) but makes the staging fs.cp fail.
+  const blocker = path.join(setupDir, 'unreadable.txt');
+  await fs.writeFile(blocker, 'unreadable\n');
+  await fs.chmod(blocker, 0o000);
+  let response;
+  try {
+    response = run([...args, '--dry-run'], { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  } finally {
+    await fs.chmod(blocker, 0o644);
+  }
+  assert.notEqual(response.status, 0, response.stderr);
+  const output = result(response);
+  assert.equal(output.ok, false);
+  assert.equal(output.errorCode, 'VALIDATION_ERROR');
+  assert.match(output.error, /EACCES|permission denied/);
+  assert.deepEqual(await stagingCopies(), stagingBefore, 'cleanStaging removed the staging copy before the rethrow');
+  assert.deepEqual(await snapshotTree(setupDir).then((snapshot) => { snapshot.delete('unreadable.txt'); return snapshot; }), setupBefore, 'the real setup repository is untouched');
+  assert.deepEqual(await snapshotTree(agentDir), agentBefore, 'the local installation is untouched');
+});
 test('bootstrap surfaces the inner plan failure instead of hiding it', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-plan-error-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -5105,7 +5668,7 @@ test('bootstrap surfaces the inner plan failure instead of hiding it', async (t)
   const fakeTools = await fakeGitHubTools(t, sourceRepo);
   const agentDir = path.join(root, 'agent');
   const setupDir = path.join(root, 'private-checkout');
-  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir];
   const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
   assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
 
@@ -5132,7 +5695,7 @@ test('bootstrap still collides when the destination exists but is not a setup re
   await fs.mkdir(setupDir, { recursive: true });
   await fs.writeFile(path.join(setupDir, 'notes.txt'), 'not a setup repository\n');
 
-  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir], {
+  const response = run(['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir], {
     ...fakeTools, FAKE_GIT_ACCESS: 'yes',
   });
   assert.equal(response.status, 1, `${response.stderr}\n${response.stdout}`);
@@ -5151,7 +5714,7 @@ test('bootstrap rerun with the same package is idempotent and reports the bundle
   const fakeTools = await fakeGitHubTools(t, sourceRepo);
   const agentDir = path.join(root, 'agent');
   const setupDir = path.join(root, 'private-checkout');
-  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir];
 
   const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
   assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
@@ -5189,7 +5752,7 @@ test('bootstrap rerun refreshes changed bundled resources from the executing pac
   await fs.mkdir(path.dirname(unrelated), { recursive: true });
   await fs.writeFile(unrelated, '# Keep local\n');
   const setupDir = path.join(root, 'private-checkout');
-  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir];
 
   const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
   assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
@@ -5234,7 +5797,7 @@ test('bootstrap rerun with an older package downgrades the bundled resources to 
   const fakeTools = await fakeGitHubTools(t, sourceRepo);
   const agentDir = path.join(root, 'agent');
   const setupDir = path.join(root, 'private-checkout');
-  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir];
   const originalSkill = await fs.readFile(new URL('../resources/skills/pi-sync/SKILL.md', import.meta.url), 'utf8');
 
   const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
@@ -5273,7 +5836,7 @@ test('bootstrap rerun removes bundled files the executing package no longer ship
   const fakeTools = await fakeGitHubTools(t, sourceRepo);
   const agentDir = path.join(root, 'agent');
   const setupDir = path.join(root, 'private-checkout');
-  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir];
   const extraFile = 'extra-notes.md';
 
   const firstPkg = await packageFixture(t, root, {
@@ -5312,7 +5875,7 @@ test('bootstrap rerun collision preflights the bundled set and leaves every bund
   const fakeTools = await fakeGitHubTools(t, sourceRepo);
   const agentDir = path.join(root, 'agent');
   const setupDir = path.join(root, 'private-checkout');
-  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir];
 
   const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
   assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
@@ -5345,7 +5908,7 @@ test('bootstrap rerun reports an overlapping bundled declaration as a collision 
   const fakeTools = await fakeGitHubTools(t, sourceRepo);
   const agentDir = path.join(root, 'agent');
   const setupDir = path.join(root, 'private-checkout');
-  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir];
 
   const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
   assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
@@ -5380,7 +5943,7 @@ test('bootstrap rerun does not fetch or pull the existing setup repository', asy
   const fakeTools = await fakeGitHubTools(t, sourceRepo);
   const agentDir = path.join(root, 'agent');
   const setupDir = path.join(root, 'private-checkout');
-  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir];
 
   const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
   assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
@@ -5413,7 +5976,7 @@ test('bootstrap reports a local conflict while still reporting the refreshed set
   const fakeTools = await fakeGitHubTools(t, sourceRepo);
   const agentDir = path.join(root, 'agent');
   const setupDir = path.join(root, 'private-checkout');
-  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo-dir', setupDir, '--agent-dir', agentDir];
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir];
 
   const first = run(args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
   assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);

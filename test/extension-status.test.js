@@ -84,9 +84,10 @@ test('isSyncSummary validates the CLI summary shape', () => {
 
 test('extractSummary tolerates older CLI results without a summary block', () => {
   const summary = { localPending: 1, remotePending: 0, needsReview: 0, clean: false };
-  assert.deepEqual(extractSummary({ apiVersion: 1, command: 'status', ok: true, summary }), summary);
-  assert.equal(extractSummary({ apiVersion: 1, command: 'status', ok: true }), null);
-  assert.equal(extractSummary({ apiVersion: 1, command: 'status', ok: false, error: 'boom', errorCode: 'VALIDATION_ERROR' }), null);
+  assert.deepEqual(extractSummary({ apiVersion: 2, command: 'status', ok: true, summary }), summary);
+  assert.equal(extractSummary({ apiVersion: 1, command: 'status', ok: true, summary }), null);
+  assert.equal(extractSummary({ apiVersion: 2, command: 'status', ok: true }), null);
+  assert.equal(extractSummary({ apiVersion: 2, command: 'status', ok: false, error: 'boom', errorCode: 'VALIDATION_ERROR' }), null);
   assert.equal(extractSummary({ summary: { localPending: 'one', remotePending: 0, needsReview: 0, clean: false } }), null);
   assert.equal(extractSummary(null), null);
   assert.equal(extractSummary('not an object'), null);

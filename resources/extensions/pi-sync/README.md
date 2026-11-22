@@ -9,7 +9,7 @@ scope, or any other setting in the TUI. This extension watches those files
 and, after a short debounce, runs:
 
 ```sh
-pi-sync sync --apply --repo ~/.pi-sync/setup --agent-dir <agent dir>
+pi-sync sync --repo ~/.pi-sync/setup --agent-dir <agent dir>
 ```
 
 `pi-sync sync` promotes local-only changes into the `settings` declarations of
@@ -22,8 +22,8 @@ Conflicting fields (changed locally and in the repository) are never
 overwritten; they are reported for manual review.
 
 The extension is a thin trigger and relay: all sync logic lives in the
-`pi-sync` CLI, which also works headless (`pi-sync sync` previews,
-`pi-sync sync --apply` writes). Publishing synced changes still requires an
+`pi-sync` CLI, which also works headless (`pi-sync sync --dry-run` previews,
+bare `pi-sync sync` writes). Publishing synced changes still requires an
 explicit `pi-sync push`.
 
 ## Footer status
@@ -81,7 +81,7 @@ built-in latest-version notice by setting the documented
 On process startup, the extension asynchronously runs the read-only
 `pi-sync pi-update` eligibility check. If a release has passed the repository’s
 configured cooldown, a separate warning notification names the version and
-directs the user to `pi-sync pi-update --apply`. The check never delays startup
+directs the user to bare `pi-sync pi-update`. The check never delays startup
 or installs anything; no notice is shown when the candidate is absent or the
 check fails.
 
@@ -95,11 +95,11 @@ check fails.
 ## Multiple sessions
 
 Multiple Pi sessions sharing one agent directory are safe: each session runs
-its own watcher with per-process state, every `sync --apply` serializes on
+its own watcher with per-process state, every `sync` serializes on
 the same agent lock as `apply`, and the shared status cache ensures at most
 one full footer refresh per real change. A concurrent sync that loses the
 race re-reads the fresh manifest and baseline and becomes a no-op instead of
-double-writing. `sync --apply` never writes the settings files themselves
+double-writing. Bare `sync` never writes the settings files themselves
 (only the manifest and baseline state), so it cannot clobber a setting Pi is
 persisting.
 

@@ -65,14 +65,14 @@ const [command] = process.argv.slice(2);
 fs.appendFileSync(process.env.PI_TEST_CLI_LOG, JSON.stringify({ command, args: process.argv.slice(2) }) + '\\n');
 if (command === 'pi-update') {
   await new Promise((resolve) => setTimeout(resolve, Number(process.env.PI_TEST_UPDATE_DELAY_MS || 0)));
-  const result = JSON.parse(process.env.PI_TEST_UPDATE_RESULT || JSON.stringify({ apiVersion: 1, command: 'pi-update', ok: true, mode: 'preview', candidate: { version: '9.8.7' } }));
+  const result = JSON.parse(process.env.PI_TEST_UPDATE_RESULT || JSON.stringify({ apiVersion: 2, command: 'pi-update', ok: true, mode: 'preview', candidate: { version: '9.8.7' } }));
   console.log(JSON.stringify(result));
   fs.writeFileSync(process.env.PI_TEST_UPDATE_DONE, 'done');
   if (process.env.PI_TEST_UPDATE_EXIT === '1') process.exitCode = 2;
 } else if (command === 'status') {
-  console.log(JSON.stringify({ apiVersion: 1, command: 'status', ok: true, summary: { localPending: 0, remotePending: 0, needsReview: 0, clean: true } }));
+  console.log(JSON.stringify({ apiVersion: 2, command: 'status', ok: true, summary: { localPending: 0, remotePending: 0, needsReview: 0, clean: true } }));
 } else if (command === 'sync') {
-  console.log(JSON.stringify({ apiVersion: 1, command: 'sync', ok: true, synced: [] }));
+  console.log(JSON.stringify({ apiVersion: 2, command: 'sync', ok: true, synced: [] }));
 }
 `;
   const cliBin = path.join(binDir, 'pi-sync');
@@ -85,7 +85,7 @@ if (command === 'pi-update') {
   process.env.PI_TEST_AGENT_DIR = agentDir;
   process.env.PI_TEST_CLI_LOG = log;
   process.env.PI_TEST_UPDATE_RESULT = JSON.stringify(result ?? {
-    apiVersion: 1, command: 'pi-update', ok: true, mode: 'preview', candidate: { version: '9.8.7' },
+    apiVersion: 2, command: 'pi-update', ok: true, mode: 'preview', candidate: { version: '9.8.7' },
   });
   process.env.PI_TEST_UPDATE_DELAY_MS = String(delayMs);
   process.env.PI_TEST_UPDATE_DONE = done;
@@ -150,10 +150,10 @@ test('managed startup suppresses Pi check before its lifecycle check and asynchr
   const notice = state.notifications.find((item) => item.message.includes('Pi 9.8.7'));
   assert.equal(notice.level, 'warning');
   assert.match(notice.message, /Pi Sync Update Available/);
-  assert.match(notice.message, /pi-sync pi-update --apply/);
+  assert.match(notice.message, /pi-sync pi-update/);
   assert.equal(state.notifications.filter((item) => item.message.includes('Pi Sync Update Available')).length, 1);
   assert.deepEqual((await cliCalls(state.log, 'pi-update')).map((entry) => entry.args), [
-    ['pi-update', '--repo', state.setup, '--agent-dir', state.agentDir],
+    ['pi-update', '--json', '--repo', state.setup, '--agent-dir', state.agentDir],
   ]);
 
   for (const reason of ['resume', 'fork', 'new']) state.handlers.get('session_start')({ reason }, state.ctx);
@@ -187,7 +187,7 @@ test('managed initialization preserves an explicitly supplied PI_SKIP_VERSION_CH
 
 test('a no-candidate result shows no version-specific startup notice', async (t) => {
   const state = await fixture(t, { result: {
-    apiVersion: 1, command: 'pi-update', ok: true, mode: 'preview', candidate: null,
+    apiVersion: 2, command: 'pi-update', ok: true, mode: 'preview', candidate: null,
   } });
   state.handlers.get('session_start')({ reason: 'startup' }, state.ctx);
   await waitFor(() => fs.access(state.done).then(() => true, () => false), 'no-candidate check completion');

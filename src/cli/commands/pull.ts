@@ -32,7 +32,7 @@ function pullConflict(message: string, details: Record<string, unknown> = {}): P
 // upstream: reconcile the checkout with the local installation, then publish
 // local managed changes. Included in successful results and in refusals so
 // the JSON always points at the next step.
-const NEXT_STEPS = ['pi-sync plan', 'pi-sync apply'];
+const NEXT_STEPS = ['pi-sync status', 'pi-sync apply'];
 
 export interface PullInput {
   repo: string;
@@ -40,7 +40,7 @@ export interface PullInput {
 }
 
 export interface PullOutput {
-  apiVersion: 1;
+  apiVersion: 2;
   command: 'pull';
   ok: boolean;
   exitCode: number;
@@ -87,7 +87,7 @@ function parsePorcelain(output: string): PorcelainEntry[] {
 }
 
 // Shared, re-runnable safety preconditions plus a fresh upstream comparison.
-// `pull --apply` runs this after fetching, never reusing a preview's stale
+// Bare `pull` runs this after fetching, never reusing a preview's stale
 // tracking refs, so the mutation decision is always made on current state.
 interface CheckedState {
   branch: string;
@@ -241,10 +241,10 @@ function recoveryGuidance(snapshot: PullSnapshot): string[] {
   ];
 }
 
-// The pull workflow: by default it is a read-only preview of the upstream
-// changes and the local checkout dirt (apart from the bounded, metadata-only
-// fetch of the configured upstream). With --apply it re-fetches and rechecks
-// before mutating, then: if the branch is behind its upstream, it saves the
+// The pull workflow mutates by default; `--dry-run` previews the upstream
+// changes and local checkout dirt (apart from the bounded, metadata-only
+// fetch of the configured upstream). The mutating run re-fetches and rechecks
+// before mutating, then if the branch is behind its upstream, saves the
 // staged, unstaged, and non-ignored untracked working changes in a uniquely
 // identifiable recovery snapshot, advances the branch to the fetched upstream
 // tip using fast-forward-only semantics, and restores the snapshot with
@@ -253,7 +253,7 @@ function recoveryGuidance(snapshot: PullSnapshot): string[] {
 // conflict state with the snapshot retained for manual recovery. It never
 // merges or rewrites history, force-updates a ref, commits the restored
 // changes, or silently discards a snapshot. Pulling does not touch the local
-// installation; the result always guides the user to `pi-sync plan` and
+// installation; the result always guides the user to `pi-sync status` and
 // `pi-sync apply` afterwards.
 export async function runPull({ repo, apply }: PullInput): Promise<PullOutput> {
   const state = await checkRepository(repo);
@@ -264,15 +264,15 @@ export async function runPull({ repo, apply }: PullInput): Promise<PullOutput> {
 
   if (!apply) {
     const note = diverged
-      ? 'The branch has both local-only and upstream-only commits. Reconcile the branch manually; Pi Sync will not merge or rewrite history, and `pi-sync pull --apply` will refuse it.'
+      ? 'The branch has both local-only and upstream-only commits. Reconcile the branch manually; Pi Sync will not merge or rewrite history, and bare `pi-sync pull` will refuse it.'
       : upToDate
         ? state.ahead > 0
           ? 'The branch is up to date with its upstream and has local-only commits; publish them with `pi-sync push`.'
-          : 'The branch is already at the upstream tip; run `pi-sync plan` and `pi-sync apply` to reconcile the local installation.'
+          : 'The branch is already at the upstream tip; run `pi-sync status` and `pi-sync apply` to reconcile the local installation.'
         : dirty
-          ? 'The upstream has advanced and the working tree has local changes; `pi-sync pull --apply` snapshots the local changes, fast-forwards the branch, and restores them with the native Git three-way merge. Genuinely conflicting edits remain for manual resolution with the recovery snapshot retained.'
-          : 'The upstream has advanced and the checkout is clean; run `pi-sync pull --apply` to fast-forward the branch, then run `pi-sync plan` and `pi-sync apply` to reconcile the local installation.';
-    return { apiVersion: 1, command: 'pull', ok: true, exitCode: 0, repository: repo,
+          ? 'The upstream has advanced and the working tree has local changes; bare `pi-sync pull` snapshots the local changes, fast-forwards the branch, and restores them with the native Git three-way merge. Genuinely conflicting edits remain for manual resolution with the recovery snapshot retained.'
+          : 'The upstream has advanced and the checkout is clean; run bare `pi-sync pull` to fast-forward the branch, then run `pi-sync status` and `pi-sync apply` to reconcile the local installation.';
+    return { apiVersion: 2, command: 'pull', ok: true, exitCode: 0, repository: repo,
       branch: state.branch, upstream: state.upstream, mode: 'preview',
       ahead: state.ahead, behind: state.behind, upToDate, diverged, dirty, dirtyPaths,
       changedPaths: state.changedPaths, nextSteps: NEXT_STEPS, note };
@@ -283,7 +283,7 @@ export async function runPull({ repo, apply }: PullInput): Promise<PullOutput> {
   if (upToDate) {
     // Nothing to advance, so there is nothing to snapshot: the working tree
     // is left exactly as found.
-    return { apiVersion: 1, command: 'pull', ok: true, exitCode: 0, repository: repo,
+    return { apiVersion: 2, command: 'pull', ok: true, exitCode: 0, repository: repo,
       branch: state.branch, upstream: state.upstream, mode: 'applied',
       ahead: state.ahead, behind: state.behind, upToDate: true, diverged: false, dirty, dirtyPaths,
       changedPaths: [], nextSteps: NEXT_STEPS,
@@ -355,7 +355,7 @@ export async function runPull({ repo, apply }: PullInput): Promise<PullOutput> {
   const finalEntries = parsePorcelain(finalStatus.stdout);
   const finalDirtyPaths = finalEntries.map((entry) => entry.path);
 
-  return { apiVersion: 1, command: 'pull', ok: true, exitCode: 0, repository: repo,
+  return { apiVersion: 2, command: 'pull', ok: true, exitCode: 0, repository: repo,
     branch: state.branch, upstream: state.upstream, mode: 'applied',
     ahead: 0, behind: 0, upToDate: true, diverged: false, dirty: finalEntries.length > 0, dirtyPaths: finalDirtyPaths,
     changedPaths: state.changedPaths, fromCommit: fromCommit.output, toCommit: toCommit.output,
@@ -363,6 +363,6 @@ export async function runPull({ repo, apply }: PullInput): Promise<PullOutput> {
     ...(retained ? { snapshot: retained } : {}),
     nextSteps: NEXT_STEPS,
     note: snapshot
-      ? `The setup repository was fast-forwarded to the upstream tip and the local changes were restored from the pre-pull snapshot; ${finalEntries.length} path(s) remain dirty.${retained ? ` The recovery snapshot could not be discarded and is retained: find it in \`git stash list\` as "${retained.message}" (sha ${retained.sha}) and drop it with \`git stash drop ${retained.sha}\` once you no longer need it.` : ''} Run \`pi-sync plan\` and \`pi-sync apply\` to reconcile the local installation.`
-      : 'The setup repository was fast-forwarded to the upstream tip; run `pi-sync plan` and `pi-sync apply` to reconcile the local installation.' };
+      ? `The setup repository was fast-forwarded to the upstream tip and the local changes were restored from the pre-pull snapshot; ${finalEntries.length} path(s) remain dirty.${retained ? ` The recovery snapshot could not be discarded and is retained: find it in \`git stash list\` as "${retained.message}" (sha ${retained.sha}) and drop it with \`git stash drop ${retained.sha}\` once you no longer need it.` : ''} Run \`pi-sync status\` and \`pi-sync apply\` to reconcile the local installation.`
+      : 'The setup repository was fast-forwarded to the upstream tip; run `pi-sync status` and `pi-sync apply` to reconcile the local installation.' };
 }

@@ -87,7 +87,7 @@ async function holdForTestBeforeCompare() {
 // Shared atomic, concurrency-guarded manifest and lockfile write: an
 // exclusively created temp file whose sibling's text is compared before the
 // rename, so a concurrent change is never overwritten. `operation` names the
-// command performing the write (for example 'remove', 'register', or 'sync')
+// command performing the write (for example 'remove', 'add', or 'sync')
 // so a concurrent-change failure reports the operation that was actually in
 // flight, not a stale one.
 export async function writeJsonFileAtomic(file: string, value: unknown, previousText: string, operation: string) {
@@ -121,7 +121,7 @@ export async function restoreFileAtomic(file: string, text: string) {
   }
 }
 
-// Per-type rules for the add and register workflows: the local installation
+// Per-type rules for the add workflow: the local installation
 // root, the setup repository source root, the required content shape, and the
 // source pattern expressed against the agent-relative local root.
 export interface ResourceAddRule {
@@ -149,25 +149,25 @@ export const RESOURCE_ADD_RULES: Record<string, ResourceAddRule> = {
     pattern: /^workflows\/[A-Za-z0-9._-]+\.js$/, patternError: 'Workflow source must be a .js file directly under workflows/ (for example, workflows/octopus-loop.js)' },
 };
 
-// Normalizes an add --source value into an agent-relative POSIX path and
-// validates it against the type's source pattern.
-export function normalizeResourceSource(type: string, source: string, agentDir: string): string {
+// Normalizes an add --target value into an agent-relative POSIX path and
+// validates it against the inferred type's target pattern.
+export function normalizeResourceTarget(type: string, target: string, agentDir: string): string {
   const rule = RESOURCE_ADD_RULES[type];
   if (!rule) throw new Error(`Unsupported resource type: ${type}`);
-  if (typeof source !== 'string' || source.length === 0) throw new Error('--source must be a non-empty path');
+  if (typeof target !== 'string' || target.length === 0) throw new Error('--target must be a non-empty path');
   let relative: string;
-  if (path.isAbsolute(source)) {
-    const absolute = path.resolve(source);
+  if (path.isAbsolute(target)) {
+    const absolute = path.resolve(target);
     relative = path.relative(agentDir, absolute).split(path.sep).join('/');
     if (relative === '' || relative === '..' || relative.startsWith('../') || path.isAbsolute(relative)) {
-      throw new Error('--source must identify a resource inside the Pi agent directory');
+      throw new Error('--target must identify a resource inside the Pi agent directory');
     }
   } else {
-    if (source.includes('\\')) throw new Error('Relative --source paths must use POSIX separators');
-    relative = source;
+    if (target.includes('\\')) throw new Error('Relative --target paths must use POSIX separators');
+    relative = target;
   }
-  validateRelativePath(relative, '--source');
-  if (!rule.pattern.test(relative)) throw new Error(rule.patternError);
+  validateRelativePath(relative, '--target');
+  if (!rule.pattern.test(relative)) throw new Error(rule.patternError.replace('source', 'target'));
   return relative;
 }
 
@@ -177,7 +177,7 @@ export interface ResourceCandidate {
   target: string;
 }
 
-// Discovery for register --list and --all: candidates are the resources
+// Discovery for add --list and --all: candidates are the resources
 // present directly under a type root that the manifest does not declare.
 // The per-type shape rules are reused: .md files directly under the
 // prompts/agents/roles roots, .js files directly under the workflows

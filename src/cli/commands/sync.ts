@@ -29,7 +29,7 @@ export interface SyncInput {
 }
 
 export interface SyncOutput {
-  apiVersion: 1;
+  apiVersion: 2;
   command: 'sync';
   ok: boolean;
   exitCode: number;
@@ -56,14 +56,14 @@ async function syncSettings(repo: string, agentDir: string, declarations: Reposi
   const { syncable, conflicts, rejected, review } = syncClassification(plan);
 
   if (!applyChanges) {
-    return { apiVersion: 1, command: 'sync', ok: true, exitCode: 0, repository: repo, agentDirectory: agentDir, mode: 'preview',
+    return { apiVersion: 2, command: 'sync', ok: true, exitCode: 0, repository: repo, agentDirectory: agentDir, mode: 'preview',
       syncable, conflicts, rejected, review,
       note: syncable.length
-        ? 'Preview only: run `pi-sync sync --apply` to write the local values into the setup manifest. Pushing the change still requires an explicit `pi-sync push`.'
+        ? 'Preview only: run bare `pi-sync sync` to write the local values into the setup manifest. Pushing the change still requires an explicit `pi-sync push`.'
         : 'Nothing to sync: every managed setting field matches the setup manifest locally.' };
   }
 
-  const output: SyncOutput = { apiVersion: 1, command: 'sync', ok: true, exitCode: 0, repository: repo, agentDirectory: agentDir, mode: 'applied',
+  const output: SyncOutput = { apiVersion: 2, command: 'sync', ok: true, exitCode: 0, repository: repo, agentDirectory: agentDir, mode: 'applied',
     synced: [], conflicts, rejected, review, note: '' };
   if (!syncable.length) {
     output.note = conflicts.length || rejected.length || review.length
@@ -111,15 +111,12 @@ async function syncSettings(repo: string, agentDir: string, declarations: Reposi
   return output;
 }
 
-// The sync workflow: read-only preview by default; with --apply it takes the
-// same agent lock as apply (it writes the manifest and re-baselines the
-// synced fields) and publishes the local-only values into the setup manifest
-// without committing or pushing anything.
+// The sync workflow performs its action by default. `--dry-run` selects the
+// read-only preview; a mutating run takes the same agent lock as apply, writes
+// the manifest, and re-baselines synced fields without committing or pushing.
 export async function runSync({ repo, agentDir, declarations, apply }: SyncInput): Promise<SyncOutput> {
   const agentInfo = await fs.lstat(agentDir).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
   if (!agentInfo) throw new Error(`Pi agent directory does not exist: ${agentDir}`);
-  // --apply writes the manifest and re-baselines synced fields, so it takes
-  // the same agent lock as apply to serialize state.json updates.
   const releaseSyncLock = apply ? await acquireLock(agentDir) : null;
   try {
     const state = await loadState(agentDir);

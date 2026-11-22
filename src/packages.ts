@@ -171,7 +171,7 @@ export async function installPinnedPackages(lock: any, { approved = false, promp
   const installed = [];
   for (const item of lock.packages) {
     if (approvalRequired(item) && !approved && prompt && !await prompt(item)) throw Object.assign(new Error(`First-time installation approval was not granted for ${packageIdentity(item)}`), { errorCode: 'APPROVAL_REQUIRED' });
-    if (approvalRequired(item) && !approved && !prompt) throw Object.assign(new Error(`First-time installation requires explicit approval for ${packageIdentity(item)}; rerun with --approve`), { errorCode: 'APPROVAL_REQUIRED' });
+    if (approvalRequired(item) && !approved && !prompt) throw Object.assign(new Error(`First-time installation requires explicit approval for ${packageIdentity(item)}; rerun with --approve-installs`), { errorCode: 'APPROVAL_REQUIRED' });
     const result = await run('pi', ['install', packageSpec(item)]);
     if (result.status !== 0) {
       // Only packages installed in this run can be rolled back; when Pi could
@@ -215,7 +215,7 @@ export function lockWithUpdates(lock: any, updates: any) {
 }
 // First-time installation approval: a locked package with no local pin
 // bookkeeping entry is new for this agent directory and requires explicit
-// approval (--approve) or an interactive prompt before it is installed.
+// approval (--approve-installs) or an interactive prompt before it is installed.
 // Shared by the apply and update workflows.
 export async function obtainFirstInstallApproval(lock: any, pins: any, explicitlyApproved: any) {
   for (const item of lock.packages) {
@@ -223,7 +223,7 @@ export async function obtainFirstInstallApproval(lock: any, pins: any, explicitl
     if (explicitlyApproved) continue;
     const prompt = approvalPrompt(item);
     if (!prompt) {
-      const error: any = new Error(`First-time installation requires explicit approval for ${packageIdentity(item)}; rerun with --approve`);
+      const error: any = new Error(`First-time installation requires explicit approval for ${packageIdentity(item)}; rerun with --approve-installs`);
       error.errorCode = 'APPROVAL_REQUIRED';
       throw error;
     }

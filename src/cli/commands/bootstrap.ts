@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { inspectRequiredTools, type PrerequisitesResult, type PrerequisiteTool } from '../../prerequisites.js';
@@ -55,7 +56,8 @@ export interface BootstrapInput {
   repoDir: string;
   agentDir: string;
   binDir: string;
-  approve?: boolean;
+  approveInstalls?: boolean;
+  dryRun?: boolean;
 }
 
 export type BootstrapErrorCode =
@@ -68,8 +70,9 @@ export type BootstrapErrorCode =
   | 'REPOSITORY_REMOTE_UNRESOLVABLE';
 
 export interface BootstrapOutput {
-  apiVersion: 1;
+  apiVersion: 2;
   command: 'bootstrap';
+  mode?: 'preview' | 'applied';
   ok: boolean;
   errorCode: BootstrapErrorCode | undefined;
   error: string | undefined;
@@ -138,7 +141,7 @@ async function inferOriginRemoteUrl(repoDir: string): Promise<{ value: string; g
 }
 
 function bootstrapResponse(ok: boolean, errorCode: BootstrapErrorCode | undefined, error: string | undefined, extra: { repository: string; packageVersion: string } & Partial<Omit<BootstrapOutput, 'apiVersion' | 'command' | 'ok' | 'errorCode' | 'error' | 'exitCode' | 'repository' | 'packageVersion'>>): BootstrapOutput {
-  return { apiVersion: 1 as const, command: 'bootstrap', ok, errorCode, error, exitCode: ok ? 0 : OPERATION_ERROR, ...extra };
+  return { apiVersion: 2 as const, command: 'bootstrap', ok, errorCode, error, exitCode: ok ? 0 : OPERATION_ERROR, ...extra };
 }
 
 // The version of the package currently executing bootstrap: the bundle it
@@ -290,16 +293,16 @@ async function ensureRepositoryPolicy(repo: string): Promise<'created' | 'curren
   return existing === GITATTRIBUTES_POLICY ? 'current' : 'divergent';
 }
 
-// Runs a sibling pi-sync command (plan/apply) as a subprocess of this CLI
+// Runs a sibling pi-sync command (status/apply) as a subprocess of this CLI
 // build so bootstrap drives the exact established workflows, including the
 // apply/reconciliation path, with their own locking and error envelopes.
-async function runPiSync(command: 'plan' | 'apply', repo: string, agentDir: string, approve: boolean = false): Promise<PiSyncSubprocessResult> {
+async function runPiSync(command: 'status' | 'apply', repo: string, agentDir: string, approveInstalls: boolean = false): Promise<PiSyncSubprocessResult> {
   const entry = fileURLToPath(new URL('../../cli.js', import.meta.url));
-  const result = await runCommand(process.execPath, [entry, command, '--repo', repo, '--agent-dir', agentDir, ...(approve ? ['--approve'] : [])]);
+  const result = await runCommand(process.execPath, [entry, command, '--json', '--repo', repo, '--agent-dir', agentDir, ...(approveInstalls ? ['--approve-installs'] : [])]);
   let output;
   try { output = JSON.parse(result.stdout); } catch {
     const detail = (result.stderr || '').trim() || (result.stdout || '').trim() || (result.error ? result.error.message : '');
-    return { status: result.status ?? 1, output: { apiVersion: 1, command, ok: false, errorCode: 'CLI_FAILED',
+    return { status: result.status ?? 1, output: { apiVersion: 2, command, ok: false, errorCode: 'CLI_FAILED',
       error: `Pi Sync command returned no valid JSON output${detail ? `: ${detail.slice(0, 2000)}` : ''}`, exitCode: OPERATION_ERROR } };
   }
   return { status: result.status ?? output.exitCode ?? 1, output };
@@ -314,7 +317,7 @@ async function runPiSync(command: 'plan' | 'apply', repo: string, agentDir: stri
 // ordinary plan/apply commands. A rerun with the same command resumes from an
 // existing valid setup repository instead of requiring an empty path. Pi Sync
 // never requests, prints, or stores credentials.
-export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve = false }: BootstrapInput): Promise<BootstrapOutput> {
+export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approveInstalls = false, dryRun = false }: BootstrapInput): Promise<BootstrapOutput> {
   // An explicit --repo-url is validated up front, exactly as before; when
   // it is absent, inference is deferred until the destination has proven
   // to be a valid setup repository (resume path).
@@ -335,6 +338,11 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
   let checkout: string | null = null;
   let stagingRoot: string | null = null;
   let authenticationMethod: 'git' | 'github-cli' | null = 'git';
+  const cleanStaging = async () => {
+    if (!stagingRoot) return;
+    await fs.rm(stagingRoot, { recursive: true, force: true }).catch(() => {});
+    stagingRoot = null;
+  };
   if (existing) {
     if (!existing.isDirectory()) {
       return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination exists and is not a directory; choose an empty path', { repository: destination, packageVersion, ...urlFields() });
@@ -346,7 +354,6 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
     if (!setup) {
       return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination already exists but is not a valid Pi Sync setup repository; choose an empty path', { repository: destination, packageVersion, ...urlFields() });
     }
-    checkout = destination;
     authenticationMethod = null;
     if (remote === null) {
       // The destination has just passed validateRepository, so it is safe
@@ -359,6 +366,12 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
         return bootstrapResponse(false, 'REPOSITORY_REMOTE_UNRESOLVABLE', error instanceof Error ? error.message : String(error), { repository: destination, packageVersion });
       }
     }
+    if (dryRun) {
+      stagingRoot = await fs.mkdtemp(path.join(os.tmpdir(), '.pi-sync-bootstrap-'));
+      checkout = path.join(stagingRoot, 'checkout');
+      try { await fs.cp(destination, checkout, { recursive: true }); }
+      catch (error) { await cleanStaging(); throw error; }
+    } else checkout = destination;
   } else {
     // The entry point preflights the missing-URL case, so a first-time fetch
     // always carries an explicit URL; this guard keeps runBootstrap
@@ -372,7 +385,7 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
       let ghAvailable = false;
       let prerequisiteResult: PrerequisitesResult | null = null;
       if (remote.githubSlug) {
-        prerequisiteResult = await inspectRequiredTools(['gh'], { binDir: bin });
+        prerequisiteResult = await inspectRequiredTools(['gh'], { binDir: bin, install: !dryRun });
         ghAvailable = prerequisiteResult.ok;
         if (!ghAvailable) return bootstrapResponse(false, 'PREREQUISITE_INSTALL_REQUIRED',
           'GitHub CLI is required for this authentication handoff but could not be installed automatically.', {
@@ -384,7 +397,7 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
         ghAuthenticated = status.status === 0;
       }
       if (!ghAuthenticated) {
-        const resumeArgs = ['bootstrap', '--repo-url', remote.value, '--repo-dir', destination, '--agent-dir', path.resolve(agentDir), '--bin-dir', bin, ...(approve ? ['--approve'] : [])];
+        const resumeArgs = ['bootstrap', '--repo-url', remote.value, '--repo', destination, '--agent-dir', path.resolve(agentDir), '--bin-dir', bin, ...(approveInstalls ? ['--approve-installs'] : [])];
         const ghTool = prerequisiteResult?.tools.find((tool) => tool.name === 'gh');
         const ghExecutable = ghTool?.installPath ?? 'gh';
         const authArgs = [ghExecutable, 'auth', 'login', '--hostname', 'github.com'];
@@ -404,9 +417,12 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
       }
       authenticationMethod = 'github-cli';
     }
-    const parent = path.dirname(destination);
-    await fs.mkdir(parent, { recursive: true });
-    stagingRoot = await fs.mkdtemp(path.join(parent, '.pi-sync-bootstrap-'));
+    if (dryRun) stagingRoot = await fs.mkdtemp(path.join(os.tmpdir(), '.pi-sync-bootstrap-'));
+    else {
+      const parent = path.dirname(destination);
+      await fs.mkdir(parent, { recursive: true });
+      stagingRoot = await fs.mkdtemp(path.join(parent, '.pi-sync-bootstrap-'));
+    }
     checkout = path.join(stagingRoot, 'checkout');
     const cloneEnv = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` };
     // The GitHub CLI branch is only reached when remote.githubSlug was
@@ -416,14 +432,16 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
       ? await runCommand(await gitExecutable(), ['clone', '--quiet', '--', remote.value, checkout], cloneEnv)
       : await runCommand('gh', ['repo', 'clone', remote.githubSlug as string, checkout], cloneEnv);
     if (clone.status !== 0) {
+      await cleanStaging();
       return bootstrapResponse(false, 'FETCH_FAILED',
         authenticationMethod === 'git' ? 'GitHub access was detected but cloning the setup repository failed' : 'GitHub CLI authentication was detected but it could not fetch the setup repository',
         { repository: destination, packageVersion, ...urlFields() });
     }
-    setup = await validateRepository(checkout);
+    try { setup = await validateRepository(checkout); }
+    catch (error) { await cleanStaging(); throw error; }
   }
   try {
-    const prerequisites = await inspectRequiredTools(setup.requiredTools, { binDir: bin });
+    const prerequisites = await inspectRequiredTools(setup.requiredTools, { binDir: bin, install: !dryRun });
     if (!prerequisites.ok) return bootstrapResponse(false, 'PREREQUISITE_INSTALL_REQUIRED',
       'One or more required setup tools are unavailable. Resolve the listed handoff before applying the setup.', {
         repository: destination, packageVersion, prerequisites: prerequisites.tools, ...urlFields(),
@@ -438,32 +456,36 @@ export async function runBootstrap({ repoUrl, repoDir, agentDir, binDir, approve
     await validateRepository(checkout);
     const policyAction = await ensureRepositoryPolicy(checkout);
     const repositoryPolicy = { file: GITATTRIBUTES_FILE, action: policyAction };
-    const plan = await runPiSync('plan', checkout, path.resolve(agentDir));
+    const plan = await runPiSync('status', checkout, path.resolve(agentDir));
     if (plan.status !== 0 || !plan.output.ok) {
-      const refreshed = declaration.actions.some((action) => action.action !== 'already-current');
+      const refreshed = !dryRun && declaration.actions.some((action) => action.action !== 'already-current');
       return bootstrapResponse(false, 'APPLY_CONFLICT',
         `Bootstrap plan found a collision or conflict; existing local content was left untouched${refreshed ? ' The setup repository was already refreshed to the executing package\'s bundled resources; resolve the conflict and rerun bootstrap.' : ''}`, {
         repository: destination, packageVersion, ...urlFields(),
         bundledResources: declaration.actions, plan: plan.output, repositoryPolicy,
       });
     }
+    if (dryRun) return bootstrapResponse(true, undefined, undefined, {
+      repository: destination, mode: 'preview', authenticationMethod, prerequisites: prerequisites.tools, ...urlFields(),
+      packageVersion, bundledResources: declaration.actions, repositoryPolicy, plan: plan.output,
+    });
     if (checkout !== destination) {
       if (await fs.lstat(destination).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error))) {
         return bootstrapResponse(false, 'REPOSITORY_PATH_COLLISION', 'Setup repository destination appeared during bootstrap; no content was replaced', { repository: destination, packageVersion, ...urlFields() });
       }
       await fs.rename(checkout, destination);
     }
-    const applied = await runPiSync('apply', destination, path.resolve(agentDir), approve);
+    const applied = await runPiSync('apply', destination, path.resolve(agentDir), approveInstalls);
     const succeeded = applied.status === 0 && applied.output.ok;
     return bootstrapResponse(succeeded, succeeded ? undefined : 'APPLY_CONFLICT',
       succeeded ? undefined : 'Bootstrap apply did not complete cleanly; inspect the structured apply result and resume after resolving it', {
-        repository: destination, authenticationMethod, prerequisites: prerequisites.tools, ...urlFields(),
+        repository: destination, mode: 'applied', authenticationMethod, prerequisites: prerequisites.tools, ...urlFields(),
         packageVersion,
         bundledResources: declaration.actions,
         repositoryPolicy,
         apply: applied.output,
       });
   } finally {
-    if (stagingRoot) await fs.rm(stagingRoot, { recursive: true, force: true }).catch(() => {});
+    await cleanStaging();
   }
 }

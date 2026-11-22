@@ -304,7 +304,7 @@ export async function runPiUpdate({ repo, agentDir, apply }: PiUpdateInput) {
   const installation = await detectInstallation();
   const candidate = await findCandidate(installation.version, minimumReleaseAgeDays);
   if (!apply || !candidate) {
-    return { apiVersion: 1, command: 'pi-update', ok: true, exitCode: 0, mode: 'preview', localVersion: installation.version,
+    return { apiVersion: 2, command: 'pi-update', ok: true, exitCode: 0, mode: 'preview', localVersion: installation.version,
       installationMethod: installation.method, candidate, minimumReleaseAgeDays, policySource: 'setup repository pi-sync.json',
       note: candidate ? 'Preview only; no Pi installation or setup repository files were changed.' : 'No newer stable Pi release has met the setup repository release-age policy.' };
   }
@@ -340,7 +340,7 @@ export async function runPiUpdate({ repo, agentDir, apply }: PiUpdateInput) {
       failure.details = { message, rollbackError };
       throw failure;
     }
-    return { apiVersion: 1, command: 'pi-update', ok: true, exitCode: 0, mode: 'applied', localVersion: currentInstallation.version,
+    return { apiVersion: 2, command: 'pi-update', ok: true, exitCode: 0, mode: 'applied', localVersion: currentInstallation.version,
       installedVersion: currentCandidate.version, installationMethod: currentInstallation.method, candidate: currentCandidate,
       minimumReleaseAgeDays, policySource: 'setup repository pi-sync.json', note: 'Pi was updated locally; the setup repository was not changed.' };
   } finally { await releaseLock(); }

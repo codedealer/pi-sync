@@ -2,7 +2,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { GITATTRIBUTES_FILE, LOCK_FILE, MANIFEST_FILE, RESOURCE_RULES, isRecord, type RepositoryDeclarations } from '../manifest.js';
 import os from 'node:os';
-import crypto from 'node:crypto';
 import { gitResult } from '../process.js';
 import { findLikelySecrets, findLikelySecretsInText } from '../resource-operations.js';
 
@@ -25,21 +24,16 @@ export interface PushChange {
 export interface PushInput {
   repo: string;
   declarations: RepositoryDeclarations;
-  // Without --publish the run stops after the preview; --publish authorizes
-  // the managed-only commit and the ordinary fast-forward push.
+  // Preview mode is selected with --dry-run; otherwise the managed-only commit and fast-forward push run.
   publish?: boolean;
   // Optional subject for the new managed-only commit this run creates,
   // passed as a process argument. It never rewrites existing commits and
   // has no effect when no new commit is created.
   message?: string;
-  // The entry point owns stream output; the human-readable preview is passed
-  // through this narrow writer, which the entry point supplies (the stderr
-  // writer) for both the `push` command and `update --push`.
-  previewWriter: (preview: string) => void;
 }
 
 export interface PushOutput {
-  apiVersion: 1;
+  apiVersion: 2;
   command: 'push';
   ok: true;
   exitCode: 0;
@@ -57,8 +51,6 @@ export interface PushOutput {
   // The subject used (preview: to be used) for the new managed-only commit
   // this run creates. Absent when no new commit is planned or created.
   commitMessage?: string;
-  patchSha256?: string;
-  patchBytes?: number;
   forcePush?: boolean;
   note?: string;
 }
@@ -185,14 +177,14 @@ async function validateAheadCommitTree(repo: string, commit: string): Promise<vo
 }
 
 // The managed-only push workflow: it previews the managed-only commit, then
-// with --publish stages and commits only managed paths (manifest, lockfile,
+// by default stages and commits only managed paths (manifest, lockfile,
 // declared resource sources, and deletions of previously managed paths),
 // publishes already-committed managed-only ahead commits, and performs an
 // ordinary fast-forward push. Every safeguard (secret review, unrelated
 // commits, remote divergence, ignored paths, ahead-commit tree validation,
 // push rejection) fails closed with a PUSH_BLOCKED error, preserving local
 // state.
-export async function runPush({ repo, declarations, publish = false, message, previewWriter }: PushInput): Promise<PushOutput> {
+export async function runPush({ repo, declarations, publish = false, message }: PushInput): Promise<PushOutput> {
   const commitMessage = message ?? 'pi-sync: publish managed setup';
   const resourceSources = declarations.resources.map((item) => item.source);
   for (const managedFile of [MANIFEST_FILE, LOCK_FILE]) {
@@ -301,12 +293,10 @@ export async function runPush({ repo, declarations, publish = false, message, pr
     const patch = diffResult.stdout;
     const patchFindings = findLikelySecretsInText(patch, 'staged managed patch');
     if (patchFindings.length) throw gitFailure('Publishable managed changes contain suspected credential material; review and remove it before push', { reviewRequired: patchFindings });
-    if (!publish) return { apiVersion: 1, command: 'push', ok: true, exitCode: 0, repository: repo, branch, upstream,
+    if (!publish) return { apiVersion: 2, command: 'push', ok: true, exitCode: 0, repository: repo, branch, upstream,
       mode: 'preview', changes, patch, commitRequired, publicationAuthorized: false,
       ...(commitRequired ? { commitMessage } : {}),
-      note: 'Only these managed paths can be committed; rerun with --publish to authorize commit and push.' };
-    const renderedPreview = patch || '(no new working-tree diff; publishing already-committed managed changes)';
-    if (changes.length) previewWriter(`Pi Sync managed commit preview (before publication):\n${renderedPreview}\n`);
+      note: 'Only these managed paths can be committed; rerun without --dry-run to commit and push.' };
 
     if (commitRequired) {
       const committedPaths = changes.filter((item) => item.status !== 'committed').map((item) => item.path);
@@ -319,7 +309,7 @@ export async function runPush({ repo, declarations, publish = false, message, pr
         if (reset.status !== 0) throw gitFailure('Managed commit was created, but the normal Git index could not be refreshed; no local changes were discarded', { changes, gitStatus: reset.status });
       }
     }
-    if (!changes.length) return { apiVersion: 1, command: 'push', ok: true, exitCode: 0, repository: repo, branch, upstream,
+    if (!changes.length) return { apiVersion: 2, command: 'push', ok: true, exitCode: 0, repository: repo, branch, upstream,
       mode: 'published', changes: [], commit: null, note: 'No managed changes or managed-only commits were available to push.' };
 
     const pushed = await gitResult(repo, ['push', '--porcelain', remote, `HEAD:${upstream.slice(slash + 1)}`]);
@@ -327,10 +317,8 @@ export async function runPush({ repo, declarations, publish = false, message, pr
       upstream, changes, gitStatus: pushed.status,
     });
     const commit = await requireGit(repo, ['rev-parse', 'HEAD'], 'Push succeeded but the local commit could not be identified');
-    return { apiVersion: 1, command: 'push', ok: true, exitCode: 0, repository: repo, branch, upstream,
+    return { apiVersion: 2, command: 'push', ok: true, exitCode: 0, repository: repo, branch, upstream,
       mode: 'published', changes,
-      patchSha256: crypto.createHash('sha256').update(renderedPreview, 'utf8').digest('hex'),
-      patchBytes: Buffer.byteLength(renderedPreview, 'utf8'),
       commit, forcePush: false,
       ...(commitRequired ? { commitMessage } : {}) };
   } finally {

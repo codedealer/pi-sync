@@ -46,7 +46,7 @@ export interface ApplyInput {
 }
 
 export interface ApplyOutput {
-  apiVersion: 1;
+  apiVersion: 2;
   command: 'apply';
   ok: boolean;
   exitCode: number;
@@ -199,7 +199,7 @@ async function applySettings(agentDir: string, settings: PlanSetting) {
 // packages, and re-baselines the local state — all under the apply lock and
 // with full rollback of managed content, package pins, and pin state when
 // any step fails. Stale managed resources are reported but never touched;
-// only `prune --confirm` removes them.
+// only `remove` (the `--target` and `--stale` workflows) removes them.
 export async function runApply({ repo, agentDir, declarations, approve }: ApplyInput): Promise<ApplyOutput> {
   let agentInfo = await fs.lstat(agentDir).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
   if (!agentInfo) {
@@ -221,7 +221,7 @@ export async function runApply({ repo, agentDir, declarations, approve }: ApplyI
     }
     const plan = await buildPlan(repo, agentDir, declarations, currentState);
     const { actions, conflicts, staleResources } = reportBlocks(plan);
-    const output: ApplyOutput = { apiVersion: 1, command: 'apply', ok: conflicts.length === 0, exitCode: conflicts.length ? OPERATION_ERROR : 0,
+    const output: ApplyOutput = { apiVersion: 2, command: 'apply', ok: conflicts.length === 0, exitCode: conflicts.length ? OPERATION_ERROR : 0,
       repository: repo,
       agentDirectory: agentDir, actions, conflicts, staleResources,
       packages: declarations.lock.packages.map((item) => ({ package: packageIdentity(item), pin: packageRevision(item), action: 'pinned-install' })) };

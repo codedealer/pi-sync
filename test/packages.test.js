@@ -44,7 +44,8 @@ async function setup(t, { dependencies, packages, policy } = {}) {
 }
 
 function run(f, args, extra = {}) {
-  return spawnSync(process.execPath, [cli, ...args, '--repo', f.repo, '--agent-dir', f.agentDir], {
+  const jsonArgs = args.includes('--json') ? args : [...args, '--json'];
+  return spawnSync(process.execPath, [cli, ...jsonArgs, '--repo', f.repo, '--agent-dir', f.agentDir], {
     encoding: 'utf8', env: { ...process.env, PATH: `${f.bin}${path.delimiter}${process.env.PATH}`, FAKE_LOG: f.log, FAKE_PI_STATE: f.piState,
       FAKE_SHA: sha, ...extra },
   });
@@ -62,7 +63,7 @@ test('apply uses exact npm pins; standalone pi update is unsupported and can mov
   assert.equal(output(denied).errorCode, 'APPROVAL_REQUIRED');
   assert.deepEqual(await entries(f), []);
 
-  const approved = run(f, ['apply', '--approve']);
+  const approved = run(f, ['apply', '--approve-installs']);
   assert.equal(approved.status, 0, approved.stderr || approved.stdout);
   assert.deepEqual((await entries(f)).map(({ tool, args }) => [tool, args]), [['pi', ['install', 'npm:widget@1.0.0']]]);
   assert.deepEqual(JSON.parse(await fs.readFile(f.piState, 'utf8')), { installed: ['npm:widget@1.0.0'] });
@@ -90,7 +91,7 @@ test('apply installs a GitHub lock pin using a clean Pi git ref instead of a URL
   const pin = { type: 'github', repository: 'acme/extension', commit: sha, tag: 'v1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' };
   const f = await setup(t, { dependencies: [dependency], packages: [pin] });
 
-  const applied = run(f, ['apply', '--approve']);
+  const applied = run(f, ['apply', '--approve-installs']);
   assert.equal(applied.status, 0, applied.stderr || applied.stdout);
   assert.deepEqual((await entries(f)).filter(({ tool, args }) => tool === 'pi').map(({ args }) => args), [
     ['install', `git:github.com/acme/extension@${sha}`],
@@ -99,7 +100,7 @@ test('apply installs a GitHub lock pin using a clean Pi git ref instead of a URL
 
 test('apply rejects declarations without exact lock pins before invoking Pi', async (t) => {
   const f = await setup(t, { dependencies: npmDependency, packages: [] });
-  const response = run(f, ['apply', '--approve']);
+  const response = run(f, ['apply', '--approve-installs']);
   assert.equal(response.status, 2);
   assert.match(output(response).error, /missing exact pins.*npm:widget/);
   assert.deepEqual(await entries(f), []);
@@ -113,7 +114,7 @@ test('update preview applies the repository-owned seven-day minimum and does not
     policy: { minimumReleaseAgeDays: 7 } });
   const times = { '0.9.0': '2020-01-01T00:00:00.000Z', '1.0.0': new Date(now - 9 * 86400000).toISOString(), '2.0.0': new Date(now - 2 * 86400000).toISOString() };
   const before = await fs.readFile(path.join(f.repo, 'pi-sync.lock.json'), 'utf8');
-  const preview = run(f, ['update'], { FAKE_VERSIONS: JSON.stringify(['0.9.0', '1.0.0', '2.0.0']), FAKE_TIMES: JSON.stringify(times) });
+  const preview = run(f, ['update', '--dry-run'], { FAKE_VERSIONS: JSON.stringify(['0.9.0', '1.0.0', '2.0.0']), FAKE_TIMES: JSON.stringify(times) });
   assert.equal(preview.status, 0, preview.stderr || preview.stdout);
   const response = output(preview);
   assert.equal(response.minimumReleaseAgeDays, 7);
@@ -123,21 +124,21 @@ test('update preview applies the repository-owned seven-day minimum and does not
   assert.equal((await entries(f)).some(({ tool }) => tool === 'pi'), false);
 });
 
-test('update --apply requires first-install approval and writes the new exact lock only after Pi install succeeds', async (t) => {
+test('update requires first-install approval and writes the new exact lock only after Pi install succeeds', async (t) => {
   const f = await setup(t, { dependencies: npmDependency });
   const env = { FAKE_VERSIONS: '["1.0.0"]', FAKE_TIMES: '{"1.0.0":"2020-01-01T00:00:00.000Z"}' };
-  const denied = run(f, ['update', '--apply'], env);
+  const denied = run(f, ['update'], env);
   assert.equal(denied.status, 1);
   assert.equal(output(denied).errorCode, 'APPROVAL_REQUIRED');
   assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.repo, 'pi-sync.lock.json'), 'utf8')), { schemaVersion: 1, packages: [] });
   assert.equal((await entries(f)).some(({ tool }) => tool === 'pi'), false);
 
-  const failedInstall = run(f, ['update', '--apply', '--approve'], { ...env, FAKE_PI_FAIL: 'yes' });
+  const failedInstall = run(f, ['update', '--approve-installs'], { ...env, FAKE_PI_FAIL: 'yes' });
   assert.equal(failedInstall.status, 1);
   assert.equal(output(failedInstall).errorCode, 'PACKAGE_INSTALL_FAILED');
   assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.repo, 'pi-sync.lock.json'), 'utf8')), { schemaVersion: 1, packages: [] });
 
-  const accepted = run(f, ['update', '--apply', '--approve'], env);
+  const accepted = run(f, ['update', '--approve-installs'], env);
   assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
   const lock = JSON.parse(await fs.readFile(path.join(f.repo, 'pi-sync.lock.json'), 'utf8'));
   assert.deepEqual(lock.packages, [{ type: 'npm', name: 'widget', version: '1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' }]);
@@ -160,7 +161,7 @@ test('failed multi-package apply rolls back package installs, resources, setting
   ] }));
   await fs.mkdir(f.agentDir, { recursive: true });
   await fs.writeFile(path.join(f.agentDir, 'settings.json'), JSON.stringify({ localOnly: true }, null, 2));
-  const initial = run(f, ['apply', '--approve']);
+  const initial = run(f, ['apply', '--approve-installs']);
   assert.equal(initial.status, 0, initial.stderr || initial.stdout);
   const statePath = path.join(f.agentDir, '.pi-sync', 'state.json');
   const stateBefore = await fs.readFile(statePath, 'utf8');
@@ -176,7 +177,7 @@ test('failed multi-package apply rolls back package installs, resources, setting
     { type: 'npm', name: 'second', version: '1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' },
   ] }));
 
-  const failed = run(f, ['apply', '--approve'], { FAKE_PI_FAIL_SPEC: 'npm:second@1.0.0' });
+  const failed = run(f, ['apply', '--approve-installs'], { FAKE_PI_FAIL_SPEC: 'npm:second@1.0.0' });
   assert.equal(failed.status, 1, failed.stderr || failed.stdout);
   assert.equal(output(failed).errorCode, 'PACKAGE_INSTALL_FAILED');
   assert.match(output(failed).error, /previously installed package pins were restored/);
@@ -197,13 +198,13 @@ test('failed multi-package update restores existing Pi pins and leaves the lockf
   const dependencies = [{ type: 'npm', name: 'first' }, { type: 'npm', name: 'second' }];
   const packages = dependencies.map(({ name }) => ({ type: 'npm', name, version: '0.9.0', releasedAt: '2020-01-01T00:00:00.000Z' }));
   const f = await setup(t, { dependencies, packages });
-  const initial = run(f, ['apply', '--approve']);
+  const initial = run(f, ['apply', '--approve-installs']);
   assert.equal(initial.status, 0, initial.stderr || initial.stdout);
   const lockPath = path.join(f.repo, 'pi-sync.lock.json');
   const lockBefore = await fs.readFile(lockPath, 'utf8');
   const packageStatePath = path.join(f.agentDir, '.pi-sync', 'packages.json');
   const packageStateBefore = await fs.readFile(packageStatePath, 'utf8');
-  const failed = run(f, ['update', '--apply', '--approve'], {
+  const failed = run(f, ['update', '--approve-installs'], {
     FAKE_VERSIONS: '["0.9.0","1.0.0"]',
     FAKE_TIMES: '{"0.9.0":"2020-01-01T00:00:00.000Z","1.0.0":"2020-01-01T00:00:00.000Z"}',
     FAKE_PI_FAIL_SPEC: 'npm:second@1.0.0',
@@ -225,14 +226,14 @@ test('update rolls back installed packages and both pin files when either persis
   for (const failedTarget of ['lockfile', 'local package state']) {
     await t.test(failedTarget, async (t) => {
       const f = await setup(t, { dependencies: npmDependency, packages: npmPin });
-      const initial = run(f, ['apply', '--approve']);
+      const initial = run(f, ['apply', '--approve-installs']);
       assert.equal(initial.status, 0, initial.stderr || initial.stdout);
       const lockPath = path.join(f.repo, 'pi-sync.lock.json');
       const packageStatePath = path.join(f.agentDir, '.pi-sync', 'packages.json');
       const lockBefore = await fs.readFile(lockPath, 'utf8');
       const packageStateBefore = await fs.readFile(packageStatePath, 'utf8');
       const destination = failedTarget === 'lockfile' ? lockPath : packageStatePath;
-      const failed = run(f, ['update', '--apply', '--approve'], {
+      const failed = run(f, ['update', '--approve-installs'], {
         FAKE_VERSIONS: '["1.0.0","2.0.0"]',
         FAKE_TIMES: '{"1.0.0":"2020-01-01T00:00:00.000Z","2.0.0":"2020-01-01T00:00:00.000Z"}',
         NODE_OPTIONS: `--require=${f.faultModule}`,
@@ -253,7 +254,7 @@ test('update rolls back installed packages and both pin files when either persis
 
 test('update fails closed when any npm version has no trustworthy release timestamp', async (t) => {
   const f = await setup(t, { dependencies: npmDependency });
-  const response = run(f, ['update'], { FAKE_VERSIONS: '["1.0.0","2.0.0"]', FAKE_TIMES: '{"1.0.0":"2020-01-01T00:00:00.000Z"}' });
+  const response = run(f, ['update', '--dry-run'], { FAKE_VERSIONS: '["1.0.0","2.0.0"]', FAKE_TIMES: '{"1.0.0":"2020-01-01T00:00:00.000Z"}' });
   assert.equal(response.status, 1);
   assert.match(output(response).error, /timestamps.*incomplete.*stopped closed/);
   assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.repo, 'pi-sync.lock.json'), 'utf8')), { schemaVersion: 1, packages: [] });
@@ -262,7 +263,7 @@ test('update fails closed when any npm version has no trustworthy release timest
 test('GitHub update records an immutable commit, release tag, and published timestamp', async (t) => {
   const f = await setup(t, { dependencies: [{ type: 'github', repository: 'acme/extension' }] });
   const release = [{ tag_name: 'v2.0.0', published_at: '2020-01-01T00:00:00Z', draft: false, prerelease: false }];
-  const preview = run(f, ['update'], { FAKE_RELEASES: JSON.stringify(release) });
+  const preview = run(f, ['update', '--dry-run'], { FAKE_RELEASES: JSON.stringify(release) });
   assert.equal(preview.status, 0, `${preview.stderr || preview.stdout}\n${JSON.stringify(await entries(f))}`);
   const pin = output(preview).proposedPins[0];
   assert.deepEqual(pin, { type: 'github', repository: 'acme/extension', commit: sha, tag: 'v2.0.0', releasedAt: '2020-01-01T00:00:00.000Z' });
@@ -274,20 +275,20 @@ test('GitHub update records an immutable commit, release tag, and published time
 
 test('GitHub release metadata without a timestamp fails closed', async (t) => {
   const f = await setup(t, { dependencies: [{ type: 'github', repository: 'acme/extension' }] });
-  const preview = run(f, ['update'], { FAKE_RELEASES: JSON.stringify([{ tag_name: 'v1', published_at: null, draft: false, prerelease: false }]) });
+  const preview = run(f, ['update', '--dry-run'], { FAKE_RELEASES: JSON.stringify([{ tag_name: 'v1', published_at: null, draft: false, prerelease: false }]) });
   assert.equal(preview.status, 1);
   assert.match(output(preview).error, /tags or timestamps.*stopped closed/);
   assert.equal((await entries(f)).some(({ tool }) => tool === 'pi'), false);
 });
 
-test('update --apply installs a GitHub dependency through the Pi git: source spec', async (t) => {
+test('update installs a GitHub dependency through the Pi git: source spec', async (t) => {
   const f = await setup(t, { dependencies: [{ type: 'github', repository: 'acme/extension' }] });
   const release = [{ tag_name: 'v2.0.0', published_at: '2020-01-01T00:00:00Z', draft: false, prerelease: false }];
-  const denied = run(f, ['update', '--apply'], { FAKE_RELEASES: JSON.stringify(release) });
+  const denied = run(f, ['update'], { FAKE_RELEASES: JSON.stringify(release) });
   assert.equal(denied.status, 1, denied.stderr || denied.stdout);
   assert.equal(output(denied).errorCode, 'APPROVAL_REQUIRED');
 
-  const applied = run(f, ['update', '--apply', '--approve'], { FAKE_RELEASES: JSON.stringify(release) });
+  const applied = run(f, ['update', '--approve-installs'], { FAKE_RELEASES: JSON.stringify(release) });
   assert.equal(applied.status, 0, applied.stderr || applied.stdout);
   assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.repo, 'pi-sync.lock.json'), 'utf8')).packages,
     [{ type: 'github', repository: 'acme/extension', commit: sha, tag: 'v2.0.0', releasedAt: '2020-01-01T00:00:00.000Z' }]);
@@ -300,7 +301,7 @@ test('failed GitHub update rolls installed pins back through the same git: sourc
   const oldSha = 'a'.repeat(40);
   const packages = dependencies.map(({ repository }) => ({ type: 'github', repository, commit: oldSha, tag: 'v1.0.0', releasedAt: '2020-01-01T00:00:00.000Z' }));
   const f = await setup(t, { dependencies, packages });
-  const seeded = run(f, ['apply', '--approve']);
+  const seeded = run(f, ['apply', '--approve-installs']);
   assert.equal(seeded.status, 0, seeded.stderr || seeded.stdout);
 
   const lockPath = path.join(f.repo, 'pi-sync.lock.json');
@@ -308,7 +309,7 @@ test('failed GitHub update rolls installed pins back through the same git: sourc
   const packageStatePath = path.join(f.agentDir, '.pi-sync', 'packages.json');
   const packageStateBefore = await fs.readFile(packageStatePath, 'utf8');
   const release = [{ tag_name: 'v2.0.0', published_at: '2020-06-01T00:00:00Z', draft: false, prerelease: false }];
-  const failed = run(f, ['update', '--apply', '--approve'], {
+  const failed = run(f, ['update', '--approve-installs'], {
     FAKE_RELEASES: JSON.stringify(release),
     FAKE_PI_FAIL_SPEC: `git:github.com/acme/two@${sha}`,
   });
@@ -329,7 +330,7 @@ test('failed GitHub update rolls installed pins back through the same git: sourc
 
 test('dependency add updates only the declaration and directs agents through update', async (t) => {
   const f = await setup(t);
-  const added = run(f, ['add', '--type', 'dependency', '--source', 'npm:widget']);
+  const added = run(f, ['add', '--source', 'npm:widget']);
   assert.equal(added.status, 0, added.stderr || added.stdout);
   assert.deepEqual(output(added).dependency, { type: 'npm', name: 'widget' });
   assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.repo, 'pi-sync.json'), 'utf8')).dependencies, [{ type: 'npm', name: 'widget' }]);
@@ -339,7 +340,7 @@ test('dependency add updates only the declaration and directs agents through upd
 
 test('repository policy cannot lower seven days and malformed pins are rejected before package-manager calls', async (t) => {
   const f = await setup(t, { dependencies: npmDependency, packages: npmPin, policy: { minimumReleaseAgeDays: 6 } });
-  const response = run(f, ['apply', '--approve']);
+  const response = run(f, ['apply', '--approve-installs']);
   assert.equal(response.status, 2);
   assert.match(output(response).error, /at least seven days/);
   assert.deepEqual(await entries(f), []);
@@ -348,7 +349,7 @@ test('apply reports an unstartable Pi executable without claiming a package roll
   const f = await setup(t, { dependencies: npmDependency, packages: npmPin });
   const emptyBin = path.join(f.root, 'empty-bin');
   await fs.mkdir(emptyBin);
-  const response = run(f, ['apply', '--approve'], { PATH: emptyBin });
+  const response = run(f, ['apply', '--approve-installs'], { PATH: emptyBin });
   assert.equal(response.status, 1, response.stderr || response.stdout);
   assert.equal(output(response).errorCode, 'PACKAGE_INSTALL_FAILED');
   assert.match(output(response).error, /Pi package installation failed for npm:widget at recorded pin npm:widget@1\.0\.0/);

@@ -9,7 +9,7 @@
  *
  * This extension closes that loop: it watches the agent directory for
  * changes to the files the setup manifest declares as settings targets and,
- * after a short debounce, runs `pi-sync sync --apply`, which promotes
+ * after a short debounce, runs `pi-sync sync`, which promotes
  * local-only changes into the manifest (three-way compared against the last
  * applied baseline, portability-validated, and atomically written). All
  * sync logic lives in the pi-sync CLI; this extension is a thin trigger
@@ -60,7 +60,7 @@
  * notice by setting PI_SKIP_VERSION_CHECK during extension initialization,
  * unless the user already supplied that variable. At process startup only,
  * it asynchronously runs `pi-sync pi-update`; an eligible version gets a
- * separate warning notification with the explicit `pi-sync pi-update --apply`
+ * separate warning notification with the explicit `pi-sync pi-update`
  * command. The read-only check never delays startup or applies an update.
  *
  * The extension also guards the first reflexive reach for the local
@@ -72,7 +72,7 @@
  * of drifting, and blocking them would only add friction. The first such
  * call in a session is blocked, and the warning — the qualified source path
  * in the setup repository, then pi-sync apply (plus the concrete pi-sync
- * register command for a new resource), and the explicit retry-to-allow
+ * add command for a new resource), and the explicit retry-to-allow
  * bypass — is returned as the tool result. Every later call in the session
  * passes (persistence is intent), and arming resets on each session_start.
  * The gate is by input shape (path-like top-level fields), not tool name,
@@ -317,7 +317,7 @@ export default function (pi: ExtensionAPI) {
   async function checkPiUpdate(ctx: ExtensionContext) {
     if (!ctx.hasUI) return;
     try {
-      const { stdout } = await execFileAsync(cliBinary(), ["pi-update", "--repo", repoDir(), "--agent-dir", agentDir()], {
+      const { stdout } = await execFileAsync(cliBinary(), ["pi-update", "--json", "--repo", repoDir(), "--agent-dir", agentDir()], {
         timeout: PI_UPDATE_TIMEOUT_MS,
         maxBuffer: 1024 * 1024,
         shell: shellFor(cliBinary()),
@@ -329,10 +329,10 @@ export default function (pi: ExtensionAPI) {
         mode?: unknown;
         candidate?: { version?: unknown } | null;
       };
-      if (result.apiVersion !== 1 || result.command !== "pi-update" || result.ok !== true || result.mode !== "preview" ||
+      if (result.apiVersion !== 2 || result.command !== "pi-update" || result.ok !== true || result.mode !== "preview" ||
           typeof result.candidate?.version !== "string" || !result.candidate.version) return;
       ctx.ui.notify(
-        `Pi Sync Update Available: Pi ${result.candidate.version} has passed your release-age policy. Run \`pi-sync pi-update --apply\` to update.`,
+        `Pi Sync Update Available: Pi ${result.candidate.version} has passed your release-age policy. Run \`pi-sync pi-update\` to update.`,
         "warning",
       );
     } catch {
@@ -394,7 +394,7 @@ export default function (pi: ExtensionAPI) {
       stdout = await new Promise<string>((resolve, reject) => {
         execFile(
           cliBinary(),
-          ["status", ...(options.offline ? ["--no-fetch"] : []), "--repo", repoDir(), "--agent-dir", agentDir()],
+          ["status", "--json", ...(options.offline ? ["--no-fetch"] : []), "--repo", repoDir(), "--agent-dir", agentDir()],
           { timeout: CLI_STATUS_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024, shell: shellFor(cliBinary()) },
           (error, out) => {
             if (error !== null && (error.killed === true || error.signal !== undefined)) {
@@ -496,18 +496,19 @@ export default function (pi: ExtensionAPI) {
     running = true;
     setFooter(ctx); // auto-sync in flight: footer shows ⟳
     try {
-      const { stdout } = await execFileAsync(cliBinary(), ["sync", "--apply", "--repo", repoDir(), "--agent-dir", agentDir()], {
+      const { stdout } = await execFileAsync(cliBinary(), ["sync", "--json", "--repo", repoDir(), "--agent-dir", agentDir()], {
         timeout: SYNC_TIMEOUT_MS,
         maxBuffer: 4 * 1024 * 1024,
         shell: shellFor(cliBinary()),
       });
       const result = JSON.parse(stdout) as SyncResult;
+      if (result.apiVersion !== 2 || result.command !== "sync") throw new Error("pi-sync sync returned an unsupported JSON API version");
       if (result.ok && result.synced?.length) {
         const summary = result.synced.map((item) => `${item.target} ${item.path}`).join(", ");
         announce(ctx, `pi-sync: synced local setting change${result.synced.length > 1 ? "s" : ""} to the setup repo (${summary})`, "dim", "info");
       } else if (!result.ok) {
         const count = (result.conflicts?.length ?? 0) + (result.rejected?.length ?? 0) + (result.review?.length ?? 0);
-        announce(ctx, `pi-sync: ${count} managed setting change${count === 1 ? "" : "s"} need manual review; run pi-sync plan`, "warning", "warning");
+        announce(ctx, `pi-sync: ${count} managed setting change${count === 1 ? "" : "s"} need manual review; run pi-sync status`, "warning", "warning");
       } else if (manual) {
         announce(ctx, "pi-sync: nothing to sync; local settings match the setup repo", "dim", "info");
       }

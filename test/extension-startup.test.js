@@ -13,7 +13,7 @@ const processPath = fileURLToPath(new URL('../resources/extensions/pi-sync/proce
 const guardPath = fileURLToPath(new URL('../resources/extensions/pi-sync/guard.ts', import.meta.url));
 const envKeys = [
   'PI_SYNC_REPO_DIR', 'PI_SYNC_BIN', 'PI_TEST_AGENT_DIR', 'PI_TEST_CLI_LOG', 'PI_TEST_GIT_LOG',
-  'PI_TEST_STATUS_DELAY_MS', 'PI_TEST_STATUS_FAIL', 'PI_TEST_STATUS_SUMMARY', 'PI_SKIP_VERSION_CHECK', 'PATH',
+  'PI_TEST_STATUS_DELAY_MS', 'PI_TEST_STATUS_FAIL', 'PI_TEST_STATUS_SUMMARY', 'PI_TEST_SYNC_API_VERSION', 'PI_SKIP_VERSION_CHECK', 'PATH',
 ];
 
 const CLEAN_SUMMARY = { localPending: 0, remotePending: 0, needsReview: 0, clean: true };
@@ -77,13 +77,13 @@ import fs from 'node:fs';
 const [command] = process.argv.slice(2);
 fs.appendFileSync(process.env.PI_TEST_CLI_LOG, JSON.stringify({ command, args: process.argv.slice(2) }) + '\\n');
 if (command === 'pi-update') {
-  console.log(JSON.stringify({ apiVersion: 1, command: 'pi-update', ok: true, mode: 'preview', candidate: null }));
+  console.log(JSON.stringify({ apiVersion: 2, command: 'pi-update', ok: true, mode: 'preview', candidate: null }));
 } else if (command === 'status') {
   if (process.env.PI_TEST_STATUS_FAIL === '1') process.exit(1);
   await new Promise((resolve) => setTimeout(resolve, Number(process.env.PI_TEST_STATUS_DELAY_MS || 0)));
-  console.log(JSON.stringify({ apiVersion: 1, command: 'status', ok: true, summary: JSON.parse(process.env.PI_TEST_STATUS_SUMMARY || JSON.stringify(${JSON.stringify(CLEAN_SUMMARY)})) }));
+  console.log(JSON.stringify({ apiVersion: 2, command: 'status', ok: true, summary: JSON.parse(process.env.PI_TEST_STATUS_SUMMARY || JSON.stringify(${JSON.stringify(CLEAN_SUMMARY)})) }));
 } else if (command === 'sync') {
-  console.log(JSON.stringify({ apiVersion: 1, command: 'sync', ok: true, synced: [] }));
+  console.log(JSON.stringify({ apiVersion: Number(process.env.PI_TEST_SYNC_API_VERSION || 2), command: 'sync', ok: true, synced: [] }));
 }
 `;
   const cliBin = path.join(binDir, 'pi-sync');
@@ -184,7 +184,7 @@ test('session-start refresh runs a fresh CLI status, is non-blocking, and never 
   await waitFor(() => cliCalls(state.log, 'status').then((calls) => calls.length === 1), 'session-start status run');
   const [call] = await cliCalls(state.log, 'status');
   // The CLI status owns upstream freshness: no --no-fetch on session start.
-  assert.deepEqual(call.args, ['status', '--repo', state.setup, '--agent-dir', state.agentDir]);
+  assert.deepEqual(call.args, ['status', '--json', '--repo', state.setup, '--agent-dir', state.agentDir]);
 
   await waitFor(() => footerTexts(state.statuses).some((text) => text.includes('✓')), 'clean footer');
   assert.equal((await cliCalls(state.log, 'status')).length, 1, 'no duplicate fetch for an overlapping start');
@@ -240,7 +240,7 @@ test('non-session-start refreshes stay offline and cache-first', async (t) => {
   await fs.writeFile(manifest, JSON.stringify({ schemaVersion: 1, resources: [], dependencies: [], settings: [{ target: 'settings.json' }] }));
   await waitFor(() => cliCalls(state.log, 'status').then((calls) => calls.length === 2), 'offline status after cache miss');
   const [, second] = await cliCalls(state.log, 'status');
-  assert.deepEqual(second.args, ['status', '--no-fetch', '--repo', state.setup, '--agent-dir', state.agentDir]);
+  assert.deepEqual(second.args, ['status', '--json', '--no-fetch', '--repo', state.setup, '--agent-dir', state.agentDir]);
   await waitFor(() => fs.access(statusCachePath(state.agentDir)).then(() => true, () => false), 'cache republished');
   state.shutdown();
 });
@@ -273,5 +273,38 @@ test('a failed refresh keeps the failure state but retains the last successful s
   }, 'footer returns to the last successful summary');
   const texts = footerTexts(state.statuses);
   assert.ok(texts.lastIndexOf('pi-sync ↓2') > texts.lastIndexOf('pi-sync ✗'), 'the summary footer follows the failure footer');
+  state.shutdown();
+});
+test('an unsupported sync API version degrades to a warning instead of crashing', async (t) => {
+  const state = await fixture(t);
+  // The session-start handler arms the debounced initial sync (~1.5 s later);
+  // the spawned CLI reads the API version at spawn time, so the guard sees an
+  // unsupported apiVersion.
+  process.env.PI_TEST_SYNC_API_VERSION = '1';
+  state.handlers.get('session_start')({ reason: 'startup' }, state.ctx);
+  await waitFor(() => cliCalls(state.log, 'sync').then((calls) => calls.length >= 1), 'initial sync run', 5000);
+
+  // The version guard throws inside runSync's try; the catch must degrade to
+  // a one-shot warning rather than crashing the session.
+  await waitFor(
+    () => state.notifications.some((entry) => entry.level === 'warning' && /unsupported JSON API version/.test(entry.message)),
+    'unsupported-version warning',
+    5000
+  );
+  const warning = state.notifications.find((entry) => /unsupported JSON API version/.test(entry.message));
+  assert.match(warning.message, /automatic settings sync failed/);
+  assert.match(warning.message, /it will retry on the next change/);
+
+  // Warn-once: the extension must stay alive after the failure. A subsequent
+  // session-start refresh still runs a fresh CLI status (the process and its
+  // handlers were never torn down by the guard's throw). Shut down the first
+  // session first: session_start re-arms the watchers, and only the latest
+  // pair is closed at shutdown, so the previous session must be torn down
+  // before a new one starts.
+  const statusBefore = (await cliCalls(state.log, 'status')).length;
+  state.handlers.get('session_shutdown')({}, state.ctx);
+  state.handlers.get('session_start')({ reason: 'startup' }, state.ctx);
+  await waitFor(() => cliCalls(state.log, 'status').then((calls) => calls.length === statusBefore + 1), 'post-failure status run', 5000);
+  assert.equal(state.notifications.filter((entry) => /unsupported JSON API version/.test(entry.message)).length, 1, 'the warning is emitted exactly once');
   state.shutdown();
 });

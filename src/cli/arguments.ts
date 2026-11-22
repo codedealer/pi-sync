@@ -1,300 +1,170 @@
 import path from 'node:path';
 import os from 'node:os';
 
-// Typed command requests produced from raw CLI arguments. Argument parsing is
-// deliberately repository-agnostic: it resolves option defaults, validates
-// the option/command combinations, and returns a discriminated union that
-// the entry point dispatches on. No filesystem or git access happens here.
-
+// Typed command requests produced from raw CLI arguments. Parsing resolves
+// defaults and validates command/option combinations without filesystem access.
 export const DEFAULT_SETUP_REPO = path.join(os.homedir(), '.pi-sync', 'setup');
-
 export const RESOURCE_TYPES = ['skill', 'extension', 'prompt', 'agent', 'role', 'workflow'] as const;
-export const REMOVABLE_TYPES = ['skill', 'extension', 'prompt', 'agent', 'role', 'workflow', 'dependency'] as const;
 
-export interface RequestBase {
-  agentDir: string;
+export interface RequestBase { agentDir: string }
+
+export interface StatusRequest extends RequestBase {
+  command: 'status'; repo: string; noFetch: boolean;
 }
-
-export interface StatusPlanRequest extends RequestBase {
-  command: 'status' | 'plan';
-  repo: string;
-  noFetch: boolean;
-}
-
 export interface ApplyRequest extends RequestBase {
-  command: 'apply';
-  repo: string;
-  approve: boolean;
+  command: 'apply'; repo: string; dryRun: boolean; approveInstalls: boolean;
 }
-
-export interface PruneRequest extends RequestBase {
-  command: 'prune';
-  repo: string;
-  confirm: boolean;
+export interface AddDependencyRequest extends RequestBase {
+  command: 'add'; repo: string; type: 'dependency'; source: string; dryRun: boolean;
 }
-
-export interface AddRequest extends RequestBase {
-  command: 'add';
-  repo: string;
-  type: 'skill' | 'extension' | 'prompt' | 'agent' | 'role' | 'workflow' | 'dependency';
-  source: string;
+export interface AddResourceRequest extends RequestBase {
+  command: 'add'; repo: string; type: (typeof RESOURCE_TYPES)[number]; target: string; dryRun: boolean;
 }
+export type AddRequest = AddDependencyRequest | AddResourceRequest | AddResourceDiscoveryRequest;
 
-// Discriminated per removal kind: the parser guarantees that dependency
-// removals carry --source (and reject --target) and resource removals carry
-// --target (and reject --source), so each variant exposes only the selector
-// it requires.
 export interface RemoveDependencyRequest extends RequestBase {
-  command: 'remove';
-  repo: string;
-  type: 'dependency';
-  source: string;
-  uninstall: boolean;
+  command: 'remove'; repo: string; type: 'dependency'; source: string; uninstall: boolean; dryRun: boolean;
 }
-
 export interface RemoveResourceRequest extends RequestBase {
-  command: 'remove';
-  repo: string;
-  type: 'skill' | 'extension' | 'prompt' | 'agent' | 'role' | 'workflow';
-  target: string;
-  uninstall: boolean;
+  command: 'remove'; repo: string; type: (typeof RESOURCE_TYPES)[number]; target: string; keepLocal: boolean; dryRun: boolean;
 }
-
-export type RemoveRequest = RemoveDependencyRequest | RemoveResourceRequest;
-
-// The single-registration mode carries a required type: the parser rejects a
-// source registration without --type before this request is built.
-export type RegisterMode = { source: string; type: string } | { list: true; type?: string } | { all: true; type?: string };
-
-export interface RegisterRequest extends RequestBase {
-  command: 'register';
-  repo: string;
-  mode: RegisterMode;
+export interface RemoveStaleRequest extends RequestBase {
+  command: 'remove'; repo: string; type: 'stale'; dryRun: boolean;
 }
-
-export interface PullRequest extends RequestBase {
-  command: 'pull';
-  repo: string;
-  apply: boolean;
+export type RemoveRequest = RemoveDependencyRequest | RemoveResourceRequest | RemoveStaleRequest;
+export interface AddResourceDiscoveryRequest extends RequestBase {
+  command: 'add'; repo: string; type: 'resource-discovery'; mode: { list: true } | { all: true };
 }
-
-export interface PushRequest extends RequestBase {
-  command: 'push';
-  repo: string;
-  publish: boolean;
-  // Optional subject for the new managed-only commit this run creates. It
-  // never rewrites existing commits and has no effect when no commit is
-  // created.
-  message?: string;
-}
-
-export interface UpdateRequest extends RequestBase {
-  command: 'update';
-  repo: string;
-  apply: boolean;
-  push: boolean;
-  approve: boolean;
-  // Forwarded to the shared push workflow only for `update --apply --push`.
-  message?: string;
-}
-
-export interface PiUpdateRequest extends RequestBase {
-  command: 'pi-update';
-  repo: string;
-  apply: boolean;
-}
-
-export interface SyncRequest extends RequestBase {
-  command: 'sync';
-  repo: string;
-  apply: boolean;
-}
-
+export interface PullRequest extends RequestBase { command: 'pull'; repo: string; apply: boolean }
+export interface PushRequest extends RequestBase { command: 'push'; repo: string; publish: boolean; message?: string }
+export interface UpdateRequest extends RequestBase { command: 'update'; repo: string; apply: boolean; approveInstalls: boolean }
+export interface PiUpdateRequest extends RequestBase { command: 'pi-update'; repo: string; apply: boolean }
+export interface SyncRequest extends RequestBase { command: 'sync'; repo: string; apply: boolean }
 export interface BootstrapRequest {
-  command: 'bootstrap';
-  // Optional: when absent, the entry point requires a valid setup repository
-  // at the destination so the URL can be inferred from its origin remote.
-  repoUrl?: string;
-  repoDir: string;
-  agentDir: string;
-  binDir: string;
-  approve: boolean;
+  command: 'bootstrap'; repo: string; repoUrl?: string; agentDir: string; binDir: string;
+  approveInstalls: boolean; dryRun: boolean;
+}
+export interface VersionRequest { command: 'version' }
+export type CommandRequest = StatusRequest | ApplyRequest | AddRequest | RemoveRequest |
+  PullRequest | PushRequest | UpdateRequest | PiUpdateRequest | SyncRequest | BootstrapRequest | VersionRequest;
+
+const RESOURCE_TARGET_ROOTS: Record<(typeof RESOURCE_TYPES)[number], string> = {
+  skill: 'skills', extension: 'extensions', prompt: 'prompts', agent: 'agents', role: 'roles', workflow: 'workflows',
+};
+function resourceTypeForTarget(target: string): (typeof RESOURCE_TYPES)[number] | undefined {
+  return RESOURCE_TYPES.find((type) => target === RESOURCE_TARGET_ROOTS[type] || target.startsWith(`${RESOURCE_TARGET_ROOTS[type]}/`));
 }
 
-export interface VersionRequest {
-  command: 'version';
-}
-
-export type CommandRequest =
-  | StatusPlanRequest | ApplyRequest | PruneRequest | AddRequest | RemoveRequest | RegisterRequest
-  | PullRequest | PushRequest | UpdateRequest | PiUpdateRequest | SyncRequest | BootstrapRequest | VersionRequest;
-
-// Parsed option bag, mirroring the entry point's former `options` object.
 interface Options {
-  repo: string;
-  repoUrl?: string;
-  repoDir: string;
-  agentDir: string;
-  binDir: string;
-  type?: string;
-  source?: string;
-  target?: string;
-  confirm: boolean;
-  approve: boolean;
-  applyUpdate: boolean;
-  pushUpdate: boolean;
-  publish: boolean;
-  message?: string;
-  uninstall: boolean;
-  list: boolean;
-  all: boolean;
-  noFetch: boolean;
+  repo: string; repoUrl?: string; agentDir: string; binDir: string;
+  source?: string; target?: string; approveInstalls: boolean; dryRun: boolean;
+  pushUpdate: boolean; message?: string; uninstall: boolean; list: boolean;
+  all: boolean; noFetch: boolean; stale: boolean; keepLocal: boolean;
 }
 
 function parseOptions(argv: string[]): Options {
   const options: Options = {
     repo: process.env.PI_SYNC_REPO_DIR ?? DEFAULT_SETUP_REPO,
-    repoDir: DEFAULT_SETUP_REPO,
     agentDir: process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent'),
     binDir: path.join(os.homedir(), '.local', 'bin'),
-    confirm: false, approve: false, applyUpdate: false, pushUpdate: false,
-    publish: false, uninstall: false, list: false, all: false, noFetch: false,
+    approveInstalls: false, dryRun: false, pushUpdate: false,
+    uninstall: false, list: false, all: false, noFetch: false, stale: false, keepLocal: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (['--repo', '--repo-url', '--repo-dir', '--agent-dir', '--bin-dir', '--type', '--source', '--target', '--message'].includes(arg)) {
+    if (['--repo', '--repo-url', '--agent-dir', '--bin-dir', '--source', '--target', '--message'].includes(arg)) {
       const value = argv[++i];
       if (!value || value.startsWith('--')) throw new Error(`${arg} requires a value`);
       if (arg === '--repo') options.repo = value;
       else if (arg === '--repo-url') options.repoUrl = value;
-      else if (arg === '--repo-dir') options.repoDir = value;
       else if (arg === '--agent-dir') options.agentDir = value;
       else if (arg === '--bin-dir') options.binDir = value;
-      else if (arg === '--type') options.type = value;
       else if (arg === '--target') options.target = value;
       else if (arg === '--message') options.message = value;
       else options.source = value;
-    } else if (arg === '--confirm') options.confirm = true;
-    else if (arg === '--approve') options.approve = true;
-    else if (arg === '--apply') options.applyUpdate = true;
+    } else if (arg === '--dry-run') options.dryRun = true;
+    else if (['--apply', '--confirm', '--publish', '--approve'].includes(arg)) throw new Error(`${arg} is no longer supported`);
+    else if (arg === '--approve-installs') options.approveInstalls = true;
     else if (arg === '--push') options.pushUpdate = true;
-    else if (arg === '--publish') options.publish = true;
     else if (arg === '--uninstall') options.uninstall = true;
     else if (arg === '--list') options.list = true;
     else if (arg === '--all') options.all = true;
     else if (arg === '--no-fetch') options.noFetch = true;
+    else if (arg === '--stale') options.stale = true;
+    else if (arg === '--keep-local') options.keepLocal = true;
     else throw new Error(`Unknown option: ${arg}`);
   }
   return options;
 }
 
-// Builds the typed request for a known command. The caller is responsible for
-// dispatching on `request.command` after this returns.
-function buildRequest(command: string, options: Options, argv: string[]): CommandRequest {
-  // Cross-command flag restrictions, checked in the entry point's original
-  // order so error precedence is unchanged.
-  if (options.confirm && command !== 'prune') throw new Error('--confirm is only supported by prune');
-  if (options.list && command !== 'register') throw new Error('--list is only supported by register');
-  if (options.all && command !== 'register') throw new Error('--all is only supported by register');
-  if (options.approve && !['apply', 'update', 'bootstrap'].includes(command)) throw new Error('--approve is only supported by apply, update, or bootstrap');
-  if (options.applyUpdate && !['update', 'sync', 'pi-update', 'pull'].includes(command)) throw new Error('--apply is only supported by update, sync, pi-update, or pull');
-  if (options.pushUpdate && command !== 'update') throw new Error('--push is only supported by update');
-  if (options.pushUpdate && !options.applyUpdate) throw new Error('update --push requires --apply so package updates are explicitly approved');
-  if (options.publish && command !== 'push') throw new Error('--publish is only supported by push');
-  if (options.noFetch && !['status', 'plan'].includes(command)) throw new Error('--no-fetch is only supported by status and plan');
-  if (options.message !== undefined && !['push', 'update'].includes(command)) throw new Error('--message is only supported by push and update --apply --push');
-  if (options.message !== undefined && command === 'update' && !(options.applyUpdate && options.pushUpdate)) throw new Error('update --message requires --apply --push');
+function buildRequest(command: string, options: Options): CommandRequest {
+  if (options.dryRun && command === 'status') throw new Error(`--dry-run is not supported by ${command}`);
+  if (options.list && command !== 'add') throw new Error('--list is only supported by add');
+  if (options.all && command !== 'add') throw new Error('--all is only supported by add');
+  if (options.approveInstalls && !['apply', 'update', 'bootstrap'].includes(command)) throw new Error('--approve-installs is only supported by apply, update, or bootstrap');
+  if (options.pushUpdate) throw new Error(command === 'update' ? 'update --push is no longer supported; run pi-sync push separately' : '--push is no longer supported; run pi-sync push separately');
+  if (options.noFetch && command !== 'status') throw new Error('--no-fetch is only supported by status');
+  if (options.message !== undefined && command !== 'push') throw new Error('--message is only supported by push');
   if (options.message !== undefined && !options.message.trim()) throw new Error('--message must not be empty');
-  if (command === 'add' && (!options.type || !options.source)) throw new Error('add requires explicit --type and --source options');
-  if (command === 'add' && !REMOVABLE_TYPES.includes(options.type as any)) throw new Error(`Unsupported resource type: ${options.type}`);
-  // Exactly one of the three register modes is selected: a single
-  // registration via --source, --list, or --all. --type is required for
-  // single registration and optional (narrowing the roots scanned) for
-  // --list and --all.
-  if (command === 'register' && options.type && !RESOURCE_TYPES.includes(options.type as any)) throw new Error(`Unsupported resource type: ${options.type}`);
-  if (command === 'register' && options.list && options.all) throw new Error('register --list and --all are mutually exclusive; select exactly one of --source, --list, or --all');
-  if (command === 'register' && options.source && (options.list || options.all)) throw new Error('register --source cannot be combined with --list or --all; select exactly one of --source, --list, or --all');
-  if (command === 'register' && !options.list && !options.all && (!options.type || !options.source)) throw new Error('register requires explicit --type and --source options');
-  if (command === 'remove' && !options.type) throw new Error('remove requires explicit --type and --target (or --source for dependencies)');
-  if (command === 'remove' && !REMOVABLE_TYPES.includes(options.type as any)) throw new Error(`Unsupported resource type: ${options.type}`);
-  if (command === 'remove' && options.type === 'dependency') {
-    if (!options.source) throw new Error('remove --type dependency requires --source npm:PACKAGE or github:OWNER/REPOSITORY');
-    if (options.target) throw new Error('--target is only supported for resource types; remove --type dependency uses --source');
+
+  if (command === 'add') {
+    if (options.list && options.all) throw new Error('add --list and --all are mutually exclusive; select exactly one of --target, --list, or --all');
+    if (options.dryRun && (options.list || options.all)) throw new Error(`add --dry-run is not supported with ${options.list ? '--list' : '--all'}; discovery is already read-only`);
+    if (options.source !== undefined && options.target !== undefined) throw new Error('add accepts either --target for a resource or --source for a dependency, not both');
+    if (options.source !== undefined && (options.list || options.all)) throw new Error('add --source cannot be combined with --list or --all');
+    if (options.target !== undefined && (options.list || options.all)) throw new Error('add --target cannot be combined with --list or --all');
+    if (options.source !== undefined) return { command, repo: options.repo, agentDir: options.agentDir, type: 'dependency', source: options.source, dryRun: options.dryRun };
+    if (options.list || options.all) return { command, repo: options.repo, agentDir: options.agentDir, type: 'resource-discovery', mode: options.list ? { list: true } : { all: true } };
+    if (options.target === undefined) throw new Error('add requires --target for a resource, --source for a dependency, --list, or --all');
+    const type = resourceTypeForTarget(options.target);
+    if (!type) throw new Error('--target must identify a resource under skills/, extensions/, prompts/, agents/, roles/, or workflows/');
+    return { command, repo: options.repo, agentDir: options.agentDir, type, target: options.target, dryRun: options.dryRun };
   }
-  if (command === 'remove' && options.type && options.type !== 'dependency') {
-    if (!options.target) throw new Error('remove requires --target for resource types (for example, skills/NAME)');
-    if (options.source) throw new Error('--source is only supported by remove --type dependency; resource removal uses --target');
+  if (command === 'remove') {
+    const selectorCount = [options.target !== undefined, options.source !== undefined, options.stale].filter(Boolean).length;
+    if (selectorCount !== 1) throw new Error('remove requires exactly one of --target for a resource, --source for a dependency, or --stale for the stale batch');
+    if (options.target !== undefined) {
+      if (options.uninstall) throw new Error('--uninstall is only supported for dependency removal via --source');
+      const type = resourceTypeForTarget(options.target);
+      if (!type) throw new Error('--target must identify a resource under skills/, extensions/, prompts/, agents/, roles/, or workflows/');
+      return { command, repo: options.repo, agentDir: options.agentDir, type, target: options.target, keepLocal: options.keepLocal, dryRun: options.dryRun };
+    }
+    if (options.source !== undefined) {
+      if (options.keepLocal) throw new Error('--keep-local is only supported for resource removal via --target');
+      return { command, repo: options.repo, agentDir: options.agentDir, type: 'dependency', source: options.source, uninstall: options.uninstall, dryRun: options.dryRun };
+    }
+    if (options.uninstall) throw new Error('--uninstall is only supported for dependency removal via --source');
+    if (options.keepLocal) throw new Error('--keep-local is only supported for resource removal via --target');
+    return { command, repo: options.repo, agentDir: options.agentDir, type: 'stale', dryRun: options.dryRun };
   }
-  if (options.uninstall && (command !== 'remove' || options.type !== 'dependency')) throw new Error('--uninstall is only supported by remove --type dependency');
-  if (options.target !== undefined && !(command === 'remove' && options.type && options.type !== 'dependency')) throw new Error('--target is only supported by remove for resource types');
-  if (command === 'bootstrap') {
-    // --repo-url is no longer a parse-time requirement: the entry point
-    // preflights the missing-URL case (usage error when no valid setup
-    // repository exists at the destination), and bootstrap otherwise
-    // infers the URL from that repository's origin remote.
-    // --repo is rejected for bootstrap wherever it appears in the arguments.
-    // The check inspects the argv handed to this parser (not process.argv)
-    // so the parser stays self-contained for any call site or test argv.
-    if (argv.includes('--repo')) throw new Error('bootstrap uses --repo-dir, not --repo');
-  }
+  if (options.stale && command !== 'remove') throw new Error('--stale is only supported by remove');
+  if (options.keepLocal && command !== 'remove') throw new Error('--keep-local is only supported by remove');
+  if (options.source !== undefined && command !== 'add' && command !== 'remove') throw new Error('--source is only supported by add and remove');
+  if (options.target !== undefined && command !== 'add' && command !== 'remove') throw new Error('--target is only supported by add and remove');
+  if (options.uninstall && command !== 'remove') throw new Error('--uninstall is only supported by remove');
 
   switch (command) {
-    case 'status':
-    case 'plan':
-      return { command, repo: options.repo, agentDir: options.agentDir, noFetch: options.noFetch };
-    case 'apply':
-      return { command, repo: options.repo, agentDir: options.agentDir, approve: options.approve };
-    case 'prune':
-      return { command, repo: options.repo, agentDir: options.agentDir, confirm: options.confirm };
-    case 'add':
-      return { command, repo: options.repo, agentDir: options.agentDir, type: options.type as AddRequest['type'], source: options.source as string };
-    case 'remove':
-      // The validation above guarantees the selector each removal kind
-      // requires, so each typed variant is constructed with it present.
-      return options.type === 'dependency'
-        ? { command, repo: options.repo, agentDir: options.agentDir, type: 'dependency', source: options.source as string, uninstall: options.uninstall }
-        : { command, repo: options.repo, agentDir: options.agentDir, type: options.type as RemoveResourceRequest['type'], target: options.target as string, uninstall: options.uninstall };
-    case 'register':
-      return { command: 'register', repo: options.repo, agentDir: options.agentDir,
-        // Single registration is validated above to carry --type, so the
-        // source mode keeps its type as a required, typed field.
-        mode: options.source
-          ? { source: options.source, type: options.type as string }
-          : options.list
-            ? { list: true, ...(options.type !== undefined ? { type: options.type } : {}) }
-            : { all: true, ...(options.type !== undefined ? { type: options.type } : {}) } };
-    case 'pull':
-      // Pull updates the setup-repository checkout only; it never touches the
-      // local installation, so the resolved agent directory is carried for
-      // union uniformity but is neither required nor used by the workflow.
-      return { command, repo: options.repo, agentDir: options.agentDir, apply: options.applyUpdate };
-    case 'push':
-      return { command, repo: options.repo, agentDir: options.agentDir, publish: options.publish, message: options.message };
-    case 'update':
-      return { command, repo: options.repo, agentDir: options.agentDir, apply: options.applyUpdate, push: options.pushUpdate, approve: options.approve, message: options.message };
-    case 'pi-update':
-      return { command, repo: options.repo, agentDir: options.agentDir, apply: options.applyUpdate };
-    case 'sync':
-      return { command, repo: options.repo, agentDir: options.agentDir, apply: options.applyUpdate };
-    case 'bootstrap':
-      return { command, repoUrl: options.repoUrl, repoDir: options.repoDir, agentDir: options.agentDir, binDir: options.binDir, approve: options.approve };
-    default:
-      throw new Error(`Unknown command: ${command}`);
+    case 'status': return { command, repo: options.repo, agentDir: options.agentDir, noFetch: options.noFetch };
+    case 'apply': return { command, repo: options.repo, agentDir: options.agentDir, dryRun: options.dryRun, approveInstalls: options.approveInstalls };
+    case 'pull': return { command, repo: options.repo, agentDir: options.agentDir, apply: !options.dryRun };
+    case 'push': return { command, repo: options.repo, agentDir: options.agentDir, publish: !options.dryRun, message: options.message };
+    case 'update': return { command, repo: options.repo, agentDir: options.agentDir, apply: !options.dryRun, approveInstalls: options.approveInstalls };
+    case 'pi-update': return { command, repo: options.repo, agentDir: options.agentDir, apply: !options.dryRun };
+    case 'sync': return { command, repo: options.repo, agentDir: options.agentDir, apply: !options.dryRun };
+    case 'bootstrap': return { command, repo: options.repo, repoUrl: options.repoUrl, agentDir: options.agentDir, binDir: options.binDir, approveInstalls: options.approveInstalls, dryRun: options.dryRun };
+    default: throw new Error(`Unknown command: ${command}`);
   }
 }
 
-// Parses `argv` (everything after the script name) into a typed command
-// request. Unknown commands fail with the usage error; option defaults come
-// from the environment (PI_SYNC_REPO_DIR, PI_CODING_AGENT_DIR) and the
-// built-in setup repository default.
 export function parseCommandRequest(argv: string[]): CommandRequest {
   const command = argv[0];
   if (command === '--version') {
     if (argv.length > 1) throw new Error('--version does not accept additional arguments');
     return { command: 'version' };
   }
-  if (!['status', 'plan', 'pull', 'apply', 'add', 'remove', 'register', 'prune', 'bootstrap', 'update', 'push', 'pi-update', 'sync'].includes(command as any)) {
-    throw new Error('Usage: pi-sync --version | pi-sync <status|plan|pull|apply|add|remove|register|prune|update|pi-update|push|bootstrap|sync> [--repo PATH] [--repo-url URL --repo-dir PATH] [--agent-dir PATH] [--no-fetch] [--type skill|extension|prompt|agent|role|workflow|dependency --target VALUE | --source VALUE] [--list] [--all] [--confirm] [--approve] [--apply] [--push] [--publish] [--uninstall] [--message TEXT]');
+  const commands = ['status', 'pull', 'apply', 'add', 'remove', 'bootstrap', 'update', 'push', 'pi-update', 'sync'];
+  if (!commands.includes(command)) {
+    throw new Error('Usage: pi-sync --version | pi-sync <status|pull|apply|add|remove|update|pi-update|push|bootstrap|sync> [--repo PATH] [--repo-url URL] [--agent-dir PATH] [--no-fetch] [--target RESOURCE-PATH | --source PACKAGE | --stale] [--list] [--all] [--keep-local] [--dry-run] [--approve-installs] [--uninstall] [--message TEXT] [--json] [--pretty]');
   }
-  return buildRequest(command as 'status' | 'plan' | 'pull' | 'apply' | 'add' | 'remove' | 'register' | 'prune' | 'bootstrap' | 'update' | 'pi-update' | 'push' | 'sync', parseOptions(argv.slice(1)), argv);
+  return buildRequest(command, parseOptions(argv.slice(1)));
 }

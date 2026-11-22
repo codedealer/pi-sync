@@ -26,7 +26,7 @@
  *   the session and resets on each session_start.
  * - The warning is self-contained: it names the target, states the main
  *   path with the qualified source path in the setup repository (edit that
- *   path → `pi-sync apply`, plus the concrete `pi-sync register` command
+ *   path → `pi-sync apply`, plus the concrete `pi-sync add` command
  *   for a brand-new resource), and ends with the explicit retry-to-allow
  *   bypass.
  *
@@ -110,30 +110,30 @@ export function createWriteGuard(ctx: GuardContext) {
    * The resource-root warning. It names the qualified source path in the
    * setup repository — the repository's location plus the matching
    * resources/<root>/ file — so the agent never has to hunt for the setup
-   * repository, and gives the concrete register command for a brand-new
-   * resource. The register unit is the first segment under the type root
+   * repository, and gives the concrete add command for a brand-new
+   * resource. The add target is the first segment under the type root
    * (a skill directory, an extension file or directory, a single .md
-   * prompt/agent/role file, or a single .js workflow file); `--source` takes it repository-relative.
+   * prompt/agent/role file, or a single .js workflow file); `--target` takes it agent-relative.
    */
   function resourceWarning(target: string, root: string, relative: string): string {
     const repoDir = ctx.repoDir();
     const resourceRoot = path.join(repoDir, "resources", root);
     const source = relative ? path.join(resourceRoot, relative) : resourceRoot;
-    let register: string;
+    let add: string;
     if (relative) {
       const unit = path.join(resourceRoot, relative.split(path.sep)[0]);
-      const repoRelativeSource = path.relative(repoDir, unit).split(path.sep).join("/");
-      register = ` (for a brand-new resource, author it under ${unit}, then run ` +
-        `pi-sync register --type ${root.slice(0, -1)} --source ${repoRelativeSource} and pi-sync apply to bring it under management)`;
+      const target = path.posix.join(root, relative.split(path.sep)[0]);
+      add = ` (for a brand-new resource, author it under ${unit}, then run ` +
+        `pi-sync add --target ${target} and pi-sync apply to bring it under management)`;
     } else {
-      register = ` (for a brand-new resource, author it under ${resourceRoot}, then run ` +
-        `pi-sync register and pi-sync apply to bring it under management)`;
+      add = ` (for a brand-new resource, author it under ${resourceRoot}, then run ` +
+        `pi-sync add --list to discover undeclared resources)`;
     }
     return (
       `pi-sync write guard: ${target} is under ${root}/ of the Pi agent directory, which Pi Sync manages from ` +
       `the setup repository at ${repoDir}. ` +
       `Do not edit the installed copy directly. Edit the source at ${source} in the setup repository, ` +
-      `then run: pi-sync apply${register}. ` +
+      `then run: pi-sync apply${add}. ` +
       `If this is an intentional local-only change, retry the same operation: ` +
       `subsequent attempts are allowed. The pi-sync skill documents the full workflow.`
     );

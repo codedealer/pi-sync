@@ -8,8 +8,7 @@ import {
   rollbackPinnedPackages,
   writeLockfile,
 } from '../../packages.js';
-import { MANIFEST_FILE, LOCK_FILE, readJson, validateRepository, type LockFile, type LockPackage, type RepositoryDeclarations } from '../manifest.js';
-import { runPush, type PushOutput } from './push.js';
+import { MANIFEST_FILE, LOCK_FILE, readJson, type LockFile, type LockPackage, type RepositoryDeclarations } from '../manifest.js';
 import { STATE_DIR, acquireLock, captureRawFile, loadPackagePins, restoreRawFile, savePackagePins } from '../local-state.js';
 
 export interface PackageUpdate {
@@ -23,13 +22,7 @@ export interface UpdateInput {
   agentDir: string;
   declarations: RepositoryDeclarations;
   apply: boolean;
-  approve: boolean;
-  push: boolean;
-  // Forwarded to the managed-only push workflow for `update --apply --push`.
-  message?: string;
-  // The entry point owns stream output: for `update --push` the push module's
-  // human-readable preview is passed through this entry-point-supplied writer.
-  previewWriter: (preview: string) => void;
+  approveInstalls: boolean;
 }
 
 // The manifest fields this workflow reads directly. It re-reads the raw
@@ -47,7 +40,7 @@ export interface InstalledPackage {
 }
 
 interface UpdateOutputBase {
-  apiVersion: 1;
+  apiVersion: 2;
   command: 'update';
   ok: true;
   exitCode: 0;
@@ -78,31 +71,28 @@ export interface UpdateAppliedInstalledOutput extends UpdateOutputBase {
   updates: PackageUpdate[];
   pins: LockPackage[];
   installed: InstalledPackage[];
-  push?: PushOutput;
+
   dependencyModel?: string;
 }
 
 export type UpdateOutput = UpdatePreviewOutput | UpdateAppliedNoUpdatesOutput | UpdateAppliedInstalledOutput;
 
-// The update workflow: it discovers eligible newer releases for the
-// declared dependencies (honoring the repository-owned release-age policy),
-// previews the exact proposed pins without side effects, and with --apply
-// installs the new pins through Pi, persists the lockfile and local pin
-// state under the package lock, and rolls package pins plus both pin files
-// back to their previous state when persistence fails. With --push the
-// approved pin change is published through the managed-only push workflow.
-export async function runUpdate({ repo, agentDir, declarations, apply, approve, push, message, previewWriter }: UpdateInput): Promise<UpdateOutput> {
+// The update workflow discovers eligible newer releases for declared dependencies,
+// honoring the repository-owned release-age policy. It previews exact proposed
+// pins without side effects, or installs and persists them under the package lock
+// with rollback of package pins and both pin files when persistence fails.
+export async function runUpdate({ repo, agentDir, declarations, apply, approveInstalls }: UpdateInput): Promise<UpdateOutput> {
   const manifest = (await readJson(path.join(repo, MANIFEST_FILE), 'manifest')) as PolicyManifest;
   const updates = (await discoverUpdates(manifest, declarations.lock)) as PackageUpdate[];
   const minimumReleaseAgeDays = manifest.policy?.minimumReleaseAgeDays ?? 7;
   const nextLock = lockWithUpdates(declarations.lock, updates) as LockFile;
   if (!apply) {
-    return { apiVersion: 1, command: 'update', ok: true, exitCode: 0, repository: repo,
+    return { apiVersion: 2, command: 'update', ok: true, exitCode: 0, repository: repo,
       minimumReleaseAgeDays, policySource: 'setup repository pi-sync.json', mode: 'preview', updates,
       proposedPins: nextLock.packages, note: 'No pins were changed and no package installation was performed.' };
   }
   if (!updates.length) {
-    return { apiVersion: 1, command: 'update', ok: true, exitCode: 0, repository: repo,
+    return { apiVersion: 2, command: 'update', ok: true, exitCode: 0, repository: repo,
       minimumReleaseAgeDays, policySource: 'setup repository pi-sync.json', mode: 'applied', updates: [], pins: declarations.lock.packages,
       note: 'No eligible newer releases were found; no installs or pin changes were performed.' };
   }
@@ -111,7 +101,7 @@ export async function runUpdate({ repo, agentDir, declarations, apply, approve, 
   const releasePackageLock = await acquireLock(agentDir);
   try {
     const pins = await loadPackagePins(agentDir);
-    await obtainFirstInstallApproval(nextLock, pins, approve);
+    await obtainFirstInstallApproval(nextLock, pins, approveInstalls);
     const lockPath = path.join(repo, LOCK_FILE);
     const packageStatePath = path.join(agentDir, STATE_DIR, 'packages.json');
     const lockBefore = await captureRawFile(lockPath);
@@ -134,10 +124,10 @@ export async function runUpdate({ repo, agentDir, declarations, apply, approve, 
       error.details = { message: error.message, rollbackErrors };
       throw error;
     }
-    const output: UpdateAppliedInstalledOutput = { apiVersion: 1, command: 'update', ok: true, exitCode: 0, repository: repo,
+    const output: UpdateAppliedInstalledOutput = { apiVersion: 2, command: 'update', ok: true, exitCode: 0, repository: repo,
       minimumReleaseAgeDays, policySource: 'setup repository pi-sync.json', mode: 'applied', updates,
       pins: nextLock.packages, installed };
-    if (push) output.push = await runPush({ repo, declarations: await validateRepository(repo), publish: true, message, previewWriter });
+
     output.dependencyModel = 'exact top-level pins; transitive dependency tree is controlled by Pi and is not locked by Pi Sync';
     return output;
   } finally { await releasePackageLock(); }

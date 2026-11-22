@@ -78,9 +78,9 @@ import fs from 'node:fs';
 const [command] = process.argv.slice(2);
 fs.appendFileSync(process.env.PI_TEST_CLI_LOG, JSON.stringify({ command, args: process.argv.slice(2) }) + '\\n');
 if (command === 'status') {
-  console.log(JSON.stringify({ apiVersion: 1, command: 'status', ok: true, summary: { localPending: 0, remotePending: 0, needsReview: 0, clean: true } }));
+  console.log(JSON.stringify({ apiVersion: 2, command: 'status', ok: true, summary: { localPending: 0, remotePending: 0, needsReview: 0, clean: true } }));
 } else if (command === 'sync') {
-  console.log(JSON.stringify({ apiVersion: 1, command: 'sync', ok: true, synced: [] }));
+  console.log(JSON.stringify({ apiVersion: 2, command: 'sync', ok: true, synced: [] }));
 }
 `;
   const cliBin = path.join(binDir, 'pi-sync');
@@ -142,9 +142,9 @@ test('first touch of a gated path is blocked with the main path and bypass; late
   assert.ok(reason.includes(target), 'the warning names the target');
   const source = path.join(state.setup, 'resources', 'skills', 'demo', 'SKILL.md');
   assert.ok(reason.includes(source), 'the warning names the qualified source path in the setup repository');
-  assert.ok(reason.includes('pi-sync register --type skill --source resources/skills/demo'), 'the warning gives the concrete register command');
+  assert.ok(reason.includes('pi-sync add --target skills/demo'), 'the warning gives the concrete add command');
   assert.ok(reason.includes('pi-sync apply'), 'the warning states the main path');
-  assert.ok(reason.includes('pi-sync register'), 'the warning covers the new-resource flow');
+  assert.ok(reason.includes('pi-sync add'), 'the warning covers the new-resource flow');
   assert.ok(reason.includes('retry the same operation'), 'the warning ends with the bypass');
 
   // The retry of the same operation passes (arming), and arming is global:
@@ -153,7 +153,7 @@ test('first touch of a gated path is blocked with the main path and bypass; late
   assert.equal(await toolCall(state, 'write', { path: path.join(state.agentDir, 'prompts', 'deploy.md'), content: 'x' }), undefined, 'a second gated root passes too');
   state.shutdown();
 });
-test('the workflows root is gated with the concrete workflow register hint', async (t) => {
+test('the workflows root is gated with the concrete workflow add hint', async (t) => {
   const state = await fixture(t);
   state.handlers.get('session_start')({ reason: 'startup' }, state.ctx);
 
@@ -164,7 +164,7 @@ test('the workflows root is gated with the concrete workflow register hint', asy
   assert.ok(reason.includes(target), 'the warning names the target');
   const source = path.join(state.setup, 'resources', 'workflows', 'octopus-loop.js');
   assert.ok(reason.includes(source), 'the warning names the qualified source path in the setup repository');
-  assert.ok(reason.includes('pi-sync register --type workflow --source resources/workflows/octopus-loop.js'), 'the warning gives the concrete workflow register command');
+  assert.ok(reason.includes('pi-sync add --target workflows/octopus-loop.js'), 'the warning gives the concrete workflow add command');
   assert.ok(reason.includes('pi-sync apply'), 'the warning states the main path');
   assert.ok(reason.includes('retry the same operation'), 'the warning ends with the bypass');
 
