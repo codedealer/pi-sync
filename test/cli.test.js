@@ -5626,6 +5626,24 @@ test('bootstrap --dry-run resumes from an existing valid setup repository withou
   assert.deepEqual(await stagingCopies(), stagingBefore, 'the staging copy is cleaned up after the preview');
 });
 
+test('bootstrap success output in the compact text tier omits undefined fields', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-text-tier-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceRepo = await bootstrapRepo(t, root);
+  const fakeTools = await fakeGitHubTools(t, sourceRepo);
+  const agentDir = path.join(root, 'agent');
+  const setupDir = path.join(root, 'private-checkout');
+  const args = ['bootstrap', '--repo-url', 'https://github.com/acme/private-setup.git', '--repo', setupDir, '--agent-dir', agentDir];
+
+  // bootstrapResponse always carries errorCode/error keys; on success both are
+  // undefined. The compact text tier must omit them (as JSON.stringify does)
+  // rather than render the literal "undefined".
+  const text = runRawWith(cli, args, { ...fakeTools, FAKE_GIT_ACCESS: 'yes' });
+  assert.equal(text.status, 0, `${text.stderr}\n${text.stdout}`);
+  assert.match(text.stdout.trim().split('\n')[0], /^ok$/);
+  assert.ok(!text.stdout.split(/\r?\n/).some((line) => /:\s*undefined$/.test(line)), `compact text tier must not render undefined fields:\n${text.stdout}`);
+});
+
 test('bootstrap --dry-run removes the staging copy before rethrowing a copy failure', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-sync-bootstrap-dry-run-cp-fail-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));

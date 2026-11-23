@@ -1,6 +1,6 @@
 {
   "name": "@codedealer/pi-sync",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "A manifest-driven CLI for applying explicitly managed Pi resources.",
   "type": "module",
   "bin": {

@@ -43,6 +43,7 @@ function renderText(output: Record<string, any>): string {
   const lines: string[] = [output.ok ? 'ok' : `error ${output.errorCode ?? 'OPERATION_FAILED'}`];
   const skipped = new Set(['apiVersion', 'ok', 'exitCode', 'errorCode']);
   const emit = (key: string, value: any, depth: number, listItem = false) => {
+    if (value === undefined) return;
     const indent = '  '.repeat(depth);
     const prefix = listItem ? `${indent}- ${key}: ` : `${indent}${key}: `;
     if (Array.isArray(value)) {
