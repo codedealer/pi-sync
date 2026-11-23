@@ -14,6 +14,7 @@ Manifest-driven CLI that applies explicitly managed Pi resources, plus the first
 ## Checks
 - `npm test` — build + typecheck (CLI and extension) + full `node --test` suite
 - `npm run typecheck` — CLI via `tsconfig.json`; extension via `tsconfig.extension.json` against the pinned `@earendil-works/pi-coding-agent` version in `devDependencies`
+- The suite spawns real subprocesses (CLI, git, extension startup) and can hang when a process never exits; always run it under a timeout (e.g. `timeout 600 npm test` or the shell tool's timeout argument)
 
 ## Installed Pi runtime
 To verify runtime behavior, inspect the installed Pi rather than assuming. `$(command -v pi)` is a pnpm shim whose exec line names the exact installed path of `@earendil-works/pi-coding-agent` (a content-hashed pnpm global store path). Readable, non-minified sources live under that package's `dist/` (e.g. `dist/utils/version-check.js`, `dist/modes/interactive/interactive-mode.js`, `dist/main.js`); `dist/bundle/` is minified.
